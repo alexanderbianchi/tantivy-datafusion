@@ -1,0 +1,34 @@
+[package]
+name = "tantivy-datafusion"
+version = "0.1.0"
+edition = "2021"
+description = "DataFusion integration for tantivy search indices"
+license = "MIT"
+
+[dependencies]
+tantivy = { git = "https://github.com/alexanderbianchi/tantivy.git", branch = "bianchi/tantivy-pub-for-datafusion", features = ["quickwit"] }
+datafusion = "52"
+datafusion-datasource = "52"
+datafusion-physical-plan = "52"
+datafusion-physical-expr = "52"
+datafusion-physical-optimizer = "52"
+datafusion-expr-common = "52"
+datafusion-proto = "52"
+arrow = { version = "57", features = ["prettyprint"] }
+async-trait = "0.1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt"] }
+prost = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde_json = "1"
+binggan = "0.14.2"
+rand = "0.9"
+rand_distr = "0.5"
+
+[[bench]]
+name = "agg_bench"
+harness = false
