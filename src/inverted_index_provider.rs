@@ -453,7 +453,7 @@ impl DataSource for InvertedIndexDataSource {
 
 /// Combine pre-parsed queries with raw query strings into a single tantivy query.
 /// Raw queries are parsed using `QueryParser::for_index` which requires an opened `Index`.
-fn build_combined_query(
+pub(crate) fn build_combined_query(
     index: &Index,
     pre_parsed: Option<&Arc<dyn tantivy::query::Query>>,
     raw_queries: &[(String, String)],

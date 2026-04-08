@@ -142,25 +142,47 @@ pub fn read_segment_fast_fields_to_batch(
                         DataFusionError::Internal(format!("str fast field '{name}' not found"))
                     })?;
 
-                // Build dictionary values once (one string per unique term)
-                let num_terms = str_col.num_terms();
-                let mut dict_builder = StringBuilder::with_capacity(num_terms, num_terms * 16);
+                // Collect only the ordinals actually referenced by docs in this
+                // batch, then build a compact dictionary. This avoids materializing
+                // the entire term dictionary for high-cardinality columns when only
+                // a small subset of terms appear in the current doc set.
+                let mut raw_ords: Vec<Option<u64>> = Vec::with_capacity(num_docs);
+                let mut seen_ords: Vec<u64> = Vec::new();
+                for &doc_id in &docs {
+                    let mut ord_iter = str_col.term_ords(doc_id);
+                    match ord_iter.next() {
+                        Some(ord) => {
+                            raw_ords.push(Some(ord));
+                            // Track unique ordinals (sorted insert for dedup)
+                            if let Err(pos) = seen_ords.binary_search(&ord) {
+                                seen_ords.insert(pos, ord);
+                            }
+                        }
+                        None => raw_ords.push(None),
+                    }
+                }
+
+                // Build compact dictionary values from only the referenced terms
+                let mut dict_builder =
+                    StringBuilder::with_capacity(seen_ords.len(), seen_ords.len() * 16);
                 let mut buf = String::new();
-                for ord in 0..num_terms {
+                for &ord in &seen_ords {
                     buf.clear();
                     str_col
-                        .ord_to_str(ord as u64, &mut buf)
+                        .ord_to_str(ord, &mut buf)
                         .map_err(|e| DataFusionError::Internal(format!("dict build '{name}': {e}")))?;
                     dict_builder.append_value(&buf);
                 }
                 let dict_values: ArrayRef = Arc::new(dict_builder.finish());
 
-                // Build keys (one i32 ordinal per doc)
+                // Remap original ordinals to compact indices
                 let mut keys_builder = Int32Builder::with_capacity(num_docs);
-                for &doc_id in &docs {
-                    let mut ord_iter = str_col.term_ords(doc_id);
-                    match ord_iter.next() {
-                        Some(ord) => keys_builder.append_value(ord as i32),
+                for raw in &raw_ords {
+                    match raw {
+                        Some(ord) => {
+                            let compact_idx = seen_ords.binary_search(ord).unwrap();
+                            keys_builder.append_value(compact_idx as i32);
+                        }
                         None => keys_builder.append_null(),
                     }
                 }
