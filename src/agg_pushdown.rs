@@ -17,6 +17,7 @@ use crate::agg_exec::TantivyAggregateExec;
 use crate::plan_traversal::{
     find_fast_field_datasource, find_partial_aggregate, find_single_table_datasource,
 };
+use datafusion_datasource::source::DataSourceExec;
 
 /// A physical optimizer rule that replaces DataFusion's `AggregateExec`
 /// with tantivy's native `AggregationSegmentCollector` when the
@@ -127,28 +128,18 @@ fn try_rewrite_single(
         }
     }
 
-    // Try SingleTableDataSource
+    // Try SingleTableDataSource: push aggs into the data source
     if let Some(st_ds) = find_single_table_datasource(input) {
-        // Check stashed aggregations (backward compat)
+        // Check stashed aggregations first
         if let Some(tantivy_aggs) = st_ds.aggregations() {
-            let new_exec = TantivyAggregateExec::new(
-                st_ds.opener().clone(),
-                tantivy_aggs.clone(),
-                None,
-                agg.schema(),
-            );
-            return Ok(Transformed::yes(Arc::new(new_exec)));
+            let updated = st_ds.with_agg_mode(tantivy_aggs.clone(), agg.schema());
+            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(updated)))));
         }
 
         // Fallback: derive from AggregateExec expressions
         if let Some(tantivy_aggs) = derive_tantivy_aggregations(agg) {
-            let new_exec = TantivyAggregateExec::new(
-                st_ds.opener().clone(),
-                Arc::new(tantivy_aggs),
-                None,
-                agg.schema(),
-            );
-            return Ok(Transformed::yes(Arc::new(new_exec)));
+            let updated = st_ds.with_agg_mode(Arc::new(tantivy_aggs), agg.schema());
+            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(updated)))));
         }
     }
 
@@ -199,28 +190,18 @@ fn try_rewrite_two_phase(
         }
     }
 
-    // Try SingleTableDataSource
+    // Try SingleTableDataSource: push aggs into the data source
     if let Some(st_ds) = find_single_table_datasource(partial_input) {
-        // Check stashed aggregations (backward compat)
+        // Check stashed aggregations first
         if let Some(tantivy_aggs) = st_ds.aggregations() {
-            let new_exec = TantivyAggregateExec::new(
-                st_ds.opener().clone(),
-                tantivy_aggs.clone(),
-                None,
-                final_agg.schema(),
-            );
-            return Ok(Transformed::yes(Arc::new(new_exec)));
+            let updated = st_ds.with_agg_mode(tantivy_aggs.clone(), final_agg.schema());
+            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(updated)))));
         }
 
         // Fallback: derive from the Final AggregateExec expressions
         if let Some(tantivy_aggs) = derive_tantivy_aggregations(final_agg) {
-            let new_exec = TantivyAggregateExec::new(
-                st_ds.opener().clone(),
-                Arc::new(tantivy_aggs),
-                None,
-                final_agg.schema(),
-            );
-            return Ok(Transformed::yes(Arc::new(new_exec)));
+            let updated = st_ds.with_agg_mode(Arc::new(tantivy_aggs), final_agg.schema());
+            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(updated)))));
         }
     }
 

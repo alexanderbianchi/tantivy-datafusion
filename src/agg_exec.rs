@@ -150,7 +150,7 @@ impl ExecutionPlan for TantivyAggregateExec {
 // Core tantivy aggregation execution
 // ---------------------------------------------------------------------------
 
-fn execute_tantivy_agg(
+pub(crate) fn execute_tantivy_agg(
     index: &Index,
     aggs: &Aggregations,
     query: Option<&Arc<dyn Query>>,

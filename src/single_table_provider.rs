@@ -263,6 +263,7 @@ impl TableProvider for SingleTableProvider {
             num_segments,
             pushed_filters: Vec::new(),
             aggregations: self.aggregations.clone(),
+            agg_mode: None,
         };
 
         Ok(Arc::new(DataSourceExec::new(Arc::new(data_source))))
@@ -295,6 +296,10 @@ pub struct SingleTableDataSource {
     num_segments: usize,
     pushed_filters: Vec<Arc<dyn PhysicalExpr>>,
     aggregations: Option<Arc<Aggregations>>,
+    /// When set, the data source runs in aggregation mode — executes tantivy's
+    /// native aggregation instead of streaming rows. The output schema changes
+    /// to match the aggregation results.
+    agg_mode: Option<(Arc<Aggregations>, SchemaRef)>,
 }
 
 impl SingleTableDataSource {
@@ -317,6 +322,7 @@ impl SingleTableDataSource {
             num_segments: self.num_segments,
             pushed_filters: self.pushed_filters.clone(),
             aggregations: self.aggregations.clone(),
+            agg_mode: self.agg_mode.clone(),
         };
         f(&mut new);
         new
@@ -368,6 +374,20 @@ impl SingleTableDataSource {
         self.aggregations.as_ref()
     }
 
+    /// Set aggregation mode. The data source will run tantivy's native
+    /// aggregation instead of streaming rows.
+    pub(crate) fn with_agg_mode(&self, aggs: Arc<Aggregations>, output_schema: SchemaRef) -> Self {
+        self.clone_with(|s| {
+            s.agg_mode = Some((aggs, output_schema.clone()));
+            s.projected_schema = output_schema;
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn agg_mode(&self) -> Option<&(Arc<Aggregations>, SchemaRef)> {
+        self.agg_mode.as_ref()
+    }
+
     /// Access the projection indices.
     pub fn projection(&self) -> Option<&Vec<usize>> {
         self.projection.as_ref()
@@ -390,6 +410,51 @@ impl DataSource for SingleTableDataSource {
         partition: usize,
         context: Arc<datafusion::execution::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        // Aggregation mode: run tantivy native aggregation
+        if let Some((aggs, agg_schema)) = &self.agg_mode {
+            let opener = self.opener.clone();
+            let raw_queries = self.raw_queries.clone();
+            let pre_built_query = self.pre_built_query.as_ref().map(|q| Arc::from(q.box_clone()));
+            let aggs = aggs.clone();
+            let schema = agg_schema.clone();
+
+            // Only partition 0 runs the aggregation (single output partition)
+            if partition != 0 {
+                return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    schema,
+                    stream::empty(),
+                )));
+            }
+
+            let stream = stream::once(async move {
+                let index = opener.open().await?;
+
+                // Warm up inverted index for queried text fields
+                let queried_fields: Vec<tantivy::schema::Field> = raw_queries
+                    .iter()
+                    .filter_map(|(field_name, _)| index.schema().get_field(field_name).ok())
+                    .collect();
+                if !queried_fields.is_empty() {
+                    crate::warmup::warmup_inverted_index(&index, &queried_fields).await?;
+                }
+
+                // Build combined query from FTS + fast field filters
+                let query = build_combined_query(&index, pre_built_query.as_ref(), &raw_queries)?;
+
+                tokio::task::spawn_blocking(move || {
+                    crate::agg_exec::execute_tantivy_agg(&index, &aggs, query.as_ref(), &schema)
+                })
+                .await
+                .map_err(|e| DataFusionError::Internal(format!("spawn_blocking join error: {e}")))?
+            });
+
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                agg_schema.clone(),
+                stream,
+            )));
+        }
+
+        // Normal row-streaming mode
         let batch_size = context.session_config().batch_size();
         let opener = self.opener.clone();
         let segment_idx = partition;
@@ -479,11 +544,19 @@ impl DataSource for SingleTableDataSource {
             self.needs_score,
             self.needs_document,
             self.topk,
-        )
+        )?;
+        if self.agg_mode.is_some() {
+            write!(f, ", agg_mode=true")?;
+        }
+        Ok(())
     }
 
     fn output_partitioning(&self) -> Partitioning {
-        segment_hash_partitioning(&self.projected_schema, self.num_segments)
+        if self.agg_mode.is_some() {
+            Partitioning::UnknownPartitioning(1)
+        } else {
+            segment_hash_partitioning(&self.projected_schema, self.num_segments)
+        }
     }
 
     fn eq_properties(&self) -> EquivalenceProperties {
