@@ -305,6 +305,11 @@ impl FastFieldDataSource {
     pub(crate) fn query(&self) -> Option<&Arc<dyn Query>> {
         self.query.as_ref()
     }
+
+    /// Return the number of partitions.
+    pub fn num_partitions(&self) -> usize {
+        self.partition_ranges.len()
+    }
 }
 
 impl DataSource for FastFieldDataSource {

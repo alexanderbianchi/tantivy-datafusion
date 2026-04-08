@@ -14,6 +14,7 @@ pub(crate) mod plan_traversal;
 pub mod schema_mapping;
 pub mod single_table_provider;
 pub mod table_provider;
+pub mod task_estimator;
 pub mod topk_pushdown;
 pub mod unified_provider;
 pub mod warmup;
@@ -32,4 +33,5 @@ pub use schema_mapping::{tantivy_schema_to_arrow, tantivy_schema_to_arrow_from_i
 pub use table_provider::{FastFieldDataSource, TantivyTableProvider};
 pub use topk_pushdown::TopKPushdown;
 pub use single_table_provider::SingleTableProvider;
+pub use task_estimator::estimate_task_count;
 pub use unified_provider::UnifiedTantivyTableProvider;

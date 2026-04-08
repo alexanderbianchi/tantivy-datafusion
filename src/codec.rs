@@ -45,6 +45,7 @@ use crate::full_text_udf::full_text_udf;
 use crate::index_opener::{IndexOpener, OpenerMetadata};
 use crate::inverted_index_provider::{InvertedIndexDataSource, TantivyInvertedIndexProvider};
 use crate::schema_mapping::tantivy_schema_to_arrow_with_multi_valued;
+use crate::single_table_provider::SingleTableDataSource;
 use crate::table_provider::{FastFieldDataSource, TantivyTableProvider};
 
 // ── Opener factory as session extension ─────────────────────────────
@@ -117,6 +118,7 @@ struct TantivyScanProto {
 const FAST_FIELD: u32 = 0;
 const INVERTED_INDEX: u32 = 1;
 const DOCUMENT: u32 = 2;
+const SINGLE_TABLE: u32 = 3;
 
 // ── TantivyCodec — pure serialization, no runtime state ────────────
 
@@ -248,6 +250,28 @@ impl PhysicalExtensionCodec for TantivyCodec {
                     footer_start, footer_end, multi_valued_fields: mv,
                 }.encode(buf).map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
             }
+
+            if let Some(st) = ds.as_any().downcast_ref::<SingleTableDataSource>() {
+                let (id, schema_json, seg, footer_start, footer_end, mv) = opener_to_proto(st.opener())?;
+                let (proj, has_proj) = match st.projection() {
+                    Some(p) => (p.iter().map(|&i| i as u32).collect(), true),
+                    None => (Vec::new(), false),
+                };
+                let rq_json = serde_json::to_string(st.raw_queries())
+                    .map_err(|e| DataFusionError::Internal(format!("serialize raw_queries: {e}")))?;
+                let (topk, has_topk) = match st.topk() {
+                    Some(k) => (k as u32, true),
+                    None => (0, false),
+                };
+                let pushed_filters = serialize_pushed_filters(st.pushed_filters(), self)?;
+                return TantivyScanProto {
+                    identifier: id, tantivy_schema_json: schema_json, segment_sizes: seg,
+                    projection: proj, has_projection: has_proj, output_partitions,
+                    provider_type: SINGLE_TABLE, raw_queries_json: rq_json, topk, has_topk,
+                    pushed_filters,
+                    footer_start, footer_end, multi_valued_fields: mv,
+                }.encode(buf).map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
+            }
         }
 
         if let Some(lazy) = node.as_any().downcast_ref::<LazyScanExec>() {
@@ -320,6 +344,17 @@ impl PhysicalExtensionCodec for TantivyCodec {
             ),
             INVERTED_INDEX => TantivyInvertedIndexProvider::from_opener(opener.clone()).schema(),
             DOCUMENT => TantivyDocumentProvider::from_opener(opener.clone()).schema(),
+            SINGLE_TABLE => {
+                // Build unified schema: fast fields + _score + _document
+                let ff_schema = tantivy_schema_to_arrow_with_multi_valued(
+                    &opener.schema(),
+                    &proto.multi_valued_fields,
+                );
+                let mut unified_fields: Vec<arrow::datatypes::Field> = ff_schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+                unified_fields.push(arrow::datatypes::Field::new("_score", arrow::datatypes::DataType::Float32, true));
+                unified_fields.push(arrow::datatypes::Field::new("_document", arrow::datatypes::DataType::Utf8, false));
+                Arc::new(arrow::datatypes::Schema::new(unified_fields))
+            }
             other => return Err(DataFusionError::Internal(format!("unknown provider type: {other}"))),
         };
 
@@ -387,6 +422,7 @@ impl DisplayAs for LazyScanExec {
             FAST_FIELD => "FastField",
             INVERTED_INDEX => "InvertedIndex",
             DOCUMENT => "Document",
+            SINGLE_TABLE => "SingleTable",
             _ => "Unknown",
         };
         write!(f, "LazyScanExec(id={}, type={})", self.identifier, kind)
@@ -499,6 +535,30 @@ impl ExecutionPlan for LazyScanExec {
                         .scan(&state, projection.as_ref().map(|v| v as &Vec<usize>), &[], None)
                         .await?
                 }
+                SINGLE_TABLE => {
+                    use crate::single_table_provider::SingleTableProvider;
+                    let provider = SingleTableProvider::from_opener(opener);
+                    // Register full_text UDF if there are queries
+                    if !raw_queries_json.is_empty() {
+                        session.register_udf(full_text_udf());
+                    }
+                    let st_exec = provider.scan(&state, projection.as_ref().map(|v| v as &Vec<usize>), &filters, None).await?;
+                    // Re-apply topk if present
+                    if let Some(k) = topk {
+                        if let Some(ds_exec) = st_exec.as_any().downcast_ref::<DataSourceExec>() {
+                            if let Some(st_ds) = ds_exec.data_source().as_any().downcast_ref::<SingleTableDataSource>() {
+                                let updated = st_ds.with_topk(k);
+                                Arc::new(DataSourceExec::new(Arc::new(updated)))
+                            } else {
+                                st_exec
+                            }
+                        } else {
+                            st_exec
+                        }
+                    } else {
+                        st_exec
+                    }
+                }
                 other => return Err(DataFusionError::Internal(format!("unknown provider type: {other}"))),
             };
 
@@ -534,6 +594,19 @@ impl ExecutionPlan for LazyScanExec {
                                 &TantivyCodec,
                             )?;
                             let updated = doc_ds.with_pushed_filters(deserialized);
+                            Arc::new(DataSourceExec::new(Arc::new(updated)))
+                        } else if let Some(st_ds) = ds_exec
+                            .data_source()
+                            .as_any()
+                            .downcast_ref::<SingleTableDataSource>()
+                        {
+                            let deserialized = deserialize_pushed_filters(
+                                &pushed_filter_bytes,
+                                &context,
+                                ds_schema.as_ref(),
+                                &TantivyCodec,
+                            )?;
+                            let updated = st_ds.with_pushed_filters(deserialized);
                             Arc::new(DataSourceExec::new(Arc::new(updated)))
                         } else {
                             exec
