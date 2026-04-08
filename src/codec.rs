@@ -252,13 +252,6 @@ impl PhysicalExtensionCodec for TantivyCodec {
             }
 
             if let Some(st) = ds.as_any().downcast_ref::<SingleTableDataSource>() {
-                if st.agg_mode().is_some() {
-                    return Err(DataFusionError::Internal(
-                        "SingleTableDataSource with agg_mode cannot be serialized yet; \
-                         aggregation pushdown rules should not fire in distributed mode"
-                            .to_string(),
-                    ));
-                }
                 let (id, schema_json, seg, footer_start, footer_end, mv) = opener_to_proto(st.opener())?;
                 let (proj, has_proj) = match st.projection() {
                     Some(p) => (p.iter().map(|&i| i as u32).collect(), true),

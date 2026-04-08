@@ -5,6 +5,7 @@
 //!
 //! Start reviewing here: [`SingleTableProvider`] is the entry point.
 
+pub mod agg_data_source;
 pub(crate) mod agg_exec;
 pub mod agg_pushdown;
 pub mod ordinal_group_by;

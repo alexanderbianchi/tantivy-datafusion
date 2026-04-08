@@ -13,6 +13,7 @@ use tantivy::aggregation::metric::{
     AverageAggregation, CountAggregation, MaxAggregation, MinAggregation, SumAggregation,
 };
 
+use crate::unified::agg_data_source::AggDataSource;
 use crate::unified::agg_exec::TantivyAggregateExec;
 use crate::unified::plan_traversal::{
     find_fast_field_datasource, find_partial_aggregate, find_single_table_datasource,
@@ -128,18 +129,21 @@ fn try_rewrite_single(
         }
     }
 
-    // Try SingleTableDataSource: push aggs into the data source
+    // Try SingleTableDataSource: create a dedicated AggDataSource
     if let Some(st_ds) = find_single_table_datasource(input) {
-        // Check stashed aggregations first
-        if let Some(tantivy_aggs) = st_ds.aggregations() {
-            let updated = st_ds.with_agg_mode(tantivy_aggs.clone(), agg.schema());
-            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(updated)))));
-        }
-
-        // Fallback: derive from AggregateExec expressions
-        if let Some(tantivy_aggs) = derive_tantivy_aggregations(agg) {
-            let updated = st_ds.with_agg_mode(Arc::new(tantivy_aggs), agg.schema());
-            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(updated)))));
+        let tantivy_aggs = st_ds
+            .aggregations()
+            .cloned()
+            .or_else(|| derive_tantivy_aggregations(agg).map(Arc::new));
+        if let Some(aggs) = tantivy_aggs {
+            let agg_ds = AggDataSource::new(
+                st_ds.opener().clone(),
+                aggs,
+                agg.schema(),
+                st_ds.raw_queries().to_vec(),
+                st_ds.pre_built_query().cloned(),
+            );
+            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(agg_ds)))));
         }
     }
 
@@ -190,18 +194,21 @@ fn try_rewrite_two_phase(
         }
     }
 
-    // Try SingleTableDataSource: push aggs into the data source
+    // Try SingleTableDataSource: create a dedicated AggDataSource
     if let Some(st_ds) = find_single_table_datasource(partial_input) {
-        // Check stashed aggregations first
-        if let Some(tantivy_aggs) = st_ds.aggregations() {
-            let updated = st_ds.with_agg_mode(tantivy_aggs.clone(), final_agg.schema());
-            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(updated)))));
-        }
-
-        // Fallback: derive from the Final AggregateExec expressions
-        if let Some(tantivy_aggs) = derive_tantivy_aggregations(final_agg) {
-            let updated = st_ds.with_agg_mode(Arc::new(tantivy_aggs), final_agg.schema());
-            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(updated)))));
+        let tantivy_aggs = st_ds
+            .aggregations()
+            .cloned()
+            .or_else(|| derive_tantivy_aggregations(final_agg).map(Arc::new));
+        if let Some(aggs) = tantivy_aggs {
+            let agg_ds = AggDataSource::new(
+                st_ds.opener().clone(),
+                aggs,
+                final_agg.schema(),
+                st_ds.raw_queries().to_vec(),
+                st_ds.pre_built_query().cloned(),
+            );
+            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(agg_ds)))));
         }
     }
 
