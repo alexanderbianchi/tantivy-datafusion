@@ -8,7 +8,9 @@ use datafusion_physical_optimizer::PhysicalOptimizerRule;
 use datafusion_physical_plan::aggregates::{AggregateExec, AggregateMode};
 
 use crate::agg_exec::TantivyAggregateExec;
-use crate::plan_traversal::{find_fast_field_datasource, find_partial_aggregate};
+use crate::plan_traversal::{
+    find_fast_field_datasource, find_partial_aggregate, find_single_table_datasource,
+};
 
 /// A physical optimizer rule that replaces DataFusion's `AggregateExec`
 /// with tantivy's native `AggregationSegmentCollector` when the
@@ -104,6 +106,19 @@ fn try_rewrite_single(
             return Ok(Transformed::yes(Arc::new(new_exec)));
         }
     }
+
+    if let Some(st_ds) = find_single_table_datasource(input) {
+        if let Some(tantivy_aggs) = st_ds.aggregations() {
+            let new_exec = TantivyAggregateExec::new(
+                st_ds.opener().clone(),
+                tantivy_aggs.clone(),
+                None,
+                agg.schema(),
+            );
+            return Ok(Transformed::yes(Arc::new(new_exec)));
+        }
+    }
+
     Ok(Transformed::no(plan.clone()))
 }
 
@@ -131,6 +146,18 @@ fn try_rewrite_two_phase(
                 ff_ds.opener().clone(),
                 tantivy_aggs.clone(),
                 ff_ds.query().map(|q| Arc::from(q.box_clone())),
+                final_agg.schema(),
+            );
+            return Ok(Transformed::yes(Arc::new(new_exec)));
+        }
+    }
+
+    if let Some(st_ds) = find_single_table_datasource(partial_input) {
+        if let Some(tantivy_aggs) = st_ds.aggregations() {
+            let new_exec = TantivyAggregateExec::new(
+                st_ds.opener().clone(),
+                tantivy_aggs.clone(),
+                None,
                 final_agg.schema(),
             );
             return Ok(Transformed::yes(Arc::new(new_exec)));

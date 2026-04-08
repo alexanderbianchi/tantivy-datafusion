@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::fmt;
+use std::ops::Bound;
 use std::sync::Arc;
 
 use arrow::array::{AsArray, Float32Array, RecordBatch, StringBuilder};
@@ -11,7 +12,8 @@ use datafusion::common::config::ConfigOptions;
 use datafusion::common::{Result, Statistics};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::DataFusionError;
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::common::ScalarValue;
+use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_datasource::source::{DataSource, DataSourceExec};
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr};
@@ -24,7 +26,9 @@ use futures::stream::{self, StreamExt};
 use tantivy::aggregation::agg_req::Aggregations;
 use tantivy::collector::TopNComputer;
 use tantivy::query::EnableScoring;
-use tantivy::{DocId, Document, Index, Score};
+use tantivy::query::RangeQuery;
+use tantivy::schema::{FieldType, IndexRecordOption, Schema as TantivySchema, Term};
+use tantivy::{DateTime, DocId, Document, Index, Score};
 
 use crate::fast_field_reader::read_segment_fast_fields_to_batch;
 use crate::full_text_udf::extract_full_text_call;
@@ -132,10 +136,13 @@ impl TableProvider for SingleTableProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
+        let tantivy_schema = self.opener.schema();
         Ok(filters
             .iter()
             .map(|f| {
                 if extract_full_text_call(f).is_some() {
+                    TableProviderFilterPushDown::Exact
+                } else if logical_expr_to_tantivy_query(f, &tantivy_schema).is_some() {
                     TableProviderFilterPushDown::Exact
                 } else {
                     TableProviderFilterPushDown::Unsupported
@@ -151,9 +158,10 @@ impl TableProvider for SingleTableProvider {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // 1. Extract full_text() calls from pushed-down filters.
+        // 1. Extract full_text() calls and fast field filters from pushed-down filters.
         let tantivy_schema = self.opener.schema();
         let mut raw_queries: Vec<(String, String)> = Vec::new();
+        let mut tantivy_queries: Vec<Box<dyn tantivy::query::Query>> = Vec::new();
         for filter in filters {
             if let Some((field_name, query_string)) = extract_full_text_call(filter) {
                 tantivy_schema.get_field(&field_name).map_err(|e| {
@@ -162,9 +170,23 @@ impl TableProvider for SingleTableProvider {
                     ))
                 })?;
                 raw_queries.push((field_name, query_string));
+            } else if let Some(q) = logical_expr_to_tantivy_query(filter, &tantivy_schema) {
+                tantivy_queries.push(q);
             }
         }
         let has_full_text = !raw_queries.is_empty();
+
+        // Combine fast field tantivy queries into a single pre-built query.
+        let pre_built_query: Option<Arc<dyn tantivy::query::Query>> =
+            if tantivy_queries.is_empty() {
+                None
+            } else if tantivy_queries.len() == 1 {
+                Some(Arc::from(tantivy_queries.into_iter().next().unwrap()))
+            } else {
+                Some(Arc::new(tantivy::query::BooleanQuery::intersection(
+                    tantivy_queries,
+                )))
+            };
 
         // 2. Analyze projection.
         let projected_indices: Vec<usize> = match projection {
@@ -236,6 +258,7 @@ impl TableProvider for SingleTableProvider {
             ff_projection: ff_indices,
             ff_projected_schema,
             raw_queries,
+            pre_built_query,
             topk: None,
             num_segments,
             pushed_filters: Vec::new(),
@@ -266,6 +289,8 @@ pub struct SingleTableDataSource {
     /// The projected fast field schema (built from ff_projection).
     ff_projected_schema: SchemaRef,
     raw_queries: Vec<(String, String)>,
+    /// Pre-built tantivy queries from fast field filters converted at scan time.
+    pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
     pub(crate) topk: Option<usize>,
     num_segments: usize,
     pushed_filters: Vec<Arc<dyn PhysicalExpr>>,
@@ -287,6 +312,7 @@ impl SingleTableDataSource {
             ff_projection: self.ff_projection.clone(),
             ff_projected_schema: self.ff_projected_schema.clone(),
             raw_queries: self.raw_queries.clone(),
+            pre_built_query: self.pre_built_query.as_ref().map(|q| Arc::from(q.box_clone())),
             topk: self.topk,
             num_segments: self.num_segments,
             pushed_filters: self.pushed_filters.clone(),
@@ -318,7 +344,7 @@ impl SingleTableDataSource {
 
     /// Whether this data source has an active query.
     pub fn has_query(&self) -> bool {
-        !self.raw_queries.is_empty()
+        !self.raw_queries.is_empty() || self.pre_built_query.is_some()
     }
 
     /// Create a copy with the topk limit set.
@@ -378,6 +404,10 @@ impl DataSource for SingleTableDataSource {
         let document_column_idx = self.document_column_idx;
         let topk = self.topk;
         let pushed_filters = self.pushed_filters.clone();
+        let pre_built_query = self
+            .pre_built_query
+            .as_ref()
+            .map(|q| Arc::from(q.box_clone()));
 
         let schema = self.projected_schema.clone();
         let stream = stream::once(async move {
@@ -400,8 +430,9 @@ impl DataSource for SingleTableDataSource {
                 crate::warmup::warmup_inverted_index(&index, &queried_fields).await?;
             }
 
-            // Build query from raw_queries.
-            let query = build_combined_query(&index, None, &raw_queries)?;
+            // Build query from raw_queries + pre-built fast field query.
+            let query =
+                build_combined_query(&index, pre_built_query.as_ref(), &raw_queries)?;
 
             // Move sync work to blocking thread.
             tokio::task::spawn_blocking(move || {
@@ -770,5 +801,143 @@ fn generate_single_table_batch(
             offset += len;
         }
         Ok(batches)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Logical Expr → tantivy query conversion for fast field filters
+// ---------------------------------------------------------------------------
+
+/// Try to convert a logical `Expr` (column op literal) to a tantivy query.
+///
+/// Handles simple comparisons where the column is a tantivy FAST field and
+/// the operator is one of `=`, `>`, `>=`, `<`, `<=`.
+fn logical_expr_to_tantivy_query(
+    expr: &Expr,
+    tantivy_schema: &TantivySchema,
+) -> Option<Box<dyn tantivy::query::Query>> {
+    let Expr::BinaryExpr(binary) = expr else {
+        return None;
+    };
+
+    let (col_name, scalar, col_on_left) = match (binary.left.as_ref(), binary.right.as_ref()) {
+        (Expr::Column(col), Expr::Literal(sv, _)) => (col.name.clone(), sv.clone(), true),
+        (Expr::Literal(sv, _), Expr::Column(col)) => (col.name.clone(), sv.clone(), false),
+        _ => return None,
+    };
+
+    let field = tantivy_schema.get_field(&col_name).ok()?;
+    let field_entry = tantivy_schema.get_field_entry(field);
+    if !field_entry.is_fast() {
+        return None;
+    }
+
+    let op = if col_on_left {
+        binary.op
+    } else {
+        logical_flip_operator(&binary.op)?
+    };
+
+    let term = logical_scalar_to_term(field, field_entry.field_type(), &scalar)?;
+
+    match op {
+        Operator::Eq => Some(Box::new(tantivy::query::TermQuery::new(
+            term,
+            IndexRecordOption::Basic,
+        ))),
+        Operator::Gt => Some(Box::new(RangeQuery::new(
+            Bound::Excluded(term),
+            Bound::Unbounded,
+        ))),
+        Operator::GtEq => Some(Box::new(RangeQuery::new(
+            Bound::Included(term),
+            Bound::Unbounded,
+        ))),
+        Operator::Lt => Some(Box::new(RangeQuery::new(
+            Bound::Unbounded,
+            Bound::Excluded(term),
+        ))),
+        Operator::LtEq => Some(Box::new(RangeQuery::new(
+            Bound::Unbounded,
+            Bound::Included(term),
+        ))),
+        _ => None,
+    }
+}
+
+/// Flip a comparison operator when the column is on the right side.
+fn logical_flip_operator(op: &Operator) -> Option<Operator> {
+    match op {
+        Operator::Eq => Some(Operator::Eq),
+        Operator::Gt => Some(Operator::Lt),
+        Operator::GtEq => Some(Operator::LtEq),
+        Operator::Lt => Some(Operator::Gt),
+        Operator::LtEq => Some(Operator::GtEq),
+        _ => None,
+    }
+}
+
+/// Convert a DataFusion `ScalarValue` to a tantivy `Term` for the given field.
+fn logical_scalar_to_term(
+    field: tantivy::schema::Field,
+    field_type: &FieldType,
+    scalar: &ScalarValue,
+) -> Option<Term> {
+    match (field_type, scalar) {
+        (FieldType::U64(_), ScalarValue::UInt64(Some(v))) => {
+            Some(Term::from_field_u64(field, *v))
+        }
+        (FieldType::I64(_), ScalarValue::Int64(Some(v))) => {
+            Some(Term::from_field_i64(field, *v))
+        }
+        (FieldType::F64(_), ScalarValue::Float64(Some(v))) => {
+            Some(Term::from_field_f64(field, *v))
+        }
+        (FieldType::Bool(_), ScalarValue::Boolean(Some(v))) => {
+            Some(Term::from_field_bool(field, *v))
+        }
+        (FieldType::Str(_), ScalarValue::Utf8(Some(s))) => {
+            Some(Term::from_field_text(field, s))
+        }
+        // Numeric type coercions that DataFusion may apply.
+        (FieldType::F64(_), ScalarValue::Int64(Some(v))) => {
+            Some(Term::from_field_f64(field, *v as f64))
+        }
+        (FieldType::F64(_), ScalarValue::Float32(Some(v))) => {
+            Some(Term::from_field_f64(field, *v as f64))
+        }
+        (FieldType::I64(_), ScalarValue::Int32(Some(v))) => {
+            Some(Term::from_field_i64(field, *v as i64))
+        }
+        (FieldType::U64(_), ScalarValue::Int64(Some(v))) if *v >= 0 => {
+            Some(Term::from_field_u64(field, *v as u64))
+        }
+        // Date — tantivy DateTime stores nanoseconds internally.
+        (FieldType::Date(_), ScalarValue::TimestampMicrosecond(Some(v), _)) => {
+            Some(Term::from_field_date(field, DateTime::from_timestamp_micros(*v)))
+        }
+        (FieldType::Date(_), ScalarValue::TimestampSecond(Some(v), _)) => {
+            Some(Term::from_field_date(field, DateTime::from_timestamp_secs(*v)))
+        }
+        (FieldType::Date(_), ScalarValue::TimestampMillisecond(Some(v), _)) => {
+            Some(Term::from_field_date(field, DateTime::from_timestamp_millis(*v)))
+        }
+        (FieldType::Date(_), ScalarValue::TimestampNanosecond(Some(v), _)) => {
+            Some(Term::from_field_date(field, DateTime::from_timestamp_nanos(*v)))
+        }
+        // IpAddr — mapped to Utf8 in schema_mapping, tantivy stores as Ipv6Addr.
+        (FieldType::IpAddr(_), ScalarValue::Utf8(Some(s))) => {
+            let ip: std::net::IpAddr = s.parse().ok()?;
+            let ipv6 = match ip {
+                std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+                std::net::IpAddr::V6(v6) => v6,
+            };
+            Some(Term::from_field_ip_addr(field, ipv6))
+        }
+        // Bytes — mapped to Binary in schema_mapping.
+        (FieldType::Bytes(_), ScalarValue::Binary(Some(b))) => {
+            Some(Term::from_field_bytes(field, b))
+        }
+        _ => None,
     }
 }

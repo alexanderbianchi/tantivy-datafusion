@@ -9,6 +9,7 @@ use datafusion_physical_plan::coop::CooperativeExec;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 
+use crate::single_table_provider::SingleTableDataSource;
 use crate::table_provider::FastFieldDataSource;
 
 /// Check if a plan node is a single-child, row-preserving operator
@@ -101,6 +102,26 @@ pub(crate) fn find_fast_field_datasource(
         let children = plan.children();
         if children.len() == 1 {
             return find_fast_field_datasource(children[0]);
+        }
+    }
+    None
+}
+
+/// Walk through transparent operators (including `RepartitionExec`) to find
+/// a `SingleTableDataSource`.
+pub(crate) fn find_single_table_datasource(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Option<&SingleTableDataSource> {
+    if let Some(dse) = plan.as_any().downcast_ref::<DataSourceExec>() {
+        return dse
+            .data_source()
+            .as_any()
+            .downcast_ref::<SingleTableDataSource>();
+    }
+    if is_transparent_operator_or_repartition(plan) {
+        let children = plan.children();
+        if children.len() == 1 {
+            return find_single_table_datasource(children[0]);
         }
     }
     None

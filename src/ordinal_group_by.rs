@@ -22,7 +22,8 @@ use datafusion_physical_plan::ExecutionPlanProperties;
 use futures::stream;
 
 use crate::plan_traversal::{
-    find_data_source_exec, find_fast_field_datasource, is_transparent_operator_or_repartition,
+    find_data_source_exec, find_fast_field_datasource, find_single_table_datasource,
+    is_transparent_operator_or_repartition,
 };
 
 // ---------------------------------------------------------------------------
@@ -221,8 +222,12 @@ fn check_ordinal_eligible(
         return None;
     }
 
-    // Must be backed by FastFieldDataSource.
-    find_fast_field_datasource(input)?;
+    // Must be backed by FastFieldDataSource or SingleTableDataSource.
+    if find_fast_field_datasource(input).is_none()
+        && find_single_table_datasource(input).is_none()
+    {
+        return None;
+    }
 
     Some((group_col_idx, group_col_name.clone()))
 }
