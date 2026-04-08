@@ -37,7 +37,7 @@ use datafusion_datasource::source::DataSourceExec;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
-use futures::stream;
+use futures::stream::{self, StreamExt};
 use prost::Message;
 
 use crate::decomposed::document_provider::{DocumentDataSource, TantivyDocumentProvider};
@@ -485,7 +485,7 @@ impl ExecutionPlan for LazyScanExec {
             let session = datafusion::prelude::SessionContext::new_with_config(config);
 
             let filters: Vec<Expr> =
-                if provider_type == INVERTED_INDEX && !raw_queries_json.is_empty() {
+                if (provider_type == INVERTED_INDEX || provider_type == SINGLE_TABLE) && !raw_queries_json.is_empty() {
                     let rq: Vec<(String, String)> = serde_json::from_str(&raw_queries_json)
                         .map_err(|e| DataFusionError::Internal(format!("parse raw_queries: {e}")))?;
                     session.register_udf(full_text_udf());
@@ -620,13 +620,16 @@ impl ExecutionPlan for LazyScanExec {
 
             use futures::TryStreamExt;
             let inner_stream = exec.execute(partition, context)?;
-            let batches: Vec<_> = inner_stream.try_collect().await?;
+            let batches: Vec<arrow::record_batch::RecordBatch> = inner_stream.try_collect().await?;
             if batches.is_empty() {
-                Ok(arrow::record_batch::RecordBatch::new_empty(schema))
+                Ok(vec![arrow::record_batch::RecordBatch::new_empty(schema)])
             } else {
-                arrow::compute::concat_batches(&schema, &batches)
-                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+                Ok(batches)
             }
+        })
+        .flat_map(|result: Result<Vec<arrow::record_batch::RecordBatch>>| match result {
+            Ok(batches) => stream::iter(batches.into_iter().map(Ok)).left_stream(),
+            Err(e) => stream::once(async move { Err(e) }).right_stream(),
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(

@@ -91,10 +91,9 @@ impl DataSource for AggDataSource {
                 crate::warmup::warmup_inverted_index(&index, &queried_fields).await?;
             }
 
-            // Build combined query from FTS + fast field filters
-            let query = build_combined_query(&index, pre_built_query.as_ref(), &raw_queries)?;
-
+            // Move sync work (including query building) to blocking thread.
             tokio::task::spawn_blocking(move || {
+                let query = build_combined_query(&index, pre_built_query.as_ref(), &raw_queries)?;
                 crate::unified::agg_exec::execute_tantivy_agg(
                     &index,
                     &aggs,

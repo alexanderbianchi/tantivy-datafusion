@@ -259,7 +259,7 @@ impl TableProvider for SingleTableProvider {
                 if extract_full_text_call(f).is_some() {
                     TableProviderFilterPushDown::Exact
                 } else if logical_expr_to_tantivy_query(f, &tantivy_schema).is_some() {
-                    TableProviderFilterPushDown::Exact
+                    TableProviderFilterPushDown::Inexact
                 } else {
                     TableProviderFilterPushDown::Unsupported
                 }
@@ -616,6 +616,11 @@ impl DataSource for SingleTableDataSource {
         let stream = stream::once(async move {
             let index = opener.open().await?;
 
+            // Note: warmup and query execution create separate IndexReaders.
+            // For immutable indexes (Quickwit splits), this is safe. For indexes
+            // being actively written to, warmup may warm different segments than
+            // the query sees. This is benign — warmup is best-effort.
+
             // Warm up fast fields.
             let ff_names: Vec<&str> = ff_projected_schema
                 .fields()
@@ -633,12 +638,10 @@ impl DataSource for SingleTableDataSource {
                 crate::warmup::warmup_inverted_index(&index, &queried_fields).await?;
             }
 
-            // Build query from raw_queries + pre-built fast field query.
-            let query =
-                build_combined_query(&index, pre_built_query.as_ref(), &raw_queries)?;
-
-            // Move sync work to blocking thread.
+            // Move sync work (including query building) to blocking thread.
             tokio::task::spawn_blocking(move || {
+                let query =
+                    build_combined_query(&index, pre_built_query.as_ref(), &raw_queries)?;
                 generate_single_table_batch(
                     &index,
                     segment_idx,
