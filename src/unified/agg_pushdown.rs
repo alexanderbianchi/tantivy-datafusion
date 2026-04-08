@@ -277,7 +277,7 @@ fn derive_tantivy_aggregations(agg: &AggregateExec) -> Option<Aggregations> {
     // Build the top-level terms aggregation
     let terms = TermsAggregation {
         field: group_field,
-        size: Some(65535), // Return all terms by default
+        size: None,
         ..Default::default()
     };
 

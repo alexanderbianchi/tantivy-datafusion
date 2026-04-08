@@ -132,7 +132,11 @@ impl ExecutionPlan for TantivyAggregateExec {
 
         let stream = stream::once(async move {
             let index = opener.open().await?;
-            execute_tantivy_agg(&index, &aggs, query.as_ref(), &schema)
+            tokio::task::spawn_blocking(move || {
+                execute_tantivy_agg(&index, &aggs, query.as_ref(), &schema)
+            })
+            .await
+            .map_err(|e| DataFusionError::Internal(format!("spawn_blocking join error: {e}")))?
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(

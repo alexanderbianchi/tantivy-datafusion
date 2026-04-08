@@ -27,7 +27,7 @@ use tantivy::aggregation::agg_req::Aggregations;
 use tantivy::collector::TopNComputer;
 use tantivy::query::EnableScoring;
 use tantivy::query::RangeQuery;
-use tantivy::schema::{FieldType, IndexRecordOption, Schema as TantivySchema, Term};
+use tantivy::schema::{FieldType, Schema as TantivySchema, Term};
 use tantivy::{DateTime, DocId, Document, Index, Score};
 
 use crate::fast_field_reader::read_segment_fast_fields_to_batch;
@@ -290,8 +290,6 @@ impl TableProvider for SingleTableProvider {
                 tantivy_queries.push(q);
             }
         }
-        let has_full_text = !raw_queries.is_empty();
-
         // Combine fast field tantivy queries into a single pre-built query.
         let pre_built_query: Option<Arc<dyn tantivy::query::Query>> =
             if tantivy_queries.is_empty() {
@@ -323,11 +321,6 @@ impl TableProvider for SingleTableProvider {
                 ff_indices.push(idx);
             }
         }
-
-        // If there's an FTS query but _score is not projected, we still need
-        // to run the query (for filtering), just without scoring.
-        let needs_query = has_full_text;
-        let _ = needs_query; // used implicitly via raw_queries
 
         // Ensure _doc_id and _segment_ord are in ff_indices (needed internally).
         let doc_id_idx = self.fast_field_schema.index_of("_doc_id").unwrap();
@@ -450,7 +443,7 @@ impl SingleTableDataSource {
             ff_projection: self.ff_projection.clone(),
             ff_projected_schema: self.ff_projected_schema.clone(),
             raw_queries: self.raw_queries.clone(),
-            pre_built_query: self.pre_built_query.as_ref().map(|q| Arc::from(q.box_clone())),
+            pre_built_query: self.pre_built_query.clone(),
             topk: self.topk,
             num_segments: self.num_segments,
             pushed_filters: self.pushed_filters.clone(),
@@ -893,7 +886,11 @@ fn generate_single_table_batch(
         .reader()
         .map_err(|e| DataFusionError::Internal(format!("open reader: {e}")))?;
     let searcher = reader.searcher();
-    let segment_reader = searcher.segment_reader(segment_idx as u32);
+    let segment_readers = searcher.segment_readers();
+    if segment_idx >= segment_readers.len() {
+        return Ok(vec![RecordBatch::new_empty(projected_schema.clone())]);
+    }
+    let segment_reader = &segment_readers[segment_idx];
 
     // Step 1: Run query (if any) to collect doc_ids and optional scores.
     let (doc_ids, scores): (Vec<u32>, Option<Vec<f32>>) = match query {
@@ -1029,8 +1026,8 @@ fn generate_single_table_batch(
 
     // Step 3: Build score array.
     let score_array: Option<Arc<dyn arrow::array::Array>> = if needs_score {
-        match &scores {
-            Some(score_vec) => Some(Arc::new(Float32Array::from(score_vec.clone()))),
+        match scores {
+            Some(score_vec) => Some(Arc::new(Float32Array::from(score_vec))),
             None => Some(arrow::array::new_null_array(&DataType::Float32, num_rows)),
         }
     } else {
@@ -1178,9 +1175,9 @@ fn logical_expr_to_tantivy_query(
     let term = logical_scalar_to_term(field, field_entry.field_type(), &scalar)?;
 
     match op {
-        Operator::Eq => Some(Box::new(tantivy::query::TermQuery::new(
-            term,
-            IndexRecordOption::Basic,
+        Operator::Eq => Some(Box::new(RangeQuery::new(
+            Bound::Included(term.clone()),
+            Bound::Included(term),
         ))),
         Operator::Gt => Some(Box::new(RangeQuery::new(
             Bound::Excluded(term),
