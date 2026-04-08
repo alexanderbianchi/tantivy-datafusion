@@ -97,8 +97,46 @@ pub fn tantivy_schema_to_arrow_from_index(index: &Index) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
+/// Converts a tantivy schema to an Arrow schema, using the provided list of
+/// multi-valued field names to emit `List<T>` instead of scalar `T`.
+///
+/// This is the distributed/remote counterpart of [`tantivy_schema_to_arrow_from_index`]:
+/// the coordinator inspects segments to discover multi-valued fields, serializes
+/// their names, and the worker uses this function to reconstruct the correct schema
+/// without needing local access to the index segments.
+pub fn tantivy_schema_to_arrow_with_multi_valued(
+    schema: &tantivy::schema::Schema,
+    multi_valued_fields: &[String],
+) -> SchemaRef {
+    let mut fields: Vec<Field> = vec![
+        Field::new("_doc_id", DataType::UInt32, false),
+        Field::new("_segment_ord", DataType::UInt32, false),
+    ];
+
+    fields.extend(schema.fields().filter_map(|(_field, field_entry)| {
+        if !field_entry.is_fast() {
+            return None;
+        }
+        let inner_type = scalar_arrow_type(field_entry.field_type())?;
+        let name = field_entry.name();
+
+        let arrow_type = if multi_valued_fields.iter().any(|n| n == name) {
+            let list_inner = match &inner_type {
+                DataType::Dictionary(_, value_type) => value_type.as_ref().clone(),
+                other => other.clone(),
+            };
+            DataType::List(Arc::new(Field::new("item", list_inner, true)))
+        } else {
+            inner_type
+        };
+
+        Some(Field::new(name, arrow_type, true))
+    }));
+    Arc::new(Schema::new(fields))
+}
+
 /// Returns the cardinality of a fast field in a given segment, or `None` on error.
-fn field_cardinality(
+pub(crate) fn field_cardinality(
     segment_reader: &tantivy::SegmentReader,
     name: &str,
     field_type: &FieldType,

@@ -8,15 +8,13 @@ use datafusion_datasource::source::DataSourceExec;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_optimizer::PhysicalOptimizerRule;
-use datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec;
-use datafusion_physical_plan::coop::CooperativeExec;
 use datafusion_physical_plan::joins::HashJoinExec;
-use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
 
 use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
 
 use crate::inverted_index_provider::InvertedIndexDataSource;
+use crate::plan_traversal::is_transparent_operator;
 use crate::table_provider::FastFieldDataSource;
 
 /// A physical optimizer rule that pushes `ORDER BY _score DESC LIMIT K`
@@ -131,11 +129,8 @@ fn try_inject_topk(
         return Ok(None);
     }
 
-    // Safe to traverse through these operators (row-preserving, 1:1)
-    if plan.as_any().downcast_ref::<CoalesceBatchesExec>().is_some()
-        || plan.as_any().downcast_ref::<CooperativeExec>().is_some()
-        || plan.as_any().downcast_ref::<ProjectionExec>().is_some()
-    {
+    // Safe to traverse through row-preserving, single-child operators
+    if is_transparent_operator(plan) {
         let children = plan.children();
         if children.len() == 1 {
             if let Some(new_child) = try_inject_topk(children[0], k)? {
@@ -190,13 +185,7 @@ fn probe_side_is_filter_free(plan: &Arc<dyn ExecutionPlan>) -> bool {
         return false;
     }
 
-    if plan
-        .as_any()
-        .downcast_ref::<CoalesceBatchesExec>()
-        .is_some()
-        || plan.as_any().downcast_ref::<CooperativeExec>().is_some()
-        || plan.as_any().downcast_ref::<ProjectionExec>().is_some()
-    {
+    if is_transparent_operator(plan) {
         let children = plan.children();
         if children.len() == 1 {
             return probe_side_is_filter_free(children[0]);

@@ -6,19 +6,16 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Result, ScalarValue};
 use datafusion::logical_expr::{JoinType, Operator};
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion_datasource::source::DataSourceExec;
 use datafusion_physical_expr::expressions::{BinaryExpr, Column, DynamicFilterPhysicalExpr, Literal};
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_optimizer::PhysicalOptimizerRule;
-use datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec;
-use datafusion_physical_plan::coop::CooperativeExec;
 use datafusion_physical_plan::joins::HashJoinExec;
-use datafusion_physical_plan::projection::ProjectionExec;
 use tantivy::query::RangeQuery;
 use tantivy::schema::{FieldType, IndexRecordOption, Schema as TantivySchema, Term};
 use tantivy::DateTime;
 
 use crate::inverted_index_provider::InvertedIndexDataSource;
+use crate::plan_traversal::{find_data_source, rebuild_path};
 use crate::table_provider::FastFieldDataSource;
 
 /// A physical optimizer rule that moves fast field predicates from the probe
@@ -122,74 +119,6 @@ fn try_push_filters(
     // Rebuild HashJoinExec with new children
     let new_join = Arc::clone(&plan).with_new_children(vec![new_build, new_probe])?;
     Ok(Transformed::yes(new_join))
-}
-
-// ---------------------------------------------------------------------------
-// Plan traversal helpers
-// ---------------------------------------------------------------------------
-
-/// Walk down through safe, single-child operators to find a `DataSourceExec`
-/// wrapping a specific `DataSource` type `T`.
-///
-/// Returns `(datasource_ref, datasource_exec_ref, path_of_indices)` where
-/// the path records which child index was taken at each step (always 0 for
-/// single-child operators).
-fn find_data_source<T: 'static>(
-    plan: &Arc<dyn ExecutionPlan>,
-) -> Option<(&T, &DataSourceExec, Vec<usize>)> {
-    find_data_source_inner::<T>(plan, vec![])
-}
-
-fn find_data_source_inner<T: 'static>(
-    plan: &Arc<dyn ExecutionPlan>,
-    path: Vec<usize>,
-) -> Option<(&T, &DataSourceExec, Vec<usize>)> {
-    if let Some(dse) = plan.as_any().downcast_ref::<DataSourceExec>() {
-        if let Some(ds) = dse.data_source().as_any().downcast_ref::<T>() {
-            return Some((ds, dse, path));
-        }
-        return None;
-    }
-
-    // Safe to traverse through single-child, row-preserving operators
-    if plan
-        .as_any()
-        .downcast_ref::<CoalesceBatchesExec>()
-        .is_some()
-        || plan.as_any().downcast_ref::<CooperativeExec>().is_some()
-        || plan.as_any().downcast_ref::<ProjectionExec>().is_some()
-    {
-        let children = plan.children();
-        if children.len() == 1 {
-            let mut new_path = path;
-            new_path.push(0);
-            return find_data_source_inner::<T>(children[0], new_path);
-        }
-    }
-
-    None
-}
-
-/// Rebuild the plan tree along the recorded path, replacing the leaf with
-/// `new_leaf`.
-fn rebuild_path(
-    root: &Arc<dyn ExecutionPlan>,
-    path: &[usize],
-    new_leaf: Arc<dyn ExecutionPlan>,
-) -> Result<Arc<dyn ExecutionPlan>> {
-    if path.is_empty() {
-        return Ok(new_leaf);
-    }
-
-    let children = root.children();
-    let child_idx = path[0];
-    let new_child = rebuild_path(children[child_idx], &path[1..], new_leaf)?;
-
-    let mut new_children: Vec<Arc<dyn ExecutionPlan>> =
-        children.iter().map(|c| Arc::clone(c)).collect();
-    new_children[child_idx] = new_child;
-
-    Arc::clone(root).with_new_children(new_children)
 }
 
 // ---------------------------------------------------------------------------

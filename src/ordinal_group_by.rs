@@ -11,21 +11,19 @@ use datafusion::error::DataFusionError;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
-use datafusion_datasource::source::DataSourceExec;
 use datafusion_expr_common::groups_accumulator::{EmitTo, GroupsAccumulator};
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_expr::{aggregate::AggregateFunctionExpr, PhysicalExpr};
 use datafusion_physical_optimizer::PhysicalOptimizerRule;
 use datafusion_physical_plan::aggregates::{AggregateExec, AggregateMode};
-use datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion_physical_plan::coop::CooperativeExec;
-use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::ExecutionPlanProperties;
 use futures::stream;
 
-use crate::table_provider::FastFieldDataSource;
+use crate::plan_traversal::{
+    find_data_source_exec, find_fast_field_datasource, is_transparent_operator_or_repartition,
+};
 
 // ---------------------------------------------------------------------------
 // Optimizer rule
@@ -244,7 +242,7 @@ fn find_partial_with_plan(
         return Ok(None);
     }
 
-    if is_safe_intermediate(plan) {
+    if is_transparent_operator_or_repartition(plan) {
         let children = plan.children();
         if children.len() == 1 {
             return find_partial_with_plan(children[0]);
@@ -252,44 +250,6 @@ fn find_partial_with_plan(
     }
 
     Ok(None)
-}
-
-fn is_safe_intermediate(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    plan.as_any().downcast_ref::<RepartitionExec>().is_some()
-        || plan
-            .as_any()
-            .downcast_ref::<CoalesceBatchesExec>()
-            .is_some()
-        || plan.as_any().downcast_ref::<CooperativeExec>().is_some()
-}
-
-fn find_fast_field_datasource(plan: &Arc<dyn ExecutionPlan>) -> Option<&FastFieldDataSource> {
-    if let Some(dse) = plan.as_any().downcast_ref::<DataSourceExec>() {
-        return dse
-            .data_source()
-            .as_any()
-            .downcast_ref::<FastFieldDataSource>();
-    }
-    if is_safe_intermediate(plan) {
-        let children = plan.children();
-        if children.len() == 1 {
-            return find_fast_field_datasource(children[0]);
-        }
-    }
-    None
-}
-
-fn find_data_source_exec(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
-    if plan.as_any().downcast_ref::<DataSourceExec>().is_some() {
-        return Some(plan.clone());
-    }
-    if is_safe_intermediate(plan) {
-        let children = plan.children();
-        if children.len() == 1 {
-            return find_data_source_exec(children[0]);
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------

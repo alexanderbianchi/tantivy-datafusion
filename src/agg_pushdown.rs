@@ -4,16 +4,11 @@ use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::Result;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion_datasource::source::DataSourceExec;
 use datafusion_physical_optimizer::PhysicalOptimizerRule;
 use datafusion_physical_plan::aggregates::{AggregateExec, AggregateMode};
-use datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec;
-use datafusion_physical_plan::coop::CooperativeExec;
-use datafusion_physical_plan::projection::ProjectionExec;
-use datafusion_physical_plan::repartition::RepartitionExec;
 
 use crate::agg_exec::TantivyAggregateExec;
-use crate::table_provider::FastFieldDataSource;
+use crate::plan_traversal::{find_fast_field_datasource, find_partial_aggregate};
 
 /// A physical optimizer rule that replaces DataFusion's `AggregateExec`
 /// with tantivy's native `AggregationSegmentCollector` when the
@@ -145,59 +140,3 @@ fn try_rewrite_two_phase(
     Ok(Transformed::no(plan.clone()))
 }
 
-/// Walk through safe operators to find a `FastFieldDataSource`.
-fn find_fast_field_datasource(plan: &Arc<dyn ExecutionPlan>) -> Option<&FastFieldDataSource> {
-    // Direct: DataSourceExec wrapping FastFieldDataSource
-    if let Some(dse) = plan.as_any().downcast_ref::<DataSourceExec>() {
-        if let Some(ff) = dse.data_source().as_any().downcast_ref::<FastFieldDataSource>() {
-            return Some(ff);
-        }
-        return None;
-    }
-
-    // Safe to traverse through these single-child operators
-    if plan
-        .as_any()
-        .downcast_ref::<CoalesceBatchesExec>()
-        .is_some()
-        || plan.as_any().downcast_ref::<CooperativeExec>().is_some()
-        || plan.as_any().downcast_ref::<ProjectionExec>().is_some()
-        || plan.as_any().downcast_ref::<RepartitionExec>().is_some()
-    {
-        let children = plan.children();
-        if children.len() == 1 {
-            return find_fast_field_datasource(children[0]);
-        }
-    }
-
-    None
-}
-
-/// Walk through safe operators between Final and Partial aggregate to find
-/// the Partial AggregateExec.
-fn find_partial_aggregate(
-    plan: &Arc<dyn ExecutionPlan>,
-) -> Result<Option<&AggregateExec>> {
-    if let Some(agg) = plan.as_any().downcast_ref::<AggregateExec>() {
-        if matches!(agg.mode(), AggregateMode::Partial) {
-            return Ok(Some(agg));
-        }
-        return Ok(None);
-    }
-
-    // Safe to traverse between Final and Partial
-    if plan.as_any().downcast_ref::<RepartitionExec>().is_some()
-        || plan
-            .as_any()
-            .downcast_ref::<CoalesceBatchesExec>()
-            .is_some()
-        || plan.as_any().downcast_ref::<CooperativeExec>().is_some()
-    {
-        let children = plan.children();
-        if children.len() == 1 {
-            return find_partial_aggregate(children[0]);
-        }
-    }
-
-    Ok(None)
-}

@@ -44,6 +44,7 @@ use crate::document_provider::{DocumentDataSource, TantivyDocumentProvider};
 use crate::full_text_udf::full_text_udf;
 use crate::index_opener::{IndexOpener, OpenerMetadata};
 use crate::inverted_index_provider::{InvertedIndexDataSource, TantivyInvertedIndexProvider};
+use crate::schema_mapping::tantivy_schema_to_arrow_with_multi_valued;
 use crate::table_provider::{FastFieldDataSource, TantivyTableProvider};
 
 // ── Opener factory as session extension ─────────────────────────────
@@ -108,6 +109,9 @@ struct TantivyScanProto {
     footer_start: u64,
     #[prost(uint64, tag = "13")]
     footer_end: u64,
+    /// Names of fields that are multi-valued in at least one segment.
+    #[prost(string, repeated, tag = "14")]
+    multi_valued_fields: Vec<String>,
 }
 
 const FAST_FIELD: u32 = 0;
@@ -169,7 +173,7 @@ fn deserialize_pushed_filters(
 }
 
 /// Extract serializable metadata from an opener.
-fn opener_to_proto(opener: &Arc<dyn IndexOpener>) -> Result<(String, String, Vec<u32>, u64, u64)> {
+fn opener_to_proto(opener: &Arc<dyn IndexOpener>) -> Result<(String, String, Vec<u32>, u64, u64, Vec<String>)> {
     let identifier = opener.identifier().to_string();
     let tantivy_schema_json =
         serde_json::to_string(&opener.schema()).map_err(|e| {
@@ -177,7 +181,8 @@ fn opener_to_proto(opener: &Arc<dyn IndexOpener>) -> Result<(String, String, Vec
         })?;
     let segment_sizes = opener.segment_sizes();
     let (footer_start, footer_end) = opener.footer_range();
-    Ok((identifier, tantivy_schema_json, segment_sizes, footer_start, footer_end))
+    let multi_valued_fields = opener.multi_valued_fields();
+    Ok((identifier, tantivy_schema_json, segment_sizes, footer_start, footer_end, multi_valued_fields))
 }
 
 impl PhysicalExtensionCodec for TantivyCodec {
@@ -192,7 +197,7 @@ impl PhysicalExtensionCodec for TantivyCodec {
                 ds_exec.properties().partitioning.partition_count() as u32;
 
             if let Some(ff) = ds.as_any().downcast_ref::<FastFieldDataSource>() {
-                let (id, schema_json, seg, footer_start, footer_end) = opener_to_proto(ff.opener())?;
+                let (id, schema_json, seg, footer_start, footer_end, mv) = opener_to_proto(ff.opener())?;
                 let (proj, has_proj) = match ff.projection() {
                     Some(p) => (p.iter().map(|&i| i as u32).collect(), true),
                     None => (Vec::new(), false),
@@ -203,11 +208,12 @@ impl PhysicalExtensionCodec for TantivyCodec {
                     projection: proj, has_projection: has_proj, output_partitions,
                     provider_type: FAST_FIELD, raw_queries_json: String::new(), topk: 0, has_topk: false,
                     pushed_filters,
-                    footer_start, footer_end,                }.encode(buf).map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
+                    footer_start, footer_end, multi_valued_fields: mv,
+                }.encode(buf).map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
             }
 
             if let Some(inv) = ds.as_any().downcast_ref::<InvertedIndexDataSource>() {
-                let (id, schema_json, seg, footer_start, footer_end) = opener_to_proto(inv.opener())?;
+                let (id, schema_json, seg, footer_start, footer_end, mv) = opener_to_proto(inv.opener())?;
                 let (proj, has_proj) = match inv.projection() {
                     Some(p) => (p.iter().map(|&i| i as u32).collect(), true),
                     None => (Vec::new(), false),
@@ -223,11 +229,12 @@ impl PhysicalExtensionCodec for TantivyCodec {
                     projection: proj, has_projection: has_proj, output_partitions,
                     provider_type: INVERTED_INDEX, raw_queries_json: rq_json, topk, has_topk,
                     pushed_filters: Vec::new(),
-                    footer_start, footer_end,                }.encode(buf).map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
+                    footer_start, footer_end, multi_valued_fields: mv,
+                }.encode(buf).map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
             }
 
             if let Some(doc) = ds.as_any().downcast_ref::<DocumentDataSource>() {
-                let (id, schema_json, seg, footer_start, footer_end) = opener_to_proto(doc.opener())?;
+                let (id, schema_json, seg, footer_start, footer_end, mv) = opener_to_proto(doc.opener())?;
                 let (proj, has_proj) = match doc.projection() {
                     Some(p) => (p.iter().map(|&i| i as u32).collect(), true),
                     None => (Vec::new(), false),
@@ -238,7 +245,8 @@ impl PhysicalExtensionCodec for TantivyCodec {
                     projection: proj, has_projection: has_proj, output_partitions,
                     provider_type: DOCUMENT, raw_queries_json: String::new(), topk: 0, has_topk: false,
                     pushed_filters,
-                    footer_start, footer_end,                }.encode(buf).map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
+                    footer_start, footer_end, multi_valued_fields: mv,
+                }.encode(buf).map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
             }
         }
 
@@ -258,6 +266,7 @@ impl PhysicalExtensionCodec for TantivyCodec {
                 pushed_filters: lazy.pushed_filter_bytes.clone(),
                 footer_start: lazy.footer_start,
                 footer_end: lazy.footer_end,
+                multi_valued_fields: lazy.multi_valued_fields.clone(),
             }.encode(buf).map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
         }
 
@@ -295,6 +304,7 @@ impl PhysicalExtensionCodec for TantivyCodec {
             segment_sizes: proto.segment_sizes.clone(),
             footer_start: proto.footer_start,
             footer_end: proto.footer_end,
+            multi_valued_fields: proto.multi_valued_fields.clone(),
         });
 
         let projection = if proto.has_projection {
@@ -304,7 +314,10 @@ impl PhysicalExtensionCodec for TantivyCodec {
         };
 
         let arrow_schema: SchemaRef = match proto.provider_type {
-            FAST_FIELD => TantivyTableProvider::from_opener(opener.clone()).schema(),
+            FAST_FIELD => tantivy_schema_to_arrow_with_multi_valued(
+                &opener.schema(),
+                &proto.multi_valued_fields,
+            ),
             INVERTED_INDEX => TantivyInvertedIndexProvider::from_opener(opener.clone()).schema(),
             DOCUMENT => TantivyDocumentProvider::from_opener(opener.clone()).schema(),
             other => return Err(DataFusionError::Internal(format!("unknown provider type: {other}"))),
@@ -337,6 +350,7 @@ impl PhysicalExtensionCodec for TantivyCodec {
             pushed_filter_bytes: proto.pushed_filters,
             footer_start: proto.footer_start,
             footer_end: proto.footer_end,
+            multi_valued_fields: proto.multi_valued_fields,
             plan_properties,
             projected_schema,
             output_partitions: proto.output_partitions,
@@ -361,6 +375,7 @@ struct LazyScanExec {
     pushed_filter_bytes: Vec<Vec<u8>>,
     footer_start: u64,
     footer_end: u64,
+    multi_valued_fields: Vec<String>,
     plan_properties: PlanProperties,
     projected_schema: SchemaRef,
     output_partitions: u32,
@@ -416,6 +431,7 @@ impl ExecutionPlan for LazyScanExec {
         let topk = self.topk;
         let footer_start = self.footer_start;
         let footer_end = self.footer_end;
+        let multi_valued_fields = self.multi_valued_fields.clone();
 
         let stream = stream::once(async move {
             let tantivy_schema: tantivy::schema::Schema =
@@ -424,6 +440,7 @@ impl ExecutionPlan for LazyScanExec {
 
             let opener = opener_factory(OpenerMetadata {
                 identifier, tantivy_schema, segment_sizes, footer_start, footer_end,
+                multi_valued_fields,
             });
 
             let target_partitions = output_partitions.max(1);

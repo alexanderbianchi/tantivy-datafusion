@@ -5,6 +5,8 @@ use async_trait::async_trait;
 use datafusion::common::Result;
 use tantivy::Index;
 
+use crate::schema_mapping::field_cardinality;
+
 /// Defers tantivy `Index` opening from planning time to execution time.
 ///
 /// During planning, only [`schema`](IndexOpener::schema) and
@@ -42,6 +44,13 @@ pub trait IndexOpener: Send + Sync + fmt::Debug {
         (0, 0)
     }
 
+    /// Names of fields with `Cardinality::Multivalued` in any segment.
+    /// Used for correct Arrow schema construction on remote workers.
+    /// Returns empty vec if not known (falls back to scalar types).
+    fn multi_valued_fields(&self) -> Vec<String> {
+        vec![]
+    }
+
     /// Downcast to a concrete type.
     fn as_any(&self) -> &dyn Any;
 }
@@ -60,6 +69,9 @@ pub struct OpenerMetadata {
     pub footer_start: u64,
     /// End offset of the split footer.
     pub footer_end: u64,
+    /// Names of fields that are multi-valued in at least one segment.
+    /// Used to build correct `List<T>` Arrow schemas on remote workers.
+    pub multi_valued_fields: Vec<String>,
 }
 
 /// An [`IndexOpener`] that wraps an already-opened `Index`.
@@ -103,6 +115,39 @@ impl IndexOpener for DirectIndexOpener {
 
     fn identifier(&self) -> &str {
         ""
+    }
+
+    fn multi_valued_fields(&self) -> Vec<String> {
+        use tantivy::columnar::Cardinality;
+        let schema = self.index.schema();
+        let reader = match self.index.reader() {
+            Ok(r) => r,
+            Err(_) => return vec![],
+        };
+        let searcher = reader.searcher();
+        let segment_readers = searcher.segment_readers();
+        if segment_readers.is_empty() {
+            return vec![];
+        }
+
+        schema
+            .fields()
+            .filter_map(|(_field, field_entry)| {
+                if !field_entry.is_fast() {
+                    return None;
+                }
+                let name = field_entry.name();
+                let is_multi = segment_readers.iter().any(|seg| {
+                    field_cardinality(seg, name, field_entry.field_type())
+                        == Some(Cardinality::Multivalued)
+                });
+                if is_multi {
+                    Some(name.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     fn as_any(&self) -> &dyn Any {

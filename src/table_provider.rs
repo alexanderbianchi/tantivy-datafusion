@@ -23,7 +23,7 @@ use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_plan::projection::ProjectionExprs;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{DisplayFormatType, Partitioning, SendableRecordBatchStream};
-use futures::stream;
+use futures::stream::{self, StreamExt};
 use tantivy::aggregation::agg_req::Aggregations;
 use tantivy::query::{EnableScoring, Query};
 use tantivy::{DocId, Index};
@@ -311,8 +311,9 @@ impl DataSource for FastFieldDataSource {
     fn open(
         &self,
         partition: usize,
-        _context: Arc<datafusion::execution::TaskContext>,
+        context: Arc<datafusion::execution::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let batch_size = context.session_config().batch_size();
         let opener = self.opener.clone();
         let range = self.partition_ranges[partition].clone();
         let projected_schema = self.projected_schema.clone();
@@ -324,6 +325,8 @@ impl DataSource for FastFieldDataSource {
         // Lazy: generate the batch inside the stream so dynamic filters
         // pushed after the build side completes are evaluated at poll time.
         // The index is opened here (execution time), not at planning time.
+        // flat_map yields each independently-allocated batch so downstream
+        // can release them after processing instead of holding one giant batch.
         let stream = stream::once(async move {
             let index = opener.open().await?;
 
@@ -335,17 +338,46 @@ impl DataSource for FastFieldDataSource {
                 .collect();
             crate::warmup::warmup_fast_fields_by_name(&index, &field_names).await?;
 
-            generate_and_filter_batch(
-                &index,
-                range.segment_idx,
-                range.segment_ord,
-                range.doc_start,
-                range.doc_end,
-                &projected_schema,
-                query.as_ref(),
-                limit,
-                &pushed_filters,
-            )
+            // Move sync tantivy I/O to a blocking thread so it doesn't
+            // block the Tokio executor.
+            tokio::task::spawn_blocking(move || {
+                let batch = generate_and_filter_batch(
+                    &index,
+                    range.segment_idx,
+                    range.segment_ord,
+                    range.doc_start,
+                    range.doc_end,
+                    &projected_schema,
+                    query.as_ref(),
+                    limit,
+                    &pushed_filters,
+                )?;
+
+                // Chunk the batch into batch_size-sized pieces for backpressure.
+                let total_rows = batch.num_rows();
+                if total_rows <= batch_size {
+                    Ok(vec![batch])
+                } else {
+                    let mut batches = Vec::new();
+                    let mut offset = 0;
+                    while offset < total_rows {
+                        let len = (total_rows - offset).min(batch_size);
+                        batches.push(batch.slice(offset, len));
+                        offset += len;
+                    }
+                    Ok(batches)
+                }
+            })
+            .await
+            .map_err(|e| {
+                datafusion::error::DataFusionError::Internal(format!(
+                    "spawn_blocking join error: {e}"
+                ))
+            })?
+        })
+        .flat_map(|result: Result<Vec<arrow::record_batch::RecordBatch>>| match result {
+            Ok(batches) => stream::iter(batches.into_iter().map(Ok)).left_stream(),
+            Err(e) => stream::once(async move { Err(e) }).right_stream(),
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))

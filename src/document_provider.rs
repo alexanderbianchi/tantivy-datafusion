@@ -211,14 +211,24 @@ impl DataSource for DocumentDataSource {
         // can release them after processing instead of holding one giant batch.
         let stream = stream::once(async move {
             let index = opener.open().await?;
-            generate_document_batches(
-                &index,
-                segment_idx,
-                projection.as_deref(),
-                &full_schema,
-                &pushed_filters,
-                batch_size,
-            )
+            // Move sync tantivy I/O to a blocking thread so it doesn't
+            // block the Tokio executor.
+            tokio::task::spawn_blocking(move || {
+                generate_document_batches(
+                    &index,
+                    segment_idx,
+                    projection.as_deref(),
+                    &full_schema,
+                    &pushed_filters,
+                    batch_size,
+                )
+            })
+            .await
+            .map_err(|e| {
+                datafusion::error::DataFusionError::Internal(format!(
+                    "spawn_blocking join error: {e}"
+                ))
+            })?
         })
         .flat_map(|result| match result {
             Ok(batches) => stream::iter(batches.into_iter().map(Ok)).left_stream(),

@@ -19,7 +19,7 @@ use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_plan::projection::ProjectionExprs;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{DisplayFormatType, Partitioning, SendableRecordBatchStream};
-use futures::stream;
+use futures::stream::{self, StreamExt};
 use tantivy::collector::TopNComputer;
 use tantivy::query::{BooleanQuery, EnableScoring, QueryParser};
 use tantivy::schema::FieldType;
@@ -224,7 +224,7 @@ impl InvertedIndexDataSource {
     }
 
     /// Create a copy with the topk limit set.
-    pub(crate) fn with_topk(&self, topk: usize) -> Self {
+    pub fn with_topk(&self, topk: usize) -> Self {
         InvertedIndexDataSource {
             opener: self.opener.clone(),
             full_schema: self.full_schema.clone(),
@@ -308,8 +308,9 @@ impl DataSource for InvertedIndexDataSource {
     fn open(
         &self,
         partition: usize,
-        _context: Arc<datafusion::execution::TaskContext>,
+        context: Arc<datafusion::execution::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let batch_size = context.session_config().batch_size();
         let opener = self.opener.clone();
         let segment_idx = partition;
         let pre_parsed_query = self.query.as_ref().map(|q| Arc::from(q.box_clone()));
@@ -319,6 +320,8 @@ impl DataSource for InvertedIndexDataSource {
         let topk = self.topk;
 
         let schema = self.projected_schema.clone();
+        // flat_map yields each independently-allocated batch so downstream
+        // can release them after processing instead of holding one giant batch.
         let stream = stream::once(async move {
             let index = opener.open().await?;
 
@@ -331,21 +334,50 @@ impl DataSource for InvertedIndexDataSource {
                 crate::warmup::warmup_inverted_index(&index, &queried_fields).await?;
             }
 
-            // Parse deferred raw queries now that we have an opened Index
-            let query = build_combined_query(
-                &index,
-                pre_parsed_query.as_ref(),
-                &raw_queries,
-            )?;
+            // Move sync tantivy I/O to a blocking thread so it doesn't
+            // block the Tokio executor.
+            tokio::task::spawn_blocking(move || {
+                // Parse deferred raw queries now that we have an opened Index
+                let query = build_combined_query(
+                    &index,
+                    pre_parsed_query.as_ref(),
+                    &raw_queries,
+                )?;
 
-            generate_inverted_index_batch(
-                &index,
-                segment_idx,
-                query.as_ref(),
-                projection.as_deref(),
-                &full_schema,
-                topk,
-            )
+                let batch = generate_inverted_index_batch(
+                    &index,
+                    segment_idx,
+                    query.as_ref(),
+                    projection.as_deref(),
+                    &full_schema,
+                    topk,
+                )?;
+
+                // Chunk the batch into batch_size-sized pieces for backpressure.
+                let total_rows = batch.num_rows();
+                if total_rows <= batch_size {
+                    Ok(vec![batch])
+                } else {
+                    let mut batches = Vec::new();
+                    let mut offset = 0;
+                    while offset < total_rows {
+                        let len = (total_rows - offset).min(batch_size);
+                        batches.push(batch.slice(offset, len));
+                        offset += len;
+                    }
+                    Ok(batches)
+                }
+            })
+            .await
+            .map_err(|e| {
+                datafusion::error::DataFusionError::Internal(format!(
+                    "spawn_blocking join error: {e}"
+                ))
+            })?
+        })
+        .flat_map(|result: Result<Vec<RecordBatch>>| match result {
+            Ok(batches) => stream::iter(batches.into_iter().map(Ok)).left_stream(),
+            Err(e) => stream::once(async move { Err(e) }).right_stream(),
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
