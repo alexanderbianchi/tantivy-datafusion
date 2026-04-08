@@ -21,13 +21,13 @@ use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{DisplayFormatType, Partitioning, SendableRecordBatchStream};
 use futures::stream::{self, StreamExt};
 use tantivy::collector::TopNComputer;
-use tantivy::query::{BooleanQuery, EnableScoring, QueryParser};
+use tantivy::query::{BooleanQuery, EnableScoring};
 use tantivy::schema::FieldType;
 use tantivy::{DocId, Index, Score};
 
 use crate::full_text_udf::extract_full_text_call;
 use crate::index_opener::{DirectIndexOpener, IndexOpener};
-use crate::table_provider::segment_hash_partitioning;
+use crate::decomposed::table_provider::segment_hash_partitioning;
 
 /// A DataFusion table provider backed by a tantivy inverted index.
 ///

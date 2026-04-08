@@ -3,8 +3,8 @@ use std::sync::Arc;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_datasource::source::DataSourceExec;
 
-use crate::single_table_provider::SingleTableDataSource;
-use crate::table_provider::FastFieldDataSource;
+use crate::unified::single_table_provider::SingleTableDataSource;
+use crate::decomposed::table_provider::FastFieldDataSource;
 
 /// Estimate the number of tasks (distributed workers) needed for a tantivy scan.
 ///

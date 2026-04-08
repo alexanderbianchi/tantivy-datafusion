@@ -651,7 +651,7 @@ impl DataSource for SingleTableDataSource {
                 let query = build_combined_query(&index, pre_built_query.as_ref(), &raw_queries)?;
 
                 tokio::task::spawn_blocking(move || {
-                    crate::agg_exec::execute_tantivy_agg(&index, &aggs, query.as_ref(), &schema)
+                    crate::unified::agg_exec::execute_tantivy_agg(&index, &aggs, query.as_ref(), &schema)
                 })
                 .await
                 .map_err(|e| DataFusionError::Internal(format!("spawn_blocking join error: {e}")))?

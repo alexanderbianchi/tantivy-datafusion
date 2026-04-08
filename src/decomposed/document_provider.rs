@@ -24,7 +24,7 @@ use futures::stream::{self, StreamExt};
 use tantivy::{Document, Index};
 
 use crate::index_opener::{DirectIndexOpener, IndexOpener};
-use crate::table_provider::segment_hash_partitioning;
+use crate::decomposed::table_provider::segment_hash_partitioning;
 
 /// A DataFusion table provider that returns full tantivy documents as JSON.
 ///

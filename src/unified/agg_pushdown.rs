@@ -13,8 +13,8 @@ use tantivy::aggregation::metric::{
     AverageAggregation, CountAggregation, MaxAggregation, MinAggregation, SumAggregation,
 };
 
-use crate::agg_exec::TantivyAggregateExec;
-use crate::plan_traversal::{
+use crate::unified::agg_exec::TantivyAggregateExec;
+use crate::unified::plan_traversal::{
     find_fast_field_datasource, find_partial_aggregate, find_single_table_datasource,
 };
 use datafusion_datasource::source::DataSourceExec;

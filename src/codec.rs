@@ -40,13 +40,13 @@ use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use futures::stream;
 use prost::Message;
 
-use crate::document_provider::{DocumentDataSource, TantivyDocumentProvider};
+use crate::decomposed::document_provider::{DocumentDataSource, TantivyDocumentProvider};
 use crate::full_text_udf::full_text_udf;
 use crate::index_opener::{IndexOpener, OpenerMetadata};
-use crate::inverted_index_provider::{InvertedIndexDataSource, TantivyInvertedIndexProvider};
+use crate::decomposed::inverted_index_provider::{InvertedIndexDataSource, TantivyInvertedIndexProvider};
 use crate::schema_mapping::tantivy_schema_to_arrow_with_multi_valued;
-use crate::single_table_provider::SingleTableDataSource;
-use crate::table_provider::{FastFieldDataSource, TantivyTableProvider};
+use crate::unified::single_table_provider::SingleTableDataSource;
+use crate::decomposed::table_provider::{FastFieldDataSource, TantivyTableProvider};
 
 // ── Opener factory as session extension ─────────────────────────────
 
@@ -536,7 +536,7 @@ impl ExecutionPlan for LazyScanExec {
                         .await?
                 }
                 SINGLE_TABLE => {
-                    use crate::single_table_provider::SingleTableProvider;
+                    use crate::unified::single_table_provider::SingleTableProvider;
                     let provider = SingleTableProvider::from_opener(opener);
                     // Register full_text UDF if there are queries
                     if !raw_queries_json.is_empty() {

@@ -9,8 +9,8 @@ use datafusion_physical_plan::coop::CooperativeExec;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 
-use crate::single_table_provider::SingleTableDataSource;
-use crate::table_provider::FastFieldDataSource;
+use crate::unified::single_table_provider::SingleTableDataSource;
+use crate::decomposed::table_provider::FastFieldDataSource;
 
 /// Check if a plan node is a single-child, row-preserving operator
 /// that is safe to traverse through during optimization.

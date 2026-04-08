@@ -15,7 +15,7 @@ use tantivy_datafusion::{
     TantivyInvertedIndexProvider, TantivyTableProvider, DocumentDataSource, full_text_udf,
     SingleTableProvider,
 };
-use tantivy_datafusion::single_table_provider::SingleTableDataSource;
+use tantivy_datafusion::unified::single_table_provider::SingleTableDataSource;
 
 /// Create a simple in-memory tantivy index for testing.
 fn create_test_index() -> Index {

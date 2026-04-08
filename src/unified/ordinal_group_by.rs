@@ -21,7 +21,7 @@ use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::ExecutionPlanProperties;
 use futures::stream;
 
-use crate::plan_traversal::{
+use crate::unified::plan_traversal::{
     find_data_source_exec, find_fast_field_datasource, find_single_table_datasource,
     is_transparent_operator_or_repartition,
 };

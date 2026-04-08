@@ -14,9 +14,9 @@ use tantivy::query::RangeQuery;
 use tantivy::schema::{FieldType, IndexRecordOption, Schema as TantivySchema, Term};
 use tantivy::DateTime;
 
-use crate::inverted_index_provider::InvertedIndexDataSource;
-use crate::plan_traversal::{find_data_source, rebuild_path};
-use crate::table_provider::FastFieldDataSource;
+use crate::decomposed::inverted_index_provider::InvertedIndexDataSource;
+use crate::unified::plan_traversal::{find_data_source, rebuild_path};
+use crate::decomposed::table_provider::FastFieldDataSource;
 
 /// A physical optimizer rule that moves fast field predicates from the probe
 /// side of a hash join into the inverted index's tantivy query on the build side.

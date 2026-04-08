@@ -11,7 +11,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use tantivy::Index;
 
-use crate::table_provider::TantivyTableProvider;
+use crate::decomposed::table_provider::TantivyTableProvider;
 
 /// A DataFusion catalog that discovers tantivy indices from a root directory.
 ///

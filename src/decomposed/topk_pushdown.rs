@@ -13,9 +13,9 @@ use datafusion_physical_plan::sorts::sort::SortExec;
 
 use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
 
-use crate::inverted_index_provider::InvertedIndexDataSource;
-use crate::plan_traversal::is_transparent_operator;
-use crate::table_provider::FastFieldDataSource;
+use crate::decomposed::inverted_index_provider::InvertedIndexDataSource;
+use crate::unified::plan_traversal::is_transparent_operator;
+use crate::decomposed::table_provider::FastFieldDataSource;
 
 /// A physical optimizer rule that pushes `ORDER BY _score DESC LIMIT K`
 /// into the `InvertedIndexDataSource` as a topK hint.

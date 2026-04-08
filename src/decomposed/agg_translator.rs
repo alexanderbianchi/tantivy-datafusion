@@ -19,9 +19,9 @@ use tantivy::aggregation::metric::{
 };
 use tantivy::Index;
 
-use crate::agg_pushdown::AggPushdown;
-use crate::ordinal_group_by::OrdinalGroupByOptimization;
-use crate::table_provider::TantivyTableProvider;
+use crate::unified::agg_pushdown::AggPushdown;
+use crate::unified::ordinal_group_by::OrdinalGroupByOptimization;
+use crate::decomposed::table_provider::TantivyTableProvider;
 
 /// Execute tantivy aggregations with native pushdown.
 ///
