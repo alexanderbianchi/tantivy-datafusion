@@ -587,26 +587,12 @@ fn generate_and_filter_batch(
 // Shared partitioning helper
 // ---------------------------------------------------------------------------
 
-/// Declare `Hash([_doc_id, _segment_ord], num_segments)` when both columns
-/// are present in the projected schema. All tantivy-backed providers use
-/// this so the optimizer recognises them as co-partitioned and skips
-/// unnecessary shuffles in join plans.
+/// Declare `Hash([_doc_id, _segment_ord], num_segments)` partitioning.
+///
+/// Re-exported from [`crate::util::segment_hash_partitioning`] for backward compatibility.
 pub(crate) fn segment_hash_partitioning(
     projected_schema: &SchemaRef,
     num_segments: usize,
 ) -> Partitioning {
-    if let (Ok(doc_id_idx), Ok(seg_ord_idx)) = (
-        projected_schema.index_of("_doc_id"),
-        projected_schema.index_of("_segment_ord"),
-    ) {
-        Partitioning::Hash(
-            vec![
-                Arc::new(Column::new("_doc_id", doc_id_idx)),
-                Arc::new(Column::new("_segment_ord", seg_ord_idx)),
-            ],
-            num_segments,
-        )
-    } else {
-        Partitioning::UnknownPartitioning(num_segments)
-    }
+    crate::util::segment_hash_partitioning(projected_schema, num_segments)
 }

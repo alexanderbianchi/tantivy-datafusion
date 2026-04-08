@@ -453,38 +453,14 @@ impl DataSource for InvertedIndexDataSource {
 
 /// Combine pre-parsed queries with raw query strings into a single tantivy query.
 /// Raw queries are parsed using `QueryParser::for_index` which requires an opened `Index`.
+///
+/// Re-exported from [`crate::util::build_combined_query`] for backward compatibility.
 pub(crate) fn build_combined_query(
     index: &Index,
     pre_parsed: Option<&Arc<dyn tantivy::query::Query>>,
     raw_queries: &[(String, String)],
 ) -> Result<Option<Arc<dyn tantivy::query::Query>>> {
-    let mut queries: Vec<Box<dyn tantivy::query::Query>> = Vec::new();
-
-    if let Some(q) = pre_parsed {
-        queries.push(q.box_clone());
-    }
-
-    let tantivy_schema = index.schema();
-    for (field_name, query_string) in raw_queries {
-        let field = tantivy_schema.get_field(field_name).map_err(|e| {
-            DataFusionError::Plan(format!(
-                "full_text: field '{field_name}' not found: {e}"
-            ))
-        })?;
-        let parser = QueryParser::for_index(index, vec![field]);
-        let parsed = parser.parse_query(query_string).map_err(|e| {
-            DataFusionError::Plan(format!(
-                "full_text: failed to parse '{query_string}': {e}"
-            ))
-        })?;
-        queries.push(parsed);
-    }
-
-    match queries.len() {
-        0 => Ok(None),
-        1 => Ok(Some(Arc::from(queries.into_iter().next().unwrap()))),
-        _ => Ok(Some(Arc::new(BooleanQuery::intersection(queries)))),
-    }
+    crate::util::build_combined_query(index, pre_parsed, raw_queries)
 }
 
 // ---------------------------------------------------------------------------

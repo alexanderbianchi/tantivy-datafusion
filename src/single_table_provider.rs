@@ -33,9 +33,8 @@ use tantivy::{DateTime, DocId, Document, Index, Score};
 use crate::fast_field_reader::read_segment_fast_fields_to_batch;
 use crate::full_text_udf::extract_full_text_call;
 use crate::index_opener::{DirectIndexOpener, IndexOpener};
-use crate::inverted_index_provider::build_combined_query;
 use crate::schema_mapping::{tantivy_schema_to_arrow, tantivy_schema_to_arrow_from_index};
-use crate::table_provider::segment_hash_partitioning;
+use crate::util::{build_combined_query, segment_hash_partitioning};
 
 // ---------------------------------------------------------------------------
 // Per-partition statistics for partition pruning
