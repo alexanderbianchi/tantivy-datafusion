@@ -87,6 +87,14 @@ impl DirectIndexOpener {
     pub fn new(index: Index) -> Self {
         Self { index }
     }
+
+    /// Returns a reference to the wrapped tantivy Index.
+    ///
+    /// This is cheap (no I/O) and is used at planning time to read
+    /// per-segment statistics for partition pruning.
+    pub fn index(&self) -> &Index {
+        &self.index
+    }
 }
 
 #[async_trait]

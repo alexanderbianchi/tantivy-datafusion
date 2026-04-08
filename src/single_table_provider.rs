@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use arrow::array::{AsArray, Float32Array, RecordBatch, StringBuilder};
 use arrow::compute::filter_record_batch;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::config::ConfigOptions;
@@ -36,6 +36,123 @@ use crate::index_opener::{DirectIndexOpener, IndexOpener};
 use crate::inverted_index_provider::build_combined_query;
 use crate::schema_mapping::{tantivy_schema_to_arrow, tantivy_schema_to_arrow_from_index};
 use crate::table_provider::segment_hash_partitioning;
+
+// ---------------------------------------------------------------------------
+// Per-partition statistics for partition pruning
+// ---------------------------------------------------------------------------
+
+/// Per-segment (partition) statistics derived from tantivy fast field metadata.
+///
+/// Used by `partition_statistics()` to report column min/max values so that
+/// DataFusion's partition pruning can skip segments whose value ranges do not
+/// overlap the query's WHERE clause.
+#[derive(Debug, Clone)]
+struct PartitionStat {
+    num_rows: usize,
+    /// Column name -> (min, max) as `ScalarValue`.
+    column_stats: Vec<(String, Option<ScalarValue>, Option<ScalarValue>)>,
+}
+
+/// Eagerly compute per-segment partition statistics from a local tantivy index.
+///
+/// Reads fast field min/max from each segment's columnar data. This is cheap:
+/// it only reads column metadata, not document values.
+fn compute_partition_stats(
+    index: &Index,
+    ff_schema: &SchemaRef,
+) -> Result<Vec<Option<PartitionStat>>> {
+    let reader = index
+        .reader()
+        .map_err(|e| DataFusionError::Internal(format!("open reader for stats: {e}")))?;
+    let searcher = reader.searcher();
+
+    let mut stats = Vec::with_capacity(searcher.segment_readers().len());
+    for seg_reader in searcher.segment_readers() {
+        let num_rows = seg_reader.max_doc() as usize;
+        // Subtract deleted docs for an accurate alive count.
+        let alive = seg_reader
+            .alive_bitset()
+            .map_or(num_rows, |b| b.num_alive_docs());
+
+        let fast_fields = seg_reader.fast_fields();
+        let mut column_stats = Vec::new();
+
+        for field in ff_schema.fields() {
+            let name = field.name();
+            if name == "_doc_id" || name == "_segment_ord" {
+                continue;
+            }
+
+            let (min_val, max_val) = match field.data_type() {
+                DataType::UInt64 => {
+                    if let Ok(col) = fast_fields.u64(name) {
+                        (
+                            Some(ScalarValue::UInt64(Some(col.min_value()))),
+                            Some(ScalarValue::UInt64(Some(col.max_value()))),
+                        )
+                    } else {
+                        (None, None)
+                    }
+                }
+                DataType::Int64 => {
+                    if let Ok(col) = fast_fields.i64(name) {
+                        (
+                            Some(ScalarValue::Int64(Some(col.min_value()))),
+                            Some(ScalarValue::Int64(Some(col.max_value()))),
+                        )
+                    } else {
+                        (None, None)
+                    }
+                }
+                DataType::Float64 => {
+                    if let Ok(col) = fast_fields.f64(name) {
+                        (
+                            Some(ScalarValue::Float64(Some(col.min_value()))),
+                            Some(ScalarValue::Float64(Some(col.max_value()))),
+                        )
+                    } else {
+                        (None, None)
+                    }
+                }
+                DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                    if let Ok(col) = fast_fields.date(name) {
+                        (
+                            Some(ScalarValue::TimestampMicrosecond(
+                                Some(col.min_value().into_timestamp_micros()),
+                                None,
+                            )),
+                            Some(ScalarValue::TimestampMicrosecond(
+                                Some(col.max_value().into_timestamp_micros()),
+                                None,
+                            )),
+                        )
+                    } else {
+                        (None, None)
+                    }
+                }
+                DataType::Boolean => {
+                    if let Ok(col) = fast_fields.bool(name) {
+                        (
+                            Some(ScalarValue::Boolean(Some(col.min_value()))),
+                            Some(ScalarValue::Boolean(Some(col.max_value()))),
+                        )
+                    } else {
+                        (None, None)
+                    }
+                }
+                _ => (None, None),
+            };
+
+            column_stats.push((name.to_string(), min_val, max_val));
+        }
+
+        stats.push(Some(PartitionStat {
+            num_rows: alive,
+            column_stats,
+        }));
+    }
+    Ok(stats)
+}
 
 /// A single-table DataFusion provider for tantivy indexes.
 ///
@@ -245,6 +362,18 @@ impl TableProvider for SingleTableProvider {
         let segment_sizes = self.opener.segment_sizes();
         let num_segments = segment_sizes.len().max(1);
 
+        // 4. Compute per-partition statistics for partition pruning.
+        // For DirectIndexOpener (local), we can cheaply read fast field
+        // min/max from columnar metadata. For remote openers, stats are
+        // unavailable and we fall back to unknown.
+        let partition_stats: Vec<Option<PartitionStat>> = if let Some(direct) =
+            self.opener.as_any().downcast_ref::<DirectIndexOpener>()
+        {
+            compute_partition_stats(direct.index(), &self.fast_field_schema)?
+        } else {
+            vec![None; num_segments]
+        };
+
         let data_source = SingleTableDataSource {
             opener: self.opener.clone(),
             unified_schema: self.unified_schema.clone(),
@@ -264,6 +393,7 @@ impl TableProvider for SingleTableProvider {
             pushed_filters: Vec::new(),
             aggregations: self.aggregations.clone(),
             agg_mode: None,
+            partition_stats,
         };
 
         Ok(Arc::new(DataSourceExec::new(Arc::new(data_source))))
@@ -300,6 +430,10 @@ pub struct SingleTableDataSource {
     /// native aggregation instead of streaming rows. The output schema changes
     /// to match the aggregation results.
     agg_mode: Option<(Arc<Aggregations>, SchemaRef)>,
+    /// Per-partition (segment) statistics for partition pruning.
+    /// Indexed by partition number. `None` means stats are unavailable for
+    /// that partition (e.g. remote opener without metadata).
+    partition_stats: Vec<Option<PartitionStat>>,
 }
 
 impl SingleTableDataSource {
@@ -323,6 +457,7 @@ impl SingleTableDataSource {
             pushed_filters: self.pushed_filters.clone(),
             aggregations: self.aggregations.clone(),
             agg_mode: self.agg_mode.clone(),
+            partition_stats: self.partition_stats.clone(),
         };
         f(&mut new);
         new
@@ -386,6 +521,81 @@ impl SingleTableDataSource {
     #[allow(dead_code)]
     pub(crate) fn agg_mode(&self) -> Option<&(Arc<Aggregations>, SchemaRef)> {
         self.agg_mode.as_ref()
+    }
+
+    /// Aggregate per-partition statistics into overall table statistics.
+    ///
+    /// - `num_rows` = sum of all partition row counts
+    /// - column `min_value` = minimum across all partition minimums
+    /// - column `max_value` = maximum across all partition maximums
+    fn aggregate_statistics(&self) -> Result<Statistics> {
+        use datafusion::common::stats::Precision;
+        use datafusion::common::ColumnStatistics;
+
+        if self.agg_mode.is_some() {
+            return Ok(Statistics::new_unknown(&self.projected_schema));
+        }
+
+        // Collect only the partitions that have stats.
+        let known: Vec<&PartitionStat> = self
+            .partition_stats
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .collect();
+
+        if known.is_empty() {
+            return Ok(Statistics::new_unknown(&self.projected_schema));
+        }
+
+        let total_rows: usize = known.iter().map(|s| s.num_rows).sum();
+        let num_rows = Precision::Exact(total_rows);
+
+        let column_statistics: Vec<ColumnStatistics> = self
+            .projected_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let name = field.name();
+                let mut overall_min: Precision<ScalarValue> = Precision::Absent;
+                let mut overall_max: Precision<ScalarValue> = Precision::Absent;
+
+                for stat in &known {
+                    if let Some((_, min_val, max_val)) =
+                        stat.column_stats.iter().find(|(n, _, _)| n == name)
+                    {
+                        if let Some(min_v) = min_val {
+                            let p = Precision::Exact(min_v.clone());
+                            overall_min = match overall_min {
+                                Precision::Absent => p,
+                                prev => prev.min(&p),
+                            };
+                        }
+                        if let Some(max_v) = max_val {
+                            let p = Precision::Exact(max_v.clone());
+                            overall_max = match overall_max {
+                                Precision::Absent => p,
+                                prev => prev.max(&p),
+                            };
+                        }
+                    }
+                }
+
+                ColumnStatistics {
+                    null_count: Precision::Absent,
+                    max_value: overall_max,
+                    min_value: overall_min,
+                    sum_value: Precision::Absent,
+                    distinct_count: Precision::Absent,
+                    byte_size: Precision::Absent,
+                }
+            })
+            .collect();
+
+        Ok(Statistics {
+            num_rows,
+            total_byte_size: Precision::Absent,
+            column_statistics,
+        })
     }
 
     /// Access the projection indices.
@@ -563,8 +773,63 @@ impl DataSource for SingleTableDataSource {
         EquivalenceProperties::new(self.projected_schema.clone())
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
-        Ok(Statistics::new_unknown(&self.projected_schema))
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+        use datafusion::common::stats::Precision;
+        use datafusion::common::ColumnStatistics;
+
+        // In aggregation mode the output schema is different and per-row
+        // statistics don't apply.
+        if self.agg_mode.is_some() {
+            return Ok(Statistics::new_unknown(&self.projected_schema));
+        }
+
+        let partition = match partition {
+            Some(p) => p,
+            None => {
+                // Aggregate across all partitions.
+                return self.aggregate_statistics();
+            }
+        };
+
+        let stat = match self.partition_stats.get(partition) {
+            Some(Some(s)) => s,
+            _ => return Ok(Statistics::new_unknown(&self.projected_schema)),
+        };
+
+        let num_rows = Precision::Exact(stat.num_rows);
+
+        let column_statistics: Vec<ColumnStatistics> = self
+            .projected_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let name = field.name();
+                if let Some((_, min_val, max_val)) =
+                    stat.column_stats.iter().find(|(n, _, _)| n == name)
+                {
+                    ColumnStatistics {
+                        null_count: Precision::Absent,
+                        max_value: max_val
+                            .clone()
+                            .map_or(Precision::Absent, Precision::Exact),
+                        min_value: min_val
+                            .clone()
+                            .map_or(Precision::Absent, Precision::Exact),
+                        sum_value: Precision::Absent,
+                        distinct_count: Precision::Absent,
+                        byte_size: Precision::Absent,
+                    }
+                } else {
+                    ColumnStatistics::new_unknown()
+                }
+            })
+            .collect();
+
+        Ok(Statistics {
+            num_rows,
+            total_byte_size: Precision::Absent,
+            column_statistics,
+        })
     }
 
     fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
