@@ -1012,130 +1012,141 @@ fn generate_single_table_batch(
         return Ok(vec![RecordBatch::new_empty(projected_schema.clone())]);
     }
 
-    // Step 2: Read fast fields for the collected doc_ids.
-    let ff_batch = read_segment_fast_fields_to_batch(
-        segment_reader,
-        ff_projected_schema,
-        Some(&doc_ids),
-        None,
-        None,
-        segment_idx as u32,
-    )?;
-
-    let num_rows = ff_batch.num_rows();
-
-    // Step 3: Build score array.
-    let score_array: Option<Arc<dyn arrow::array::Array>> = if needs_score {
-        match scores {
-            Some(score_vec) => Some(Arc::new(Float32Array::from(score_vec))),
-            None => Some(arrow::array::new_null_array(&DataType::Float32, num_rows)),
-        }
+    // Step 2: Process doc_ids in batch_size chunks so that fast-field reads,
+    // document fetches, score arrays, and filter application are bounded by
+    // batch_size rather than the full segment size.
+    let tantivy_schema = index.schema();
+    let store_reader = if needs_document {
+        Some(
+            segment_reader
+                .get_store_reader(100)
+                .map_err(|e| DataFusionError::Internal(format!("open store reader: {e}")))?,
+        )
     } else {
         None
     };
 
-    // Step 4: Build document array if needed.
-    let doc_array: Option<Arc<dyn arrow::array::Array>> = if needs_document {
-        let tantivy_schema = index.schema();
-        let store_reader = segment_reader
-            .get_store_reader(100)
-            .map_err(|e| DataFusionError::Internal(format!("open store reader: {e}")))?;
-
-        let mut doc_builder =
-            StringBuilder::with_capacity(doc_ids.len(), doc_ids.len() * 256);
-        for &doc_id in &doc_ids {
-            let doc: tantivy::TantivyDocument = store_reader.get(doc_id).map_err(|e| {
-                DataFusionError::Internal(format!("read doc {doc_id}: {e}"))
-            })?;
-            let json = doc.to_json(&tantivy_schema);
-            doc_builder.append_value(&json);
-        }
-        Some(Arc::new(doc_builder.finish()) as Arc<dyn arrow::array::Array>)
-    } else {
-        None
-    };
-
-    // Step 5: Assemble the output batch by picking columns from the unified schema
-    // according to the projection.
     let projected_indices: Vec<usize> = match projection {
         Some(indices) => indices.to_vec(),
         None => (0..unified_schema.fields().len()).collect(),
     };
 
-    let mut output_columns: Vec<Arc<dyn arrow::array::Array>> =
-        Vec::with_capacity(projected_indices.len());
+    let mut batches = Vec::new();
+    let total = doc_ids.len();
+    let mut offset = 0;
 
-    for &unified_idx in &projected_indices {
-        if unified_idx == score_column_idx {
-            output_columns.push(
-                score_array
-                    .clone()
-                    .unwrap_or_else(|| arrow::array::new_null_array(&DataType::Float32, num_rows)),
-            );
-        } else if unified_idx == document_column_idx {
-            output_columns.push(
-                doc_array
-                    .clone()
-                    .expect("_document requested but not built"),
-            );
+    while offset < total {
+        let end = (offset + batch_size).min(total);
+        let chunk_ids = &doc_ids[offset..end];
+        let chunk_scores: Option<&[f32]> = scores.as_ref().map(|s| &s[offset..end]);
+
+        // Read fast fields for this chunk only.
+        let ff_batch = read_segment_fast_fields_to_batch(
+            segment_reader,
+            ff_projected_schema,
+            Some(chunk_ids),
+            None,
+            None,
+            segment_idx as u32,
+        )?;
+
+        let chunk_rows = ff_batch.num_rows();
+
+        // Build score array for this chunk.
+        let score_array: Option<Arc<dyn arrow::array::Array>> = if needs_score {
+            match chunk_scores {
+                Some(sc) => Some(Arc::new(Float32Array::from(sc.to_vec()))),
+                None => Some(arrow::array::new_null_array(&DataType::Float32, chunk_rows)),
+            }
         } else {
-            let col_name = unified_schema.field(unified_idx).name();
-            let ff_col_idx = ff_batch.schema().index_of(col_name).map_err(|_| {
-                DataFusionError::Internal(format!(
-                    "fast field column '{col_name}' not found in ff_batch"
-                ))
-            })?;
-            output_columns.push(ff_batch.column(ff_col_idx).clone());
-        }
-    }
-
-    let mut output_batch = RecordBatch::try_new(projected_schema.clone(), output_columns)
-        .map_err(|e| DataFusionError::Internal(format!("build output batch: {e}")))?;
-
-    // Step 6: Apply pushed-down filters on the assembled output batch.
-    // Filters reference column indices in the projected schema, so they must
-    // be evaluated after the full batch is built.
-    for filter in pushed_filters {
-        if output_batch.num_rows() == 0 {
-            break;
-        }
-        let result = filter.evaluate(&output_batch)?;
-        let mask = match result {
-            datafusion::physical_plan::ColumnarValue::Scalar(
-                datafusion::common::ScalarValue::Boolean(Some(true)),
-            ) => continue,
-            datafusion::physical_plan::ColumnarValue::Scalar(
-                datafusion::common::ScalarValue::Boolean(Some(false)),
-            ) => {
-                return Ok(vec![RecordBatch::new_empty(projected_schema.clone())]);
-            }
-            datafusion::physical_plan::ColumnarValue::Array(arr) => arr.as_boolean().clone(),
-            other => {
-                let arr = other.into_array(output_batch.num_rows())?;
-                arr.as_boolean().clone()
-            }
+            None
         };
-        output_batch = filter_record_batch(&output_batch, &mask)?;
-    }
 
-    if output_batch.num_rows() == 0 {
-        return Ok(vec![RecordBatch::new_empty(projected_schema.clone())]);
-    }
+        // Build document array for this chunk.
+        let doc_array: Option<Arc<dyn arrow::array::Array>> = if needs_document {
+            let store = store_reader.as_ref().unwrap();
+            let mut doc_builder =
+                StringBuilder::with_capacity(chunk_ids.len(), chunk_ids.len() * 256);
+            for &doc_id in chunk_ids {
+                let doc: tantivy::TantivyDocument = store.get(doc_id).map_err(|e| {
+                    DataFusionError::Internal(format!("read doc {doc_id}: {e}"))
+                })?;
+                let json = doc.to_json(&tantivy_schema);
+                doc_builder.append_value(&json);
+            }
+            Some(Arc::new(doc_builder.finish()) as Arc<dyn arrow::array::Array>)
+        } else {
+            None
+        };
 
-    // Step 7: Chunk into batch_size pieces.
-    let total_rows = output_batch.num_rows();
-    if total_rows <= batch_size {
-        Ok(vec![output_batch])
-    } else {
-        let mut batches = Vec::new();
-        let mut offset = 0;
-        while offset < total_rows {
-            let len = (total_rows - offset).min(batch_size);
-            batches.push(output_batch.slice(offset, len));
-            offset += len;
+        // Assemble output columns for this chunk.
+        let mut output_columns: Vec<Arc<dyn arrow::array::Array>> =
+            Vec::with_capacity(projected_indices.len());
+
+        for &unified_idx in &projected_indices {
+            if unified_idx == score_column_idx {
+                output_columns.push(
+                    score_array.clone().unwrap_or_else(|| {
+                        arrow::array::new_null_array(&DataType::Float32, chunk_rows)
+                    }),
+                );
+            } else if unified_idx == document_column_idx {
+                output_columns.push(
+                    doc_array
+                        .clone()
+                        .expect("_document requested but not built"),
+                );
+            } else {
+                let col_name = unified_schema.field(unified_idx).name();
+                let ff_col_idx = ff_batch.schema().index_of(col_name).map_err(|_| {
+                    DataFusionError::Internal(format!(
+                        "fast field column '{col_name}' not found in ff_batch"
+                    ))
+                })?;
+                output_columns.push(ff_batch.column(ff_col_idx).clone());
+            }
         }
-        Ok(batches)
+
+        let mut output_batch = RecordBatch::try_new(projected_schema.clone(), output_columns)
+            .map_err(|e| DataFusionError::Internal(format!("build output batch: {e}")))?;
+
+        // Apply pushed-down filters on this chunk.
+        for filter in pushed_filters {
+            if output_batch.num_rows() == 0 {
+                break;
+            }
+            let result = filter.evaluate(&output_batch)?;
+            let mask = match result {
+                datafusion::physical_plan::ColumnarValue::Scalar(
+                    datafusion::common::ScalarValue::Boolean(Some(true)),
+                ) => continue,
+                datafusion::physical_plan::ColumnarValue::Scalar(
+                    datafusion::common::ScalarValue::Boolean(Some(false)),
+                ) => {
+                    output_batch = RecordBatch::new_empty(projected_schema.clone());
+                    break;
+                }
+                datafusion::physical_plan::ColumnarValue::Array(arr) => arr.as_boolean().clone(),
+                other => {
+                    let arr = other.into_array(output_batch.num_rows())?;
+                    arr.as_boolean().clone()
+                }
+            };
+            output_batch = filter_record_batch(&output_batch, &mask)?;
+        }
+
+        if output_batch.num_rows() > 0 {
+            batches.push(output_batch);
+        }
+
+        offset = end;
     }
+
+    if batches.is_empty() {
+        batches.push(RecordBatch::new_empty(projected_schema.clone()));
+    }
+
+    Ok(batches)
 }
 
 // ---------------------------------------------------------------------------
