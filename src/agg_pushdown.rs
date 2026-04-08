@@ -4,8 +4,14 @@ use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::Result;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_optimizer::PhysicalOptimizerRule;
 use datafusion_physical_plan::aggregates::{AggregateExec, AggregateMode};
+use tantivy::aggregation::agg_req::{Aggregation, AggregationVariants, Aggregations};
+use tantivy::aggregation::bucket::TermsAggregation;
+use tantivy::aggregation::metric::{
+    AverageAggregation, CountAggregation, MaxAggregation, MinAggregation, SumAggregation,
+};
 
 use crate::agg_exec::TantivyAggregateExec;
 use crate::plan_traversal::{
@@ -95,7 +101,10 @@ fn try_rewrite_single(
     }
 
     let input = agg.input();
+
+    // Try FastFieldDataSource first
     if let Some(ff_ds) = find_fast_field_datasource(input) {
+        // Check stashed aggregations (backward compat)
         if let Some(tantivy_aggs) = ff_ds.aggregations() {
             let new_exec = TantivyAggregateExec::new(
                 ff_ds.opener().clone(),
@@ -105,13 +114,37 @@ fn try_rewrite_single(
             );
             return Ok(Transformed::yes(Arc::new(new_exec)));
         }
+
+        // Fallback: derive from AggregateExec expressions
+        if let Some(tantivy_aggs) = derive_tantivy_aggregations(agg) {
+            let new_exec = TantivyAggregateExec::new(
+                ff_ds.opener().clone(),
+                Arc::new(tantivy_aggs),
+                ff_ds.query().map(|q| Arc::from(q.box_clone())),
+                agg.schema(),
+            );
+            return Ok(Transformed::yes(Arc::new(new_exec)));
+        }
     }
 
+    // Try SingleTableDataSource
     if let Some(st_ds) = find_single_table_datasource(input) {
+        // Check stashed aggregations (backward compat)
         if let Some(tantivy_aggs) = st_ds.aggregations() {
             let new_exec = TantivyAggregateExec::new(
                 st_ds.opener().clone(),
                 tantivy_aggs.clone(),
+                None,
+                agg.schema(),
+            );
+            return Ok(Transformed::yes(Arc::new(new_exec)));
+        }
+
+        // Fallback: derive from AggregateExec expressions
+        if let Some(tantivy_aggs) = derive_tantivy_aggregations(agg) {
+            let new_exec = TantivyAggregateExec::new(
+                st_ds.opener().clone(),
+                Arc::new(tantivy_aggs),
                 None,
                 agg.schema(),
             );
@@ -140,7 +173,10 @@ fn try_rewrite_two_phase(
     };
 
     let partial_input = partial_agg.input();
+
+    // Try FastFieldDataSource first
     if let Some(ff_ds) = find_fast_field_datasource(partial_input) {
+        // Check stashed aggregations (backward compat)
         if let Some(tantivy_aggs) = ff_ds.aggregations() {
             let new_exec = TantivyAggregateExec::new(
                 ff_ds.opener().clone(),
@@ -150,9 +186,22 @@ fn try_rewrite_two_phase(
             );
             return Ok(Transformed::yes(Arc::new(new_exec)));
         }
+
+        // Fallback: derive from the Final AggregateExec expressions
+        if let Some(tantivy_aggs) = derive_tantivy_aggregations(final_agg) {
+            let new_exec = TantivyAggregateExec::new(
+                ff_ds.opener().clone(),
+                Arc::new(tantivy_aggs),
+                ff_ds.query().map(|q| Arc::from(q.box_clone())),
+                final_agg.schema(),
+            );
+            return Ok(Transformed::yes(Arc::new(new_exec)));
+        }
     }
 
+    // Try SingleTableDataSource
     if let Some(st_ds) = find_single_table_datasource(partial_input) {
+        // Check stashed aggregations (backward compat)
         if let Some(tantivy_aggs) = st_ds.aggregations() {
             let new_exec = TantivyAggregateExec::new(
                 st_ds.opener().clone(),
@@ -162,8 +211,104 @@ fn try_rewrite_two_phase(
             );
             return Ok(Transformed::yes(Arc::new(new_exec)));
         }
+
+        // Fallback: derive from the Final AggregateExec expressions
+        if let Some(tantivy_aggs) = derive_tantivy_aggregations(final_agg) {
+            let new_exec = TantivyAggregateExec::new(
+                st_ds.opener().clone(),
+                Arc::new(tantivy_aggs),
+                None,
+                final_agg.schema(),
+            );
+            return Ok(Transformed::yes(Arc::new(new_exec)));
+        }
     }
 
     Ok(Transformed::no(plan.clone()))
+}
+
+// ---------------------------------------------------------------------------
+// Derive tantivy Aggregations from DataFusion's AggregateExec
+// ---------------------------------------------------------------------------
+
+/// Try to derive tantivy `Aggregations` from an `AggregateExec`'s group-by
+/// and aggregate expressions. Returns `None` if the expressions cannot be
+/// mapped to supported tantivy aggregations.
+///
+/// This enables the BYOC/Substrait path where `AggregateExec` is built by
+/// DataFusion's Substrait consumer and no pre-stashed aggregations exist.
+fn derive_tantivy_aggregations(agg: &AggregateExec) -> Option<Aggregations> {
+    let group_exprs = agg.group_expr();
+    if group_exprs.is_empty() {
+        // Metric-only aggregation (no GROUP BY) — not pushed down by this rule
+        return None;
+    }
+
+    // For bucket aggregations, we only support a single GROUP BY column
+    // (maps to a tantivy TermsAggregation). Multi-column GROUP BY is not
+    // supported by tantivy.
+    if group_exprs.expr().len() != 1 {
+        return None;
+    }
+
+    let (group_expr, _alias) = &group_exprs.expr()[0];
+    let group_col = group_expr.as_any().downcast_ref::<Column>()?;
+    let group_field = group_col.name().to_string();
+
+    // Build sub-aggregations from the aggregate expressions
+    let mut sub_aggs = Aggregations::default();
+    for agg_fn in agg.aggr_expr() {
+        let func_name = agg_fn.fun().name();
+        let args = agg_fn.expressions();
+
+        // Get the field name from the first argument.
+        // COUNT(*) becomes COUNT(1) with a Literal expression, not a Column.
+        // Skip it — tantivy's TermsAggregation includes doc_count automatically.
+        let field_name = if let Some(col) = args
+            .first()
+            .and_then(|e| e.as_any().downcast_ref::<Column>())
+        {
+            col.name().to_string()
+        } else {
+            // COUNT(1) / COUNT(*) or other non-column expression — skip
+            continue;
+        };
+
+        let agg_name = agg_fn.name().to_string();
+        let variant = match func_name {
+            "sum" => AggregationVariants::Sum(SumAggregation::from_field_name(field_name)),
+            "avg" => AggregationVariants::Average(AverageAggregation::from_field_name(field_name)),
+            "min" => AggregationVariants::Min(MinAggregation::from_field_name(field_name)),
+            "max" => AggregationVariants::Max(MaxAggregation::from_field_name(field_name)),
+            "count" => AggregationVariants::Count(CountAggregation::from_field_name(field_name)),
+            _ => return None, // Unsupported aggregate function
+        };
+
+        sub_aggs.insert(
+            agg_name,
+            Aggregation {
+                agg: variant,
+                sub_aggregation: Default::default(),
+            },
+        );
+    }
+
+    // Build the top-level terms aggregation
+    let terms = TermsAggregation {
+        field: group_field,
+        size: Some(65535), // Return all terms by default
+        ..Default::default()
+    };
+
+    let mut aggs = Aggregations::default();
+    aggs.insert(
+        "group".to_string(),
+        Aggregation {
+            agg: AggregationVariants::Terms(terms),
+            sub_aggregation: sub_aggs,
+        },
+    );
+
+    Some(aggs)
 }
 
