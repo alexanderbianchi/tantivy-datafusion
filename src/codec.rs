@@ -542,10 +542,9 @@ impl ExecutionPlan for LazyScanExec {
         let segment_sizes = self.segment_sizes.clone();
         let identifier = self.identifier.clone();
         let projection = self.projection.clone();
-        let _output_partitions = self.output_partitions as usize;
+        let output_partitions = self.output_partitions as usize;
         let provider_type = self.provider_type;
         let raw_queries_json = self.raw_queries_json.clone();
-        let _pushed_filter_bytes = self.pushed_filter_bytes.clone();
         let topk = self.topk;
         let footer_start = self.footer_start;
         let footer_end = self.footer_end;
@@ -575,7 +574,6 @@ impl ExecutionPlan for LazyScanExec {
                 SINGLE_TABLE => {
                     // Construct SingleTableDataSource directly — no SessionContext needed.
                     let mv_fields = opener.multi_valued_fields();
-                    let seg_sizes = opener.segment_sizes();
                     let scan_schema = build_single_table_scan_schema(
                         &opener,
                         &mv_fields,
@@ -592,7 +590,7 @@ impl ExecutionPlan for LazyScanExec {
                         &fast_field_filters_json,
                         &opener.schema(),
                     )?;
-                    let num_segments = seg_sizes.len().max(1);
+                    let num_segments = output_partitions.max(1);
                     let ds = SingleTableDataSource::new_from_codec(
                         opener,
                         scan_schema,
