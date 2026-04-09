@@ -459,7 +459,6 @@ impl ExecutionPlan for LazyScanExec {
         let segment_sizes = self.segment_sizes.clone();
         let identifier = self.identifier.clone();
         let projection = self.projection.clone();
-        let schema = self.projected_schema.clone();
         let output_partitions = self.output_partitions as usize;
         let provider_type = self.provider_type;
         let raw_queries_json = self.raw_queries_json.clone();
@@ -469,6 +468,7 @@ impl ExecutionPlan for LazyScanExec {
         let footer_end = self.footer_end;
         let multi_valued_fields = self.multi_valued_fields.clone();
 
+        let schema_clone = self.projected_schema.clone();
         let stream = stream::once(async move {
             let tantivy_schema: tantivy::schema::Schema =
                 serde_json::from_str(&tantivy_schema_json)
@@ -618,22 +618,17 @@ impl ExecutionPlan for LazyScanExec {
                     exec
                 };
 
-            use futures::TryStreamExt;
-            let inner_stream = exec.execute(partition, context)?;
-            let batches: Vec<arrow::record_batch::RecordBatch> = inner_stream.try_collect().await?;
-            if batches.is_empty() {
-                Ok(vec![arrow::record_batch::RecordBatch::new_empty(schema)])
-            } else {
-                Ok(batches)
-            }
+            // Forward the inner stream directly — no collecting into Vec.
+            exec.execute(partition, context)
         })
-        .flat_map(|result: Result<Vec<arrow::record_batch::RecordBatch>>| match result {
-            Ok(batches) => stream::iter(batches.into_iter().map(Ok)).left_stream(),
+        // Flatten Result<Stream<Result<Batch>>> into Stream<Result<Batch>>
+        .flat_map(move |result: Result<SendableRecordBatchStream>| match result {
+            Ok(inner_stream) => inner_stream.left_stream(),
             Err(e) => stream::once(async move { Err(e) }).right_stream(),
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            self.projected_schema.clone(),
+            schema_clone,
             stream,
         )))
     }

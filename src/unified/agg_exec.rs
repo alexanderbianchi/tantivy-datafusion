@@ -132,6 +132,27 @@ impl ExecutionPlan for TantivyAggregateExec {
 
         let stream = stream::once(async move {
             let index = opener.open().await?;
+
+            // Warm fast fields for aggregation.
+            crate::warmup::warmup_fast_fields(&index).await?;
+            // Warm inverted index if a query filter is active.
+            if query.is_some() {
+                let tantivy_schema = index.schema();
+                let text_fields: Vec<tantivy::schema::Field> = tantivy_schema
+                    .fields()
+                    .filter_map(|(f, entry)| {
+                        if matches!(entry.field_type(), tantivy::schema::FieldType::Str(_)) {
+                            Some(f)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !text_fields.is_empty() {
+                    crate::warmup::warmup_inverted_index(&index, &text_fields).await?;
+                }
+            }
+
             tokio::task::spawn_blocking(move || {
                 execute_tantivy_agg(&index, &aggs, query.as_ref(), &schema)
             })

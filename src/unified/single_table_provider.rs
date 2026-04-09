@@ -36,6 +36,15 @@ use crate::index_opener::{DirectIndexOpener, IndexOpener};
 use crate::schema_mapping::{tantivy_schema_to_arrow, tantivy_schema_to_arrow_from_index};
 use crate::util::{build_combined_query, segment_hash_partitioning};
 
+/// Guard that aborts a spawned task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-partition statistics for partition pruning
 // ---------------------------------------------------------------------------
@@ -541,14 +550,14 @@ impl SingleTableDataSource {
                         stat.column_stats.iter().find(|(n, _, _)| n == name)
                     {
                         if let Some(min_v) = min_val {
-                            let p = Precision::Exact(min_v.clone());
+                            let p = Precision::Inexact(min_v.clone());
                             overall_min = match overall_min {
                                 Precision::Absent => p,
                                 prev => prev.min(&p),
                             };
                         }
                         if let Some(max_v) = max_val {
-                            let p = Precision::Exact(max_v.clone());
+                            let p = Precision::Inexact(max_v.clone());
                             overall_max = match overall_max {
                                 Precision::Absent => p,
                                 prev => prev.max(&p),
@@ -620,12 +629,17 @@ impl DataSource for SingleTableDataSource {
         let schema = self.projected_schema.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(2);
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             // Async setup: open index + warmup
             let index = match opener.open().await {
                 Ok(i) => i,
                 Err(e) => { let _ = tx.send(Err(e)).await; return; }
             };
+
+            // Note: warmup is called per-partition but is idempotent — tantivy's
+            // read_bytes_async populates a file slice cache. After the first
+            // partition warms the data, subsequent partitions' warmup calls are
+            // near-instant cache hits. Total cost is O(segments) not O(N²).
 
             // Warm up fast fields.
             let ff_names: Vec<&str> = ff_projected_schema
@@ -680,10 +694,13 @@ impl DataSource for SingleTableDataSource {
                 Ok(Ok(())) => {} // tx drops naturally, closing the channel
             }
         });
+        let guard = AbortOnDrop(handle);
 
         // Convert receiver to stream with metrics tracking.
-        let stream = futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|batch| (batch, rx))
+        // The guard is owned by the stream — when the stream is dropped, the
+        // spawned task is aborted, preventing leaked background work.
+        let stream = futures::stream::unfold((rx, guard), |(mut rx, guard)| async move {
+            rx.recv().await.map(|batch| (batch, (rx, guard)))
         });
         let tracked = stream.map(move |result| {
             if let Ok(ref batch) = result {
@@ -749,12 +766,15 @@ impl DataSource for SingleTableDataSource {
                 {
                     ColumnStatistics {
                         null_count: Precision::Absent,
+                        // Inexact because deleted docs may have held the
+                        // actual min/max — the surviving range could be
+                        // narrower than what columnar metadata reports.
                         max_value: max_val
                             .clone()
-                            .map_or(Precision::Absent, Precision::Exact),
+                            .map_or(Precision::Absent, Precision::Inexact),
                         min_value: min_val
                             .clone()
-                            .map_or(Precision::Absent, Precision::Exact),
+                            .map_or(Precision::Absent, Precision::Inexact),
                         sum_value: Precision::Absent,
                         distinct_count: Precision::Absent,
                         byte_size: Precision::Absent,
@@ -796,14 +816,11 @@ impl DataSource for SingleTableDataSource {
         filters: Vec<Arc<dyn PhysicalExpr>>,
         _config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn DataSource>>> {
-        let results: Vec<PushedDown> = filters.iter().map(|_| PushedDown::Yes).collect();
-        let mut new_filters = self.pushed_filters.clone();
-        new_filters.extend(filters);
-        let updated = self.clone_with(|s| s.pushed_filters = new_filters);
-        Ok(
-            FilterPushdownPropagation::with_parent_pushdown_result(results)
-                .with_updated_node(Arc::new(updated) as Arc<dyn DataSource>),
-        )
+        // Don't claim to handle physical filters — let DataFusion keep
+        // its FilterExec as a safety net. Tantivy-convertible predicates
+        // are already pushed at the logical level via supports_filters_pushdown.
+        let results: Vec<PushedDown> = filters.iter().map(|_| PushedDown::No).collect();
+        Ok(FilterPushdownPropagation::with_parent_pushdown_result(results))
     }
 }
 
