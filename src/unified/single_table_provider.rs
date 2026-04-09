@@ -701,21 +701,24 @@ impl DataSource for SingleTableDataSource {
             let result = tokio::task::spawn_blocking(move || {
                 let query =
                     build_combined_query(&index, pre_built_query.as_ref(), &raw_queries)?;
-                generate_single_table_batch_streaming(
-                    &index,
+                let cfg = ScanConfig {
+                    index,
                     segment_idx,
-                    query.as_ref(),
-                    &ff_projected_schema,
-                    &unified_schema,
-                    &projected_schema,
-                    projection.as_deref(),
+                    batch_size,
+                    ff_projected_schema,
+                    unified_schema,
+                    projected_schema,
+                    projection,
                     score_column_idx,
                     document_column_idx,
                     needs_score,
                     needs_document,
                     topk,
-                    &pushed_filters,
-                    batch_size,
+                    pushed_filters,
+                    query,
+                };
+                generate_single_table_batch_streaming(
+                    &cfg,
                     |batch| tx_blocking.blocking_send(Ok(batch)).is_ok(),
                 )
             }).await;
@@ -1014,27 +1017,36 @@ fn apply_pushed_filters(
 /// been emitted. If `emit` returns `false` (receiver dropped), production
 /// stops early.
 ///
-/// This is a thin orchestrator: query execution is delegated to
-/// [`collect_matching_docs`], batch assembly to [`ChunkBuilder::build`],
-/// and filter application to [`apply_pushed_filters`].
-#[allow(clippy::too_many_arguments)]
-fn generate_single_table_batch_streaming(
-    index: &Index,
+/// Configuration for a single-segment batch generation pass.
+/// Constructed in `open()` and moved into `spawn_blocking`.
+struct ScanConfig {
+    index: Index,
     segment_idx: usize,
-    query: Option<&Arc<dyn tantivy::query::Query>>,
-    ff_projected_schema: &SchemaRef,
-    unified_schema: &SchemaRef,
-    projected_schema: &SchemaRef,
-    projection: Option<&[usize]>,
+    batch_size: usize,
+    ff_projected_schema: SchemaRef,
+    unified_schema: SchemaRef,
+    projected_schema: SchemaRef,
+    projection: Option<Vec<usize>>,
     score_column_idx: usize,
     document_column_idx: usize,
     needs_score: bool,
     needs_document: bool,
     topk: Option<usize>,
-    pushed_filters: &[Arc<dyn PhysicalExpr>],
-    batch_size: usize,
+    pushed_filters: Vec<Arc<dyn PhysicalExpr>>,
+    query: Option<Arc<dyn tantivy::query::Query>>,
+}
+
+/// Thin orchestrator: query execution is delegated to
+/// [`collect_matching_docs`], batch assembly to [`ChunkBuilder::build`],
+/// and filter application to [`apply_pushed_filters`].
+fn generate_single_table_batch_streaming(
+    cfg: &ScanConfig,
     mut emit: impl FnMut(RecordBatch) -> bool,
 ) -> Result<()> {
+    let index = &cfg.index;
+    let segment_idx = cfg.segment_idx;
+    let batch_size = cfg.batch_size;
+    let needs_score = cfg.needs_score;
     let reader = index
         .reader()
         .map_err(|e| DataFusionError::Internal(format!("open reader: {e}")))?;
@@ -1049,10 +1061,10 @@ fn generate_single_table_batch_streaming(
     let (doc_ids, scores) = collect_matching_docs(
         segment_reader,
         &searcher,
-        query,
+        cfg.query.as_ref(),
         &index.schema(),
         needs_score,
-        topk,
+        cfg.topk,
     )?;
 
     if doc_ids.is_empty() {
@@ -1060,6 +1072,7 @@ fn generate_single_table_batch_streaming(
     }
 
     // Build the chunk builder once for this segment.
+    let needs_document = cfg.needs_document;
     let store_reader = if needs_document {
         Some(
             segment_reader
@@ -1070,19 +1083,19 @@ fn generate_single_table_batch_streaming(
         None
     };
 
-    let projected_indices: Vec<usize> = match projection {
-        Some(indices) => indices.to_vec(),
-        None => (0..unified_schema.fields().len()).collect(),
+    let projected_indices: Vec<usize> = match &cfg.projection {
+        Some(indices) => indices.clone(),
+        None => (0..cfg.unified_schema.fields().len()).collect(),
     };
 
     let builder = ChunkBuilder {
         segment_reader,
-        ff_projected_schema,
-        unified_schema,
-        projected_schema,
+        ff_projected_schema: &cfg.ff_projected_schema,
+        unified_schema: &cfg.unified_schema,
+        projected_schema: &cfg.projected_schema,
         projected_indices,
-        score_column_idx,
-        document_column_idx,
+        score_column_idx: cfg.score_column_idx,
+        document_column_idx: cfg.document_column_idx,
         needs_score,
         needs_document,
         segment_ord: segment_idx as u32,
@@ -1100,7 +1113,7 @@ fn generate_single_table_batch_streaming(
         let chunk_scores = scores.as_ref().map(|s| &s[offset..end]);
 
         let batch = builder.build(chunk_ids, chunk_scores)?;
-        let filtered = apply_pushed_filters(batch, pushed_filters)?;
+        let filtered = apply_pushed_filters(batch, &cfg.pushed_filters)?;
 
         if filtered.num_rows() > 0 && !emit(filtered) {
             return Ok(()); // receiver dropped, stop producing
