@@ -1,15 +1,20 @@
 use std::net::Ipv4Addr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow::array::{AsArray, RecordBatch};
 use arrow::datatypes::{Float64Type, Int64Type};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::*;
-use tantivy::schema::{Field, SchemaBuilder, FAST, STORED, TEXT};
-use tantivy::{DateTime, Index, IndexWriter, TantivyDocument};
-use tantivy_datafusion::{
-    full_text_udf, AggPushdown, SingleTableProvider,
+use rand::rngs::StdRng;
+use rand::seq::IndexedRandom;
+use rand::{Rng, SeedableRng};
+use rand_distr::Distribution;
+use tantivy::schema::{
+    Field, IndexRecordOption, SchemaBuilder, TextFieldIndexing, FAST, STORED, STRING, TEXT,
 };
+use tantivy::{doc, DateTime, Index, IndexWriter, TantivyDocument};
+use tantivy_datafusion::{full_text_udf, AggPushdown, SingleTableProvider};
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -413,6 +418,564 @@ async fn test_sum_avg_without_group_by() {
     assert!((avg_val - 3.5).abs() < eps, "AVG should be 3.5, got {avg_val}");
 }
 
+// ---------------------------------------------------------------------------
+// Runtime configuration profiling
+// ---------------------------------------------------------------------------
 
+/// Build a moderately large index (1M docs) with the same schema used in the
+/// bench suite so the terms_few regression pattern is visible.
+fn build_large_index(num_docs: usize) -> Index {
+    let mut schema_builder = tantivy::schema::Schema::builder();
+    let text_fieldtype = tantivy::schema::TextOptions::default()
+        .set_indexing_options(
+            TextFieldIndexing::default().set_index_option(IndexRecordOption::WithFreqs),
+        )
+        .set_stored();
+    let text_field = schema_builder.add_text_field("text", text_fieldtype);
+    let text_field_many_terms = schema_builder.add_text_field("text_many_terms", STRING | FAST);
+    let text_field_few_terms_status =
+        schema_builder.add_text_field("text_few_terms_status", STRING | FAST);
+    let score_fieldtype = tantivy::schema::NumericOptions::default().set_fast();
+    let score_field = schema_builder.add_u64_field("score", score_fieldtype.clone());
+    let score_field_f64 = schema_builder.add_f64_field("score_f64", score_fieldtype);
 
+    let index = Index::create_from_tempdir(schema_builder.build()).unwrap();
 
+    let status_labels = ["INFO", "ERROR", "WARN", "DEBUG", "OK", "CRITICAL", "EMERGENCY"];
+    let status_weights = [8000u32, 300, 1200, 500, 500, 20, 1];
+    let status_dist =
+        rand::distr::weighted::WeightedIndex::new(status_weights.iter().copied()).unwrap();
+
+    let lg_norm = rand_distr::LogNormal::new(2.996f64, 0.979f64).unwrap();
+    let many_terms: Vec<String> = (0..150_000).map(|n| format!("author{n}")).collect();
+
+    let mut rng = StdRng::from_seed([1u8; 32]);
+    let mut writer = index.writer_with_num_threads(1, 200_000_000).unwrap();
+
+    for _ in 0..num_docs {
+        let val: f64 = rng.random_range(0.0..1_000_000.0);
+        writer
+            .add_document(doc!(
+                text_field => "cool",
+                text_field_many_terms => many_terms.choose(&mut rng).unwrap().to_string(),
+                text_field_few_terms_status => status_labels[status_dist.sample(&mut rng)],
+                score_field => val as u64,
+                score_field_f64 => lg_norm.sample(&mut rng),
+            ))
+            .unwrap();
+    }
+    writer.commit().unwrap();
+    index
+}
+
+/// Build a SessionContext with the AggPushdown rule and a given target_partitions.
+fn build_ctx(index: &Index, target_partitions: usize) -> SessionContext {
+    let provider = SingleTableProvider::new(index.clone());
+    let config = SessionConfig::new().with_target_partitions(target_partitions);
+    let state = SessionStateBuilder::new()
+        .with_config(config)
+        .with_default_features()
+        .with_physical_optimizer_rule(Arc::new(AggPushdown::new()))
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+    ctx.register_table("t", Arc::new(provider)).unwrap();
+    ctx
+}
+
+/// Profile a single configuration. Re-creates the physical plan each iteration
+/// because DataFusion's `RepartitionExec` has internal state that is consumed on
+/// execution and cannot be reused across `collect()` calls.
+async fn profile_one(label: &str, ctx: &SessionContext, sql: &str, iterations: usize) {
+    // Warm up (also verifies correctness)
+    let warm_plan = ctx
+        .sql(sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let _ = datafusion::physical_plan::collect(warm_plan, ctx.task_ctx())
+        .await
+        .unwrap();
+
+    let t = Instant::now();
+    for _ in 0..iterations {
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let _ = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .unwrap();
+    }
+    let elapsed = t.elapsed();
+    eprintln!(
+        "{label}: {:.0}us avg  ({iterations} iters, {:.1}ms total)",
+        elapsed.as_micros() as f64 / iterations as f64,
+        elapsed.as_secs_f64() * 1000.0,
+    );
+}
+
+/// Compare the DataFusion pushdown path under different tokio runtime
+/// configurations and `target_partitions` settings.
+///
+/// Run with:
+///   cargo test --release --test agg_correctness profile_runtime -- --nocapture
+///
+/// The test prints timing data to stderr. Look for:
+/// - current_thread vs multi_thread overhead
+/// - target_partitions=1 vs default (num_cpus)
+#[test]
+fn profile_runtime_configs() {
+    const NUM_DOCS: usize = 1_000_000;
+    const ITERATIONS: usize = 50;
+
+    eprintln!("Building index with {NUM_DOCS} docs...");
+    let index = build_large_index(NUM_DOCS);
+    {
+        let r = index.reader().unwrap();
+        let s = r.searcher();
+        eprintln!(
+            "Index: {} segments, {} total docs",
+            s.segment_readers().len(),
+            s.segment_readers().iter().map(|sr| sr.max_doc()).sum::<u32>(),
+        );
+    }
+
+    let sql_queries = [
+        (
+            "terms_few",
+            "SELECT text_few_terms_status, COUNT(*) FROM t GROUP BY text_few_terms_status",
+        ),
+        (
+            "terms_few_with_avg",
+            "SELECT text_few_terms_status, COUNT(*), AVG(score_f64) FROM t GROUP BY text_few_terms_status",
+        ),
+        ("avg_f64", "SELECT AVG(score_f64) FROM t"),
+    ];
+
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
+    // Runtime configurations to test
+    let runtime_configs: Vec<(&str, tokio::runtime::Runtime)> = vec![
+        (
+            "current_thread",
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        ),
+        (
+            "multi_thread(1)",
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap(),
+        ),
+        (
+            "multi_thread(default)",
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        ),
+    ];
+
+    // target_partitions settings to test
+    let partitions_label = format!("partitions={num_cpus}");
+    let partition_configs: Vec<(&str, usize)> =
+        vec![("partitions=1", 1), (&partitions_label, num_cpus)];
+
+    eprintln!("\n=== Runtime x Partitions x Query ===\n");
+
+    for (query_name, sql) in &sql_queries {
+        eprintln!("--- {query_name} ---");
+        for (rt_name, rt) in &runtime_configs {
+            for (part_name, partitions) in &partition_configs {
+                let label = format!("{rt_name} / {part_name}");
+                rt.block_on(async {
+                    let ctx = build_ctx(&index, *partitions);
+                    profile_one(&label, &ctx, sql, ITERATIONS).await;
+                });
+            }
+        }
+        eprintln!();
+    }
+}
+
+/// Investigate whether `TermsAggregation { size: Some(429_496_729) }` causes
+/// tantivy to pre-allocate a massive internal buffer, explaining the 3x
+/// regression at 10M docs.
+///
+/// Compares three configurations at the raw tantivy level (no DataFusion):
+/// - `size: None` (defaults to 10, segment_size defaults to 100)
+/// - `size: Some(100)` (reasonable upper bound)
+/// - `size: Some(429_496_729), segment_size: Some(429_496_729)` (current value)
+///
+/// Run with:
+///   cargo test --release -p tantivy-datafusion investigate_terms_size_perf -- --ignored --nocapture
+#[test]
+#[ignore] // manual perf investigation
+fn investigate_terms_size_perf() {
+    use serde_json::json;
+    use tantivy::aggregation::agg_req::Aggregations;
+    use tantivy::aggregation::AggregationCollector;
+    use tantivy::query::AllQuery;
+
+    const NUM_DOCS: usize = 10_000_000;
+    const ITERATIONS: usize = 20;
+
+    eprintln!("Building {NUM_DOCS}-doc index (7 status categories)...");
+    let index = build_large_index(NUM_DOCS);
+
+    let reader = index.reader().unwrap();
+    let searcher = reader.searcher();
+    eprintln!(
+        "Index: {} segments, {} total docs",
+        searcher.segment_readers().len(),
+        searcher.num_docs(),
+    );
+
+    // Three size configurations to compare
+    let configs: Vec<(&str, serde_json::Value)> = vec![
+        (
+            "size=default(10)",
+            json!({
+                "group": {
+                    "terms": { "field": "text_few_terms_status" },
+                    "aggs": { "avg_score": { "avg": { "field": "score_f64" } } }
+                }
+            }),
+        ),
+        (
+            "size=100",
+            json!({
+                "group": {
+                    "terms": { "field": "text_few_terms_status", "size": 100, "shard_size": 100 },
+                    "aggs": { "avg_score": { "avg": { "field": "score_f64" } } }
+                }
+            }),
+        ),
+        (
+            "size=429_496_729",
+            json!({
+                "group": {
+                    "terms": { "field": "text_few_terms_status", "size": 429496729, "shard_size": 429496729 },
+                    "aggs": { "avg_score": { "avg": { "field": "score_f64" } } }
+                }
+            }),
+        ),
+    ];
+
+    // Warm up
+    for (label, agg_json) in &configs {
+        let aggs: Aggregations = serde_json::from_value(agg_json.clone()).unwrap();
+        let collector = AggregationCollector::from_aggs(aggs, Default::default());
+        let _ = searcher.search(&AllQuery, &collector).unwrap();
+        eprintln!("Warmup done: {label}");
+    }
+
+    // Benchmark
+    eprintln!("\n=== TermsAggregation size investigation ({NUM_DOCS} docs, {ITERATIONS} iters) ===\n");
+    for (label, agg_json) in &configs {
+        let mut durations = Vec::with_capacity(ITERATIONS);
+        for _ in 0..ITERATIONS {
+            let aggs: Aggregations = serde_json::from_value(agg_json.clone()).unwrap();
+            let collector = AggregationCollector::from_aggs(aggs, Default::default());
+            let start = Instant::now();
+            let result = searcher.search(&AllQuery, &collector).unwrap();
+            let elapsed = start.elapsed();
+            durations.push(elapsed);
+            std::hint::black_box(result);
+        }
+
+        let total: std::time::Duration = durations.iter().sum();
+        let mean = total / ITERATIONS as u32;
+        durations.sort();
+        let median = durations[ITERATIONS / 2];
+        let min_d = durations[0];
+        let max_d = durations[ITERATIONS - 1];
+
+        eprintln!(
+            "{label:30} | mean={mean:>10?} | median={median:>10?} | min={min_d:>10?} | max={max_d:>10?}",
+        );
+    }
+}
+
+// =========================================================================
+// Profiling: 10M terms_few overhead breakdown (size parameter impact)
+// =========================================================================
+
+fn build_10m_index() -> Index {
+    let num_docs = 10_000_000;
+    let mut schema_builder = tantivy::schema::Schema::builder();
+    let text_fieldtype = tantivy::schema::TextOptions::default()
+        .set_indexing_options(
+            TextFieldIndexing::default().set_index_option(IndexRecordOption::WithFreqs),
+        )
+        .set_stored();
+    let text_field = schema_builder.add_text_field("text", text_fieldtype);
+    let text_field_few = schema_builder.add_text_field("text_few_terms_status", STRING | FAST);
+    let score_fieldtype = tantivy::schema::NumericOptions::default().set_fast();
+    let score_field_f64 = schema_builder.add_f64_field("score_f64", score_fieldtype);
+    let index = Index::create_from_tempdir(schema_builder.build()).unwrap();
+
+    let status_labels = [
+        "INFO", "ERROR", "WARN", "DEBUG", "OK", "CRITICAL", "EMERGENCY",
+    ];
+    let status_weights = [8000u32, 300, 1200, 500, 500, 20, 1];
+    let status_dist =
+        rand::distr::weighted::WeightedIndex::new(status_weights.iter().copied()).unwrap();
+    let lg_norm = rand_distr::LogNormal::new(2.996f64, 0.979f64).unwrap();
+    let mut rng = StdRng::from_seed([1u8; 32]);
+    let mut writer = index.writer_with_num_threads(1, 200_000_000).unwrap();
+
+    for _ in 0..num_docs {
+        let mut doc = TantivyDocument::default();
+        doc.add_text(text_field, "cool");
+        doc.add_text(
+            text_field_few,
+            status_labels[status_dist.sample(&mut rng)],
+        );
+        doc.add_f64(score_field_f64, lg_norm.sample(&mut rng));
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().unwrap();
+    index
+}
+
+/// Isolate where the ~70ms overhead comes from in the 10M terms_few bench
+/// (36ms native vs ~110ms pushdown).
+///
+/// The key hypothesis: `AggPushdown` sets `size = u32::MAX / 10` (429_496_729)
+/// to avoid truncating results, while the native bench uses the default
+/// `size = 10`. tantivy's TermsAggregation uses `segment_size = size * 10`
+/// internally to allocate per-segment hash maps, and this massive allocation
+/// is the source of the overhead.
+///
+/// Run with:
+///   cargo test --release --test agg_correctness profile_10m -- --nocapture --ignored
+#[ignore]
+#[tokio::test]
+async fn profile_10m_terms_overhead() {
+    use tantivy::aggregation::agg_req::Aggregations;
+    use tantivy::aggregation::AggregationCollector;
+    use tantivy::query::AllQuery;
+
+    eprintln!("Building 10M doc index...");
+    let t_build = Instant::now();
+    let index = build_10m_index();
+    eprintln!("Index built in {}s", t_build.elapsed().as_secs());
+
+    let reader = index.reader().unwrap();
+    let searcher = reader.searcher();
+    eprintln!("Segments: {}", searcher.segment_readers().len());
+    for (i, sr) in searcher.segment_readers().iter().enumerate() {
+        eprintln!("  seg {i}: {} docs", sr.max_doc());
+    }
+
+    let iters: u128 = 10;
+
+    // -----------------------------------------------------------------
+    // 1. Native tantivy with default size (10)
+    // -----------------------------------------------------------------
+    let agg_small_json =
+        serde_json::json!({ "t": { "terms": { "field": "text_few_terms_status" } } });
+    let aggs_small: Aggregations = serde_json::from_value(agg_small_json).unwrap();
+
+    // Warm
+    let _ = searcher
+        .search(
+            &AllQuery,
+            &AggregationCollector::from_aggs(aggs_small.clone(), Default::default()),
+        )
+        .unwrap();
+    let t1 = Instant::now();
+    for _ in 0..iters {
+        let collector = AggregationCollector::from_aggs(aggs_small.clone(), Default::default());
+        let _ = searcher.search(&AllQuery, &collector).unwrap();
+    }
+    let native_small_ms = t1.elapsed().as_millis() / iters;
+    eprintln!("1. Native tantivy (size=default/10):  {native_small_ms}ms");
+
+    // -----------------------------------------------------------------
+    // 2. Native tantivy with size=429_496_729 (what pushdown uses)
+    // -----------------------------------------------------------------
+    let max_buckets = u32::MAX / 10;
+    let agg_big_json = serde_json::json!({
+        "t": {
+            "terms": {
+                "field": "text_few_terms_status",
+                "size": max_buckets,
+                "segment_size": max_buckets
+            }
+        }
+    });
+    let aggs_big: Aggregations = serde_json::from_value(agg_big_json).unwrap();
+
+    // Warm
+    let _ = searcher
+        .search(
+            &AllQuery,
+            &AggregationCollector::from_aggs(aggs_big.clone(), Default::default()),
+        )
+        .unwrap();
+    let t2 = Instant::now();
+    for _ in 0..iters {
+        let collector = AggregationCollector::from_aggs(aggs_big.clone(), Default::default());
+        let _ = searcher.search(&AllQuery, &collector).unwrap();
+    }
+    let native_big_ms = t2.elapsed().as_millis() / iters;
+    eprintln!("2. Native tantivy (size={max_buckets}): {native_big_ms}ms");
+
+    // -----------------------------------------------------------------
+    // 3. Native tantivy with size=100
+    // -----------------------------------------------------------------
+    let agg_100_json = serde_json::json!({
+        "t": {
+            "terms": {
+                "field": "text_few_terms_status",
+                "size": 100
+            }
+        }
+    });
+    let aggs_100: Aggregations = serde_json::from_value(agg_100_json).unwrap();
+
+    let _ = searcher
+        .search(
+            &AllQuery,
+            &AggregationCollector::from_aggs(aggs_100.clone(), Default::default()),
+        )
+        .unwrap();
+    let t3 = Instant::now();
+    for _ in 0..iters {
+        let collector = AggregationCollector::from_aggs(aggs_100.clone(), Default::default());
+        let _ = searcher.search(&AllQuery, &collector).unwrap();
+    }
+    let native_100_ms = t3.elapsed().as_millis() / iters;
+    eprintln!("3. Native tantivy (size=100):          {native_100_ms}ms");
+
+    // -----------------------------------------------------------------
+    // 4. Native tantivy with size=1000
+    // -----------------------------------------------------------------
+    let agg_1k_json = serde_json::json!({
+        "t": {
+            "terms": {
+                "field": "text_few_terms_status",
+                "size": 1000
+            }
+        }
+    });
+    let aggs_1k: Aggregations = serde_json::from_value(agg_1k_json).unwrap();
+
+    let _ = searcher
+        .search(
+            &AllQuery,
+            &AggregationCollector::from_aggs(aggs_1k.clone(), Default::default()),
+        )
+        .unwrap();
+    let t4 = Instant::now();
+    for _ in 0..iters {
+        let collector = AggregationCollector::from_aggs(aggs_1k.clone(), Default::default());
+        let _ = searcher.search(&AllQuery, &collector).unwrap();
+    }
+    let native_1k_ms = t4.elapsed().as_millis() / iters;
+    eprintln!("4. Native tantivy (size=1000):         {native_1k_ms}ms");
+
+    // -----------------------------------------------------------------
+    // 5. Native tantivy with size=10000
+    // -----------------------------------------------------------------
+    let agg_10k_json = serde_json::json!({
+        "t": {
+            "terms": {
+                "field": "text_few_terms_status",
+                "size": 10000
+            }
+        }
+    });
+    let aggs_10k: Aggregations = serde_json::from_value(agg_10k_json).unwrap();
+
+    let _ = searcher
+        .search(
+            &AllQuery,
+            &AggregationCollector::from_aggs(aggs_10k.clone(), Default::default()),
+        )
+        .unwrap();
+    let t5 = Instant::now();
+    for _ in 0..iters {
+        let collector = AggregationCollector::from_aggs(aggs_10k.clone(), Default::default());
+        let _ = searcher.search(&AllQuery, &collector).unwrap();
+    }
+    let native_10k_ms = t5.elapsed().as_millis() / iters;
+    eprintln!("5. Native tantivy (size=10000):        {native_10k_ms}ms");
+
+    // -----------------------------------------------------------------
+    // 6. Full DataFusion pushdown path (uses size=429M internally)
+    // -----------------------------------------------------------------
+    let provider = SingleTableProvider::new(index.clone());
+    let config = SessionConfig::new().with_target_partitions(1);
+    let state = SessionStateBuilder::new()
+        .with_config(config)
+        .with_default_features()
+        .with_physical_optimizer_rule(Arc::new(AggPushdown::new()))
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+    ctx.register_table("t", Arc::new(provider)).unwrap();
+
+    let plan = ctx
+        .sql("SELECT text_few_terms_status, COUNT(*) FROM t GROUP BY text_few_terms_status")
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+
+    // Warm
+    let _ = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx())
+        .await
+        .unwrap();
+    let t6 = Instant::now();
+    for _ in 0..iters {
+        let _ = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx())
+            .await
+            .unwrap();
+    }
+    let df_pushdown_ms = t6.elapsed().as_millis() / iters;
+    eprintln!("6. Full DF pushdown:                   {df_pushdown_ms}ms");
+
+    // -----------------------------------------------------------------
+    // Summary
+    // -----------------------------------------------------------------
+    eprintln!();
+    eprintln!("=== OVERHEAD BREAKDOWN ===");
+    eprintln!(
+        "  size=10 -> size=429M (native only): +{}ms",
+        native_big_ms as i128 - native_small_ms as i128
+    );
+    eprintln!(
+        "  size=10 -> size=100:                +{}ms",
+        native_100_ms as i128 - native_small_ms as i128
+    );
+    eprintln!(
+        "  size=10 -> size=1000:               +{}ms",
+        native_1k_ms as i128 - native_small_ms as i128
+    );
+    eprintln!(
+        "  size=10 -> size=10000:              +{}ms",
+        native_10k_ms as i128 - native_small_ms as i128
+    );
+    eprintln!(
+        "  size=429M native -> DF pushdown:    +{}ms",
+        df_pushdown_ms as i128 - native_big_ms as i128
+    );
+    eprintln!(
+        "  size=10  native -> DF pushdown:     +{}ms",
+        df_pushdown_ms as i128 - native_small_ms as i128
+    );
+}

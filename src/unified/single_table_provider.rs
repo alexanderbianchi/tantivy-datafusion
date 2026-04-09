@@ -650,6 +650,7 @@ impl DataSource for SingleTableDataSource {
             .as_ref()
             .map(|q| Arc::from(q.box_clone()));
         let warmup_done = self.warmup_done.clone();
+        let needs_warmup = self.opener.needs_warmup();
 
         let schema = self.schema.projected.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(2);
@@ -661,6 +662,8 @@ impl DataSource for SingleTableDataSource {
                 Err(e) => { let _ = tx.send(Err(e)).await; return; }
             };
 
+            // Skip warmup for local/mmap openers — data already accessible.
+            if needs_warmup {
             // Warmup runs once across all partitions (best-effort). The first
             // partition to reach this point initialises the OnceCell; others
             // wait briefly or get the cached result.
@@ -693,12 +696,11 @@ impl DataSource for SingleTableDataSource {
                 }).await;
             }
 
-            // Warm up the document store separately when needed. This is
-            // per-partition (redundant) but idempotent and cheap after the
-            // first call since the store reader caches its footer/index.
+            // Warm up the document store separately when needed.
             if needs_document {
                 crate::warmup::warmup_document_store(&index).await.ok();
             }
+            } // end if needs_warmup
 
             // Blocking batch generation — send batches as they're produced.
             let tx_blocking = tx.clone();

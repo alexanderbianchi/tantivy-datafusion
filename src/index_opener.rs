@@ -44,6 +44,18 @@ pub trait IndexOpener: Send + Sync + fmt::Debug {
         (0, 0)
     }
 
+    /// Whether this opener requires async warmup before synchronous reads.
+    ///
+    /// Returns `false` for local/mmap openers (data already accessible).
+    /// Returns `true` for storage-backed openers (S3/GCS) that need
+    /// file slices pre-loaded into cache before sync access.
+    ///
+    /// When `false`, warmup is skipped entirely — saving IndexReader
+    /// construction and async I/O overhead per query.
+    fn needs_warmup(&self) -> bool {
+        true // conservative default — assume warmup needed
+    }
+
     /// Names of fields with `Cardinality::Multivalued` in any segment.
     /// Used for correct Arrow schema construction on remote workers.
     /// Returns empty vec if not known (falls back to scalar types).
@@ -156,6 +168,10 @@ impl IndexOpener for DirectIndexOpener {
                 }
             })
             .collect()
+    }
+
+    fn needs_warmup(&self) -> bool {
+        false // mmap — data already accessible, no async pre-loading needed
     }
 
     fn as_any(&self) -> &dyn Any {

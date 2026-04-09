@@ -128,18 +128,22 @@ impl DataSource for AggDataSource {
         let stream = stream::once(async move {
             let index = opener.open().await?;
 
-            // Warm only the fields the aggregation needs
-            let queried_fields: Vec<tantivy::schema::Field> = raw_queries
-                .iter()
-                .filter_map(|(field_name, _)| index.schema().get_field(field_name).ok())
-                .collect();
-            if !queried_fields.is_empty() {
-                crate::warmup::warmup_inverted_index(&index, &queried_fields).await?;
-            }
-            let agg_fields = extract_agg_field_names(&aggs);
-            let agg_field_refs: Vec<&str> = agg_fields.iter().map(|s| s.as_str()).collect();
-            if !agg_field_refs.is_empty() {
-                crate::warmup::warmup_fast_fields_by_name(&index, &agg_field_refs).await?;
+            // Warmup only for storage-backed openers (S3/GCS).
+            // For local/mmap openers, data is already accessible — warmup
+            // would just create unnecessary IndexReader instances.
+            if opener.needs_warmup() {
+                let queried_fields: Vec<tantivy::schema::Field> = raw_queries
+                    .iter()
+                    .filter_map(|(field_name, _)| index.schema().get_field(field_name).ok())
+                    .collect();
+                if !queried_fields.is_empty() {
+                    crate::warmup::warmup_inverted_index(&index, &queried_fields).await?;
+                }
+                let agg_fields = extract_agg_field_names(&aggs);
+                let agg_field_refs: Vec<&str> = agg_fields.iter().map(|s| s.as_str()).collect();
+                if !agg_field_refs.is_empty() {
+                    crate::warmup::warmup_fast_fields_by_name(&index, &agg_field_refs).await?;
+                }
             }
 
             // Move sync work (including query building) to blocking thread.
