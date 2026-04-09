@@ -45,6 +45,7 @@ use crate::full_text_udf::full_text_udf;
 use crate::index_opener::{IndexOpener, OpenerMetadata};
 use crate::decomposed::inverted_index_provider::{InvertedIndexDataSource, TantivyInvertedIndexProvider};
 use crate::schema_mapping::tantivy_schema_to_arrow_with_multi_valued;
+use crate::unified::agg_data_source::AggDataSource;
 use crate::unified::single_table_provider::SingleTableDataSource;
 use crate::decomposed::table_provider::{FastFieldDataSource, TantivyTableProvider};
 
@@ -113,12 +114,19 @@ struct TantivyScanProto {
     /// Names of fields that are multi-valued in at least one segment.
     #[prost(string, repeated, tag = "14")]
     multi_valued_fields: Vec<String>,
+    /// JSON-serialized tantivy aggregation specification (used by AGG_DATA_SOURCE).
+    #[prost(string, tag = "16")]
+    aggregations_json: String,
+    /// Protobuf-encoded Arrow output schema (used by AGG_DATA_SOURCE).
+    #[prost(bytes = "vec", tag = "17")]
+    output_schema_bytes: Vec<u8>,
 }
 
 const FAST_FIELD: u32 = 0;
 const INVERTED_INDEX: u32 = 1;
 const DOCUMENT: u32 = 2;
 const SINGLE_TABLE: u32 = 3;
+const AGG_DATA_SOURCE: u32 = 4;
 
 // ── TantivyCodec — pure serialization, no runtime state ────────────
 
@@ -211,6 +219,7 @@ impl PhysicalExtensionCodec for TantivyCodec {
                     provider_type: FAST_FIELD, raw_queries_json: String::new(), topk: 0, has_topk: false,
                     pushed_filters,
                     footer_start, footer_end, multi_valued_fields: mv,
+                    aggregations_json: String::new(), output_schema_bytes: Vec::new(),
                 }.encode(buf).map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
             }
 
@@ -232,6 +241,7 @@ impl PhysicalExtensionCodec for TantivyCodec {
                     provider_type: INVERTED_INDEX, raw_queries_json: rq_json, topk, has_topk,
                     pushed_filters: Vec::new(),
                     footer_start, footer_end, multi_valued_fields: mv,
+                    aggregations_json: String::new(), output_schema_bytes: Vec::new(),
                 }.encode(buf).map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
             }
 
@@ -248,6 +258,7 @@ impl PhysicalExtensionCodec for TantivyCodec {
                     provider_type: DOCUMENT, raw_queries_json: String::new(), topk: 0, has_topk: false,
                     pushed_filters,
                     footer_start, footer_end, multi_valued_fields: mv,
+                    aggregations_json: String::new(), output_schema_bytes: Vec::new(),
                 }.encode(buf).map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
             }
 
@@ -270,6 +281,34 @@ impl PhysicalExtensionCodec for TantivyCodec {
                     provider_type: SINGLE_TABLE, raw_queries_json: rq_json, topk, has_topk,
                     pushed_filters,
                     footer_start, footer_end, multi_valued_fields: mv,
+                    aggregations_json: String::new(), output_schema_bytes: Vec::new(),
+                }.encode(buf).map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
+            }
+
+            if let Some(agg_ds) = ds.as_any().downcast_ref::<AggDataSource>() {
+                let (id, schema_json, seg, footer_start, footer_end, mv) = opener_to_proto(agg_ds.opener())?;
+                let agg_json = serde_json::to_string(agg_ds.aggregations().as_ref())
+                    .map_err(|e| DataFusionError::Internal(format!("serialize aggregations: {e}")))?;
+                let rq_json = serde_json::to_string(agg_ds.raw_queries())
+                    .map_err(|e| DataFusionError::Internal(format!("serialize raw_queries: {e}")))?;
+                let output_schema_bytes = {
+                    let proto_schema = datafusion_proto::protobuf::Schema::try_from(agg_ds.output_schema().as_ref())
+                        .map_err(|e| DataFusionError::Internal(format!("encode schema: {e}")))?;
+                    let mut schema_buf = Vec::new();
+                    prost::Message::encode(&proto_schema, &mut schema_buf)
+                        .map_err(|e| DataFusionError::Internal(format!("encode schema bytes: {e}")))?;
+                    schema_buf
+                };
+                return TantivyScanProto {
+                    identifier: id, tantivy_schema_json: schema_json, segment_sizes: seg,
+                    projection: Vec::new(), has_projection: false, output_partitions,
+                    provider_type: AGG_DATA_SOURCE,
+                    raw_queries_json: rq_json,
+                    topk: 0, has_topk: false,
+                    pushed_filters: Vec::new(),
+                    footer_start, footer_end, multi_valued_fields: mv,
+                    aggregations_json: agg_json,
+                    output_schema_bytes,
                 }.encode(buf).map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
             }
         }
@@ -291,6 +330,8 @@ impl PhysicalExtensionCodec for TantivyCodec {
                 footer_start: lazy.footer_start,
                 footer_end: lazy.footer_end,
                 multi_valued_fields: lazy.multi_valued_fields.clone(),
+                aggregations_json: lazy.aggregations_json.clone(),
+                output_schema_bytes: lazy.output_schema_bytes.clone(),
             }.encode(buf).map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
         }
 
@@ -355,6 +396,23 @@ impl PhysicalExtensionCodec for TantivyCodec {
                 unified_fields.push(arrow::datatypes::Field::new("_document", arrow::datatypes::DataType::Utf8, false));
                 Arc::new(arrow::datatypes::Schema::new(unified_fields))
             }
+            AGG_DATA_SOURCE => {
+                if proto.output_schema_bytes.is_empty() {
+                    return Err(DataFusionError::Internal(
+                        "missing output schema for AGG_DATA_SOURCE".into(),
+                    ));
+                }
+                let proto_schema = datafusion_proto::protobuf::Schema::decode(
+                    proto.output_schema_bytes.as_slice(),
+                )
+                .map_err(|e| DataFusionError::Internal(format!("decode schema: {e}")))?;
+                Arc::new(
+                    arrow::datatypes::Schema::try_from(&proto_schema)
+                        .map_err(|e| {
+                            DataFusionError::Internal(format!("convert schema: {e}"))
+                        })?,
+                )
+            }
             other => return Err(DataFusionError::Internal(format!("unknown provider type: {other}"))),
         };
 
@@ -386,6 +444,8 @@ impl PhysicalExtensionCodec for TantivyCodec {
             footer_start: proto.footer_start,
             footer_end: proto.footer_end,
             multi_valued_fields: proto.multi_valued_fields,
+            aggregations_json: proto.aggregations_json,
+            output_schema_bytes: proto.output_schema_bytes,
             plan_properties,
             projected_schema,
             output_partitions: proto.output_partitions,
@@ -411,6 +471,10 @@ struct LazyScanExec {
     footer_start: u64,
     footer_end: u64,
     multi_valued_fields: Vec<String>,
+    /// JSON-serialized tantivy aggregation specification (AGG_DATA_SOURCE only).
+    aggregations_json: String,
+    /// Protobuf-encoded Arrow output schema (AGG_DATA_SOURCE only).
+    output_schema_bytes: Vec<u8>,
     plan_properties: PlanProperties,
     projected_schema: SchemaRef,
     output_partitions: u32,
@@ -423,6 +487,7 @@ impl DisplayAs for LazyScanExec {
             INVERTED_INDEX => "InvertedIndex",
             DOCUMENT => "Document",
             SINGLE_TABLE => "SingleTable",
+            AGG_DATA_SOURCE => "Agg",
             _ => "Unknown",
         };
         write!(f, "LazyScanExec(id={}, type={})", self.identifier, kind)
@@ -467,6 +532,8 @@ impl ExecutionPlan for LazyScanExec {
         let footer_start = self.footer_start;
         let footer_end = self.footer_end;
         let multi_valued_fields = self.multi_valued_fields.clone();
+        let aggregations_json = self.aggregations_json.clone();
+        let output_schema_bytes = self.output_schema_bytes.clone();
 
         let schema_clone = self.projected_schema.clone();
         let stream = stream::once(async move {
@@ -555,6 +622,38 @@ impl ExecutionPlan for LazyScanExec {
                     } else {
                         st_exec
                     }
+                }
+                AGG_DATA_SOURCE => {
+                    // Construct AggDataSource directly — no SessionContext needed.
+                    let aggs: tantivy::aggregation::agg_req::Aggregations =
+                        serde_json::from_str(&aggregations_json)
+                            .map_err(|e| DataFusionError::Internal(format!("parse aggregations: {e}")))?;
+                    let raw_queries: Vec<(String, String)> = if raw_queries_json.is_empty() {
+                        Vec::new()
+                    } else {
+                        serde_json::from_str(&raw_queries_json)
+                            .map_err(|e| DataFusionError::Internal(format!("parse raw_queries: {e}")))?
+                    };
+                    let output_schema: SchemaRef = {
+                        let proto_schema = datafusion_proto::protobuf::Schema::decode(
+                            output_schema_bytes.as_slice(),
+                        )
+                        .map_err(|e| DataFusionError::Internal(format!("decode schema: {e}")))?;
+                        Arc::new(
+                            arrow::datatypes::Schema::try_from(&proto_schema)
+                                .map_err(|e| {
+                                    DataFusionError::Internal(format!("convert schema: {e}"))
+                                })?,
+                        )
+                    };
+                    let agg_ds = AggDataSource::new(
+                        opener,
+                        Arc::new(aggs),
+                        output_schema,
+                        raw_queries,
+                        None, // pre_built_query is not serializable; worker re-derives from filters
+                    );
+                    Arc::new(DataSourceExec::new(Arc::new(agg_ds)))
                 }
                 other => return Err(DataFusionError::Internal(format!("unknown provider type: {other}"))),
             };

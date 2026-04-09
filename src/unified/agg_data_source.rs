@@ -66,6 +66,26 @@ impl AggDataSource {
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
+
+    /// Access the index opener.
+    pub fn opener(&self) -> &Arc<dyn IndexOpener> {
+        &self.opener
+    }
+
+    /// Access the tantivy aggregation specification.
+    pub fn aggregations(&self) -> &Arc<Aggregations> {
+        &self.aggregations
+    }
+
+    /// Access the output schema.
+    pub fn output_schema(&self) -> &SchemaRef {
+        &self.output_schema
+    }
+
+    /// Access the raw full-text queries.
+    pub fn raw_queries(&self) -> &[(String, String)] {
+        &self.raw_queries
+    }
 }
 
 impl DataSource for AggDataSource {

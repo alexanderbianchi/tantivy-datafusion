@@ -674,6 +674,13 @@ impl DataSource for SingleTableDataSource {
                 }).await;
             }
 
+            // Warm up the document store separately when needed. This is
+            // per-partition (redundant) but idempotent and cheap after the
+            // first call since the store reader caches its footer/index.
+            if needs_document {
+                crate::warmup::warmup_document_store(&index).await.ok();
+            }
+
             // Blocking batch generation — send batches as they're produced.
             let tx_blocking = tx.clone();
             let result = tokio::task::spawn_blocking(move || {

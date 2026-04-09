@@ -115,6 +115,43 @@ pub async fn warmup_fast_fields(index: &Index) -> Result<()> {
     Ok(())
 }
 
+/// Warm up the document store for all segments.
+///
+/// Pre-loads the store file slices so tantivy's `StoreReader` can read
+/// documents synchronously inside `spawn_blocking`.
+///
+/// Tantivy's store uses a block-based LRU cache and does not expose async
+/// file-slice warmup like fast fields do. The pragmatic approach here is to
+/// open each segment's `StoreReader` (which reads the footer/index into cache)
+/// and read a small number of documents to warm the first blocks. Subsequent
+/// reads happen inside `spawn_blocking` and will hit the cache for these
+/// initial blocks.
+pub async fn warmup_document_store(index: &Index) -> Result<()> {
+    let reader = index
+        .reader_builder()
+        .reload_policy(ReloadPolicy::Manual)
+        .try_into()
+        .map_err(|e| DataFusionError::Internal(format!("open reader for doc warmup: {e}")))?;
+    let searcher = reader.searcher();
+
+    for segment_reader in searcher.segment_readers() {
+        // Opening the store reader reads the footer/index into cache.
+        let store_reader = segment_reader
+            .get_store_reader(100)
+            .map_err(|e| {
+                DataFusionError::Internal(format!("open store reader for warmup: {e}"))
+            })?;
+        // Reading doc 0 triggers loading the first block, which warms the
+        // file handle. We cannot easily enumerate all blocks, but this
+        // ensures the store is accessible.
+        if segment_reader.max_doc() > 0 {
+            let _ = store_reader.get::<tantivy::TantivyDocument>(0);
+        }
+    }
+
+    Ok(())
+}
+
 /// Warm up everything needed for a typical query: fast fields +
 /// all text field inverted indexes.
 ///
