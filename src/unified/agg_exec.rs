@@ -476,7 +476,10 @@ fn terms_bucket_to_batch(
                 .map(|b| Some(key_to_string(&b.key)))
                 .collect();
             columns.push(cast_key_column(&values, field.data_type()));
-        } else if col_name == "doc_count" {
+        } else if is_doc_count_column(col_name, &agg_def.sub_aggregation) {
+            // doc_count: maps to the bucket's document count.
+            // Matches explicit "doc_count" or COUNT(*) columns (e.g.
+            // "count(Int64(1))") that have no corresponding sub-aggregation.
             let values: Vec<i64> = buckets.iter().map(|b| b.doc_count as i64).collect();
             columns.push(Arc::new(Int64Array::from(values)));
         } else {
@@ -509,7 +512,7 @@ fn histogram_bucket_to_batch(
                 .map(|b| key_to_f64(&b.key))
                 .collect();
             columns.push(Arc::new(Float64Array::from(values)));
-        } else if col_name == "doc_count" {
+        } else if is_doc_count_column(col_name, &agg_def.sub_aggregation) {
             let values: Vec<i64> = buckets.iter().map(|b| b.doc_count as i64).collect();
             columns.push(Arc::new(Int64Array::from(values)));
         } else {
@@ -541,7 +544,7 @@ fn range_bucket_to_batch(
                 .map(|b| Some(key_as_str(&b.key)))
                 .collect();
             columns.push(Arc::new(StringArray::from(values)));
-        } else if col_name == "doc_count" {
+        } else if is_doc_count_column(col_name, &agg_def.sub_aggregation) {
             let values: Vec<i64> = buckets.iter().map(|b| b.doc_count as i64).collect();
             columns.push(Arc::new(Int64Array::from(values)));
         } else {
@@ -560,6 +563,29 @@ fn range_bucket_to_batch(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Check if a column should be filled with the bucket's `doc_count`.
+///
+/// Returns true when:
+/// - `col_name` is literally `"doc_count"`, or
+/// - `col_name` looks like a `COUNT(*)` / `COUNT(1)` expression (starts with
+///   `"count("` case-insensitively) and there is no sub-aggregation with that
+///   exact name.
+///
+/// This bridges the naming mismatch between tantivy's `doc_count` and
+/// DataFusion's generated column names like `count(Int64(1))`.
+fn is_doc_count_column(col_name: &str, sub_aggs: &Aggregations) -> bool {
+    if col_name == "doc_count" {
+        return true;
+    }
+    // COUNT(*) in DataFusion becomes "count(Int64(1))" or similar.
+    // If it starts with "count(" and is not a named sub-aggregation, treat it
+    // as doc_count.
+    if col_name.starts_with("count(") || col_name.starts_with("COUNT(") {
+        return sub_aggs.get(col_name).is_none();
+    }
+    false
+}
 
 /// Check if a column name is the GROUP BY key for this aggregation.
 fn is_group_key_column(col_name: &str, agg_def: &Aggregation) -> bool {
