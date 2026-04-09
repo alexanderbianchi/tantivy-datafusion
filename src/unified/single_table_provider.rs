@@ -36,6 +36,15 @@ use crate::index_opener::{DirectIndexOpener, IndexOpener};
 use crate::schema_mapping::{tantivy_schema_to_arrow, tantivy_schema_to_arrow_from_index};
 use crate::util::{build_combined_query, segment_hash_partitioning};
 
+/// Guard that calls `BaselineMetrics::done()` on drop so elapsed time is
+/// recorded even when the stream is cancelled.
+struct MetricsGuard(BaselineMetrics);
+impl Drop for MetricsGuard {
+    fn drop(&mut self) {
+        self.0.done();
+    }
+}
+
 /// Guard that aborts a spawned task when dropped.
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
@@ -394,6 +403,7 @@ impl TableProvider for SingleTableProvider {
             pushed_filters: Vec::new(),
             aggregations: self.aggregations.clone(),
             partition_stats,
+            warmup_done: Arc::new(tokio::sync::OnceCell::new()),
             metrics: ExecutionPlanMetricsSet::new(),
         };
 
@@ -431,6 +441,8 @@ pub struct SingleTableDataSource {
     /// Indexed by partition number. `None` means stats are unavailable for
     /// that partition (e.g. remote opener without metadata).
     partition_stats: Vec<Option<PartitionStat>>,
+    /// Ensures warmup runs at most once across all partitions.
+    warmup_done: Arc<tokio::sync::OnceCell<()>>,
     /// Shared metrics set for all partitions.
     metrics: ExecutionPlanMetricsSet,
 }
@@ -456,6 +468,7 @@ impl SingleTableDataSource {
             pushed_filters: self.pushed_filters.clone(),
             aggregations: self.aggregations.clone(),
             partition_stats: self.partition_stats.clone(),
+            warmup_done: self.warmup_done.clone(),
             metrics: self.metrics.clone(),
         };
         f(&mut new);
@@ -502,8 +515,7 @@ impl SingleTableDataSource {
         self.clone_with(|s| s.pushed_filters = filters)
     }
 
-    /// Access the stashed tantivy aggregations (for future AggPushdown support).
-    #[allow(dead_code)]
+    /// Access the stashed tantivy aggregations used by the AggPushdown optimizer rule.
     pub(crate) fn aggregations(&self) -> Option<&Arc<Aggregations>> {
         self.aggregations.as_ref()
     }
@@ -606,7 +618,7 @@ impl DataSource for SingleTableDataSource {
         partition: usize,
         context: Arc<datafusion::execution::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
+        let metrics_guard = MetricsGuard(BaselineMetrics::new(&self.metrics, partition));
         let batch_size = context.session_config().batch_size();
         let opener = self.opener.clone();
         let segment_idx = partition;
@@ -625,6 +637,7 @@ impl DataSource for SingleTableDataSource {
             .pre_built_query
             .as_ref()
             .map(|q| Arc::from(q.box_clone()));
+        let warmup_done = self.warmup_done.clone();
 
         let schema = self.projected_schema.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(2);
@@ -636,32 +649,29 @@ impl DataSource for SingleTableDataSource {
                 Err(e) => { let _ = tx.send(Err(e)).await; return; }
             };
 
-            // Note: warmup is called per-partition but is idempotent — tantivy's
-            // read_bytes_async populates a file slice cache. After the first
-            // partition warms the data, subsequent partitions' warmup calls are
-            // near-instant cache hits. Total cost is O(segments) not O(N²).
+            // Warmup runs once across all partitions (best-effort). The first
+            // partition to reach this point initialises the OnceCell; others
+            // wait briefly or get the cached result.
+            {
+                let index_ref = index.clone();
+                let ff_schema_ref = ff_projected_schema.clone();
+                let rq_ref = raw_queries.clone();
+                warmup_done.get_or_init(|| async move {
+                    let ff_names: Vec<&str> = ff_schema_ref
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().as_str())
+                        .collect();
+                    let _ = crate::warmup::warmup_fast_fields_by_name(&index_ref, &ff_names).await;
 
-            // Warm up fast fields.
-            let ff_names: Vec<&str> = ff_projected_schema
-                .fields()
-                .iter()
-                .map(|f| f.name().as_str())
-                .collect();
-            if let Err(e) = crate::warmup::warmup_fast_fields_by_name(&index, &ff_names).await {
-                let _ = tx.send(Err(e)).await;
-                return;
-            }
-
-            // Warm up inverted index for queried text fields.
-            let queried_fields: Vec<tantivy::schema::Field> = raw_queries
-                .iter()
-                .filter_map(|(field_name, _)| index.schema().get_field(field_name).ok())
-                .collect();
-            if !queried_fields.is_empty() {
-                if let Err(e) = crate::warmup::warmup_inverted_index(&index, &queried_fields).await {
-                    let _ = tx.send(Err(e)).await;
-                    return;
-                }
+                    let queried_fields: Vec<tantivy::schema::Field> = rq_ref
+                        .iter()
+                        .filter_map(|(field_name, _)| index_ref.schema().get_field(field_name).ok())
+                        .collect();
+                    if !queried_fields.is_empty() {
+                        let _ = crate::warmup::warmup_inverted_index(&index_ref, &queried_fields).await;
+                    }
+                }).await;
             }
 
             // Blocking batch generation — send batches as they're produced.
@@ -704,7 +714,7 @@ impl DataSource for SingleTableDataSource {
         });
         let tracked = stream.map(move |result| {
             if let Ok(ref batch) = result {
-                baseline_metrics.record_output(batch.num_rows());
+                metrics_guard.0.record_output(batch.num_rows());
             }
             result
         });
@@ -792,12 +802,22 @@ impl DataSource for SingleTableDataSource {
         })
     }
 
-    fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
-        None
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
+        // Only useful when scoring is active (enables Block-WAND early termination).
+        // For non-scored queries, DataFusion's GlobalLimitExec handles LIMIT.
+        if self.needs_score {
+            limit.map(|k| {
+                Arc::new(self.clone_with(|ds| {
+                    ds.topk = Some(k);
+                })) as Arc<dyn DataSource>
+            })
+        } else {
+            None
+        }
     }
 
     fn fetch(&self) -> Option<usize> {
-        None
+        self.topk
     }
 
     fn metrics(&self) -> ExecutionPlanMetricsSet {

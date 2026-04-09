@@ -538,10 +538,7 @@ impl ExecutionPlan for LazyScanExec {
                 SINGLE_TABLE => {
                     use crate::unified::single_table_provider::SingleTableProvider;
                     let provider = SingleTableProvider::from_opener(opener);
-                    // Register full_text UDF if there are queries
-                    if !raw_queries_json.is_empty() {
-                        session.register_udf(full_text_udf());
-                    }
+                    // full_text UDF already registered above for SINGLE_TABLE
                     let st_exec = provider.scan(&state, projection.as_ref().map(|v| v as &Vec<usize>), &filters, None).await?;
                     // Re-apply topk if present
                     if let Some(k) = topk {

@@ -25,6 +25,15 @@ use tantivy::aggregation::agg_req::Aggregations;
 use crate::index_opener::IndexOpener;
 use crate::util::build_combined_query;
 
+/// Guard that calls `BaselineMetrics::done()` on drop so elapsed time is
+/// recorded even when the stream is cancelled.
+struct MetricsGuard(BaselineMetrics);
+impl Drop for MetricsGuard {
+    fn drop(&mut self) {
+        self.0.done();
+    }
+}
+
 #[derive(Debug)]
 pub struct AggDataSource {
     opener: Arc<dyn IndexOpener>,
@@ -65,7 +74,7 @@ impl DataSource for AggDataSource {
         partition: usize,
         _context: Arc<datafusion::execution::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
+        let metrics_guard = MetricsGuard(BaselineMetrics::new(&self.metrics, partition));
         let opener = self.opener.clone();
         let raw_queries = self.raw_queries.clone();
         let pre_built_query = self
@@ -95,6 +104,9 @@ impl DataSource for AggDataSource {
                 crate::warmup::warmup_inverted_index(&index, &queried_fields).await?;
             }
 
+            // Warm fast fields for aggregation (sum, avg, min, max read columnar data)
+            crate::warmup::warmup_fast_fields(&index).await?;
+
             // Move sync work (including query building) to blocking thread.
             tokio::task::spawn_blocking(move || {
                 let query = build_combined_query(&index, pre_built_query.as_ref(), &raw_queries)?;
@@ -110,7 +122,7 @@ impl DataSource for AggDataSource {
         })
         .map(move |result| {
             if let Ok(ref batch) = result {
-                baseline_metrics.record_output(batch.num_rows());
+                metrics_guard.0.record_output(batch.num_rows());
             }
             result
         });

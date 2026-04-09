@@ -187,7 +187,7 @@ pub(crate) fn execute_tantivy_agg(
     let searcher = reader.searcher();
 
     let context = AggContextParams::default();
-    let mut intermediates: Vec<IntermediateAggregationResults> = Vec::new();
+    let mut merged: Option<IntermediateAggregationResults> = None;
 
     for (seg_ord, seg_reader) in searcher.segment_readers().iter().enumerate() {
         let mut collector = AggregationSegmentCollector::from_agg_req_and_reader(
@@ -206,12 +206,17 @@ pub(crate) fn execute_tantivy_agg(
         let intermediate = collector
             .harvest()
             .map_err(|e| DataFusionError::Internal(format!("harvest segment results: {e}")))?;
-        intermediates.push(intermediate);
+
+        match merged {
+            None => merged = Some(intermediate),
+            Some(ref mut m) => m
+                .merge_fruits(intermediate)
+                .map_err(|e| DataFusionError::Internal(format!("merge intermediates: {e}")))?,
+        }
     }
 
     // Merge across segments
-    let merged = merge_intermediates(intermediates)
-        .map_err(|e| DataFusionError::Internal(format!("merge intermediates: {e}")))?;
+    let merged = merged.ok_or_else(|| DataFusionError::Internal("no segments".into()))?;
 
     // Convert to final results
     let final_result = merged
@@ -275,20 +280,6 @@ fn collect_into_segment_collector(
     Ok(())
 }
 
-/// Merge multiple segment intermediate results into one.
-fn merge_intermediates(
-    mut intermediates: Vec<IntermediateAggregationResults>,
-) -> tantivy::Result<IntermediateAggregationResults> {
-    if intermediates.is_empty() {
-        return Ok(IntermediateAggregationResults::default());
-    }
-    let mut merged = intermediates.pop().unwrap();
-    for other in intermediates {
-        merged.merge_fruits(other)?;
-    }
-    Ok(merged)
-}
-
 // ---------------------------------------------------------------------------
 // AggregationResults → Arrow RecordBatch conversion
 // ---------------------------------------------------------------------------
@@ -309,6 +300,12 @@ fn agg_results_to_batch(
     // Determine the agg type. Since this exec replaces a single DataFrame's
     // AggregateExec, we operate on a single aggregation key.
     // The optimizer should only replace plans for a single top-level agg.
+    if results.0.len() != 1 || aggs.len() != 1 {
+        return Err(DataFusionError::NotImplemented(
+            "TantivyAggregateExec supports only a single top-level aggregation".into(),
+        ));
+    }
+
     let (agg_name, agg_def) = aggs
         .iter()
         .next()
