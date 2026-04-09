@@ -1,6 +1,5 @@
 use std::any::Any;
 
-use arrow::array::BooleanArray;
 use arrow::datatypes::DataType;
 use datafusion::common::{Result, ScalarValue};
 use datafusion::logical_expr::expr::ScalarFunction;
@@ -60,12 +59,11 @@ impl datafusion::logical_expr::ScalarUDFImpl for FullTextUdf {
         Ok(DataType::Boolean)
     }
 
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        // Fallback: if not pushed down, return true for all rows.
-        let num_rows = args.number_rows;
-        Ok(ColumnarValue::Array(std::sync::Arc::new(
-            BooleanArray::from(vec![true; num_rows]),
-        )))
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        Err(datafusion::error::DataFusionError::Execution(
+            "full_text() can only be used with tantivy-backed tables (requires filter pushdown)"
+                .into(),
+        ))
     }
 }
 

@@ -209,13 +209,23 @@ impl UnifiedSqlCtx {
 
 fn main() {
     let cases = agg_cases();
-    let index = build_bench_index(1_000_000);
+    let index_1m = build_bench_index(1_000_000);
+    let index_10m = build_bench_index(10_000_000);
 
-    let inputs: Vec<(&str, Index)> = vec![("1M_docs", index.clone())];
+    let inputs: Vec<(&str, Index)> = vec![
+        ("1M_docs", index_1m.clone()),
+        ("10M_docs", index_10m.clone()),
+    ];
 
-    for case in &cases {
-        let pushdown_ctx = Arc::new(UnifiedPushdownCtx::new(&index, case.sql));
-        let sql_ctx = Arc::new(UnifiedSqlCtx::new(&index, case.sql));
+    // Pre-build contexts for each index size × case
+    let pushdown_1m: Vec<Arc<UnifiedPushdownCtx>> = cases.iter()
+        .map(|c| Arc::new(UnifiedPushdownCtx::new(&index_1m, c.sql))).collect();
+    let pushdown_10m: Vec<Arc<UnifiedPushdownCtx>> = cases.iter()
+        .map(|c| Arc::new(UnifiedPushdownCtx::new(&index_10m, c.sql))).collect();
+
+    for (i, case) in cases.iter().enumerate() {
+        let pd_1m = pushdown_1m[i].clone();
+        let pd_10m = pushdown_10m[i].clone();
 
         let mut group = InputGroup::new_with_inputs(
             inputs.iter().map(|(name, idx)| (*name, idx.clone())).collect(),
@@ -228,15 +238,15 @@ fn main() {
         });
 
         // Unified + AggPushdown (should match native)
-        let pd = pushdown_ctx.clone();
-        group.register(&format!("unified_pushdown/{}", case.name), move |_index| {
-            pd.run();
-        });
-
-        // Unified SQL without pushdown (measures DataFusion overhead)
-        let sql = sql_ctx.clone();
-        group.register(&format!("unified_sql/{}", case.name), move |_index| {
-            sql.run();
+        let pd1 = pd_1m.clone();
+        let pd10 = pd_10m.clone();
+        group.register(&format!("unified_pushdown/{}", case.name), move |index| {
+            // Select context based on index size
+            if index.reader().unwrap().searcher().num_docs() > 5_000_000 {
+                pd10.run();
+            } else {
+                pd1.run();
+            }
         });
 
         group.run();

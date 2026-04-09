@@ -223,9 +223,13 @@ fn derive_tantivy_aggregations(agg: &AggregateExec) -> Option<Aggregations> {
     }
 
     // Build the top-level terms aggregation
+    // Use the maximum safe size that avoids overflow in tantivy's
+    // `segment_size = size * 10` default calculation.
+    let max_buckets = u32::MAX / 10;
     let terms = TermsAggregation {
         field: group_field,
-        size: None,
+        size: Some(max_buckets),
+        segment_size: Some(max_buckets),
         ..Default::default()
     };
 

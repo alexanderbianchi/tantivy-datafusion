@@ -30,7 +30,7 @@ use crate::fast_field_reader::{DictCache, read_segment_fast_fields_to_batch};
 use crate::full_text_udf::extract_full_text_call;
 use crate::index_opener::{DirectIndexOpener, IndexOpener};
 use crate::schema_mapping::{tantivy_schema_to_arrow, tantivy_schema_to_arrow_from_index};
-use crate::util::{build_combined_query, collect_matching_docs, segment_hash_partitioning};
+use crate::util::{build_combined_query, collect_matching_docs};
 
 /// Guard that calls `BaselineMetrics::done()` on drop so elapsed time is
 /// recorded even when the stream is cancelled.
@@ -101,38 +101,35 @@ fn compute_partition_stats(
 
             let (min_val, max_val) = match field.data_type() {
                 DataType::UInt64 => {
-                    if let Ok(col) = fast_fields.u64(name) {
-                        (
+                    match fast_fields.u64(name) {
+                        Ok(col) if col.values.num_vals() > 0 => (
                             Some(ScalarValue::UInt64(Some(col.min_value()))),
                             Some(ScalarValue::UInt64(Some(col.max_value()))),
-                        )
-                    } else {
-                        (None, None)
+                        ),
+                        _ => (None, None),
                     }
                 }
                 DataType::Int64 => {
-                    if let Ok(col) = fast_fields.i64(name) {
-                        (
+                    match fast_fields.i64(name) {
+                        Ok(col) if col.values.num_vals() > 0 => (
                             Some(ScalarValue::Int64(Some(col.min_value()))),
                             Some(ScalarValue::Int64(Some(col.max_value()))),
-                        )
-                    } else {
-                        (None, None)
+                        ),
+                        _ => (None, None),
                     }
                 }
                 DataType::Float64 => {
-                    if let Ok(col) = fast_fields.f64(name) {
-                        (
+                    match fast_fields.f64(name) {
+                        Ok(col) if col.values.num_vals() > 0 => (
                             Some(ScalarValue::Float64(Some(col.min_value()))),
                             Some(ScalarValue::Float64(Some(col.max_value()))),
-                        )
-                    } else {
-                        (None, None)
+                        ),
+                        _ => (None, None),
                     }
                 }
                 DataType::Timestamp(TimeUnit::Microsecond, _) => {
-                    if let Ok(col) = fast_fields.date(name) {
-                        (
+                    match fast_fields.date(name) {
+                        Ok(col) if col.values.num_vals() > 0 => (
                             Some(ScalarValue::TimestampMicrosecond(
                                 Some(col.min_value().into_timestamp_micros()),
                                 None,
@@ -141,19 +138,17 @@ fn compute_partition_stats(
                                 Some(col.max_value().into_timestamp_micros()),
                                 None,
                             )),
-                        )
-                    } else {
-                        (None, None)
+                        ),
+                        _ => (None, None),
                     }
                 }
                 DataType::Boolean => {
-                    if let Ok(col) = fast_fields.bool(name) {
-                        (
+                    match fast_fields.bool(name) {
+                        Ok(col) if col.values.num_vals() > 0 => (
                             Some(ScalarValue::Boolean(Some(col.min_value()))),
                             Some(ScalarValue::Boolean(Some(col.max_value()))),
-                        )
-                    } else {
-                        (None, None)
+                        ),
+                        _ => (None, None),
                     }
                 }
                 _ => (None, None),
@@ -773,7 +768,7 @@ impl DataSource for SingleTableDataSource {
     }
 
     fn output_partitioning(&self) -> Partitioning {
-        segment_hash_partitioning(&self.schema.projected, self.num_segments)
+        Partitioning::UnknownPartitioning(self.num_segments)
     }
 
     fn eq_properties(&self) -> EquivalenceProperties {
@@ -1214,14 +1209,19 @@ fn logical_scalar_to_term(
         FieldType::I64(_) => {
             let v = match scalar {
                 ScalarValue::Int64(Some(v)) => *v,
-                ScalarValue::Int32(Some(v)) => *v as i64,
-                ScalarValue::Int16(Some(v)) => *v as i64,
-                ScalarValue::Int8(Some(v)) => *v as i64,
-                ScalarValue::UInt64(Some(v)) => *v as i64,
-                ScalarValue::UInt32(Some(v)) => *v as i64,
-                ScalarValue::UInt16(Some(v)) => *v as i64,
-                ScalarValue::UInt8(Some(v)) => *v as i64,
-                ScalarValue::Float64(Some(v)) => *v as i64,
+                ScalarValue::Int32(Some(v)) => i64::from(*v),
+                ScalarValue::Int16(Some(v)) => i64::from(*v),
+                ScalarValue::Int8(Some(v)) => i64::from(*v),
+                ScalarValue::UInt64(Some(v)) => i64::try_from(*v).ok()?,
+                ScalarValue::UInt32(Some(v)) => i64::from(*v),
+                ScalarValue::UInt16(Some(v)) => i64::from(*v),
+                ScalarValue::UInt8(Some(v)) => i64::from(*v),
+                ScalarValue::Float64(Some(v)) => {
+                    if v.fract() != 0.0 || *v > i64::MAX as f64 || *v < i64::MIN as f64 {
+                        return None;
+                    }
+                    *v as i64
+                }
                 _ => return None,
             };
             return Some(Term::from_field_i64(field, v));
@@ -1229,14 +1229,19 @@ fn logical_scalar_to_term(
         FieldType::U64(_) => {
             let v = match scalar {
                 ScalarValue::UInt64(Some(v)) => *v,
-                ScalarValue::UInt32(Some(v)) => *v as u64,
-                ScalarValue::UInt16(Some(v)) => *v as u64,
-                ScalarValue::UInt8(Some(v)) => *v as u64,
-                ScalarValue::Int64(Some(v)) => *v as u64,
-                ScalarValue::Int32(Some(v)) => *v as u64,
-                ScalarValue::Int16(Some(v)) => *v as u64,
-                ScalarValue::Int8(Some(v)) => *v as u64,
-                ScalarValue::Float64(Some(v)) => *v as u64,
+                ScalarValue::UInt32(Some(v)) => u64::from(*v),
+                ScalarValue::UInt16(Some(v)) => u64::from(*v),
+                ScalarValue::UInt8(Some(v)) => u64::from(*v),
+                ScalarValue::Int64(Some(v)) => u64::try_from(*v).ok()?,
+                ScalarValue::Int32(Some(v)) => u64::try_from(*v).ok()?,
+                ScalarValue::Int16(Some(v)) => u64::try_from(*v).ok()?,
+                ScalarValue::Int8(Some(v)) => u64::try_from(*v).ok()?,
+                ScalarValue::Float64(Some(v)) => {
+                    if v.fract() != 0.0 || *v < 0.0 || *v > u64::MAX as f64 {
+                        return None;
+                    }
+                    *v as u64
+                }
                 _ => return None,
             };
             return Some(Term::from_field_u64(field, v));
