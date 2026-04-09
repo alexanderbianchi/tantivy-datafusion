@@ -22,10 +22,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use datafusion::common::Result;
-use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
-use datafusion::logical_expr::{Expr, lit};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -34,20 +32,18 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::SessionConfig;
 use datafusion_datasource::source::DataSourceExec;
-use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use futures::stream::{self, StreamExt};
 use prost::Message;
 
-use crate::decomposed::document_provider::{DocumentDataSource, TantivyDocumentProvider};
-use crate::full_text_udf::full_text_udf;
 use crate::index_opener::{IndexOpener, OpenerMetadata};
-use crate::decomposed::inverted_index_provider::{InvertedIndexDataSource, TantivyInvertedIndexProvider};
 use crate::schema_mapping::tantivy_schema_to_arrow_with_multi_valued;
 use crate::unified::agg_data_source::AggDataSource;
-use crate::unified::single_table_provider::SingleTableDataSource;
-use crate::decomposed::table_provider::{FastFieldDataSource, TantivyTableProvider};
+use crate::unified::single_table_provider::{
+    ScanSchema, SingleTableDataSource, deserialize_fast_field_filters,
+    serialize_fast_field_filters,
+};
 
 // ── Opener factory as session extension ─────────────────────────────
 
@@ -120,6 +116,10 @@ struct TantivyScanProto {
     /// Protobuf-encoded Arrow output schema (used by AGG_DATA_SOURCE).
     #[prost(bytes = "vec", tag = "17")]
     output_schema_bytes: Vec<u8>,
+    /// JSON-serialized fast field filter Exprs (for SINGLE_TABLE / AGG_DATA_SOURCE).
+    /// Workers re-derive `pre_built_query` from these on execution.
+    #[prost(string, tag = "18")]
+    fast_field_filters_json: String,
 }
 
 const FAST_FIELD: u32 = 0;
@@ -143,43 +143,112 @@ const AGG_DATA_SOURCE: u32 = 4;
 #[derive(Debug, Clone)]
 pub struct TantivyCodec;
 
-/// Serialize a list of `PhysicalExpr`s into protobuf bytes.
-fn serialize_pushed_filters(
-    filters: &[Arc<dyn PhysicalExpr>],
-    codec: &TantivyCodec,
-) -> Result<Vec<Vec<u8>>> {
-    filters
-        .iter()
-        .map(|f| {
-            let proto = datafusion_proto::physical_plan::to_proto::serialize_physical_expr(f, codec)?;
-            let mut buf = Vec::new();
-            proto
-                .encode(&mut buf)
-                .map_err(|e| DataFusionError::Internal(format!("encode filter: {e}")))?;
-            Ok(buf)
-        })
-        .collect()
+/// Rebuild a tantivy `pre_built_query` from serialized fast field filter JSON.
+///
+/// Returns `None` when the JSON is empty (no fast field filters were pushed).
+fn reconstruct_pre_built_query(
+    json: &str,
+    tantivy_schema: &tantivy::schema::Schema,
+) -> Result<Option<Arc<dyn tantivy::query::Query>>> {
+    let queries = deserialize_fast_field_filters(json, tantivy_schema)?;
+    if queries.is_empty() {
+        return Ok(None);
+    }
+    if queries.len() == 1 {
+        Ok(Some(Arc::from(queries.into_iter().next().unwrap())))
+    } else {
+        Ok(Some(Arc::new(tantivy::query::BooleanQuery::intersection(
+            queries,
+        ))))
+    }
 }
 
-/// Deserialize pushed filters from protobuf bytes.
-fn deserialize_pushed_filters(
-    filter_bytes: &[Vec<u8>],
-    ctx: &TaskContext,
-    schema: &arrow::datatypes::Schema,
-    codec: &TantivyCodec,
-) -> Result<Vec<Arc<dyn PhysicalExpr>>> {
-    use prost::Message as ProstMessage;
-    filter_bytes
-        .iter()
-        .map(|buf| {
-            let proto =
-                datafusion_proto::protobuf::PhysicalExprNode::decode(buf.as_slice())
-                    .map_err(|e| DataFusionError::Internal(format!("decode filter: {e}")))?;
-            datafusion_proto::physical_plan::from_proto::parse_physical_expr(
-                &proto, ctx, schema, codec,
-            )
-        })
-        .collect()
+/// Build a [`ScanSchema`] for `SingleTableDataSource` from the opener's
+/// tantivy schema, multi-valued field names, and projection indices.
+///
+/// This mirrors the logic in `SingleTableProvider::scan` but avoids
+/// constructing a full `SessionContext` and `TableProvider`.
+fn build_single_table_scan_schema(
+    opener: &Arc<dyn IndexOpener>,
+    multi_valued_fields: &[String],
+    projection: &Option<Vec<usize>>,
+) -> ScanSchema {
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let ff_schema = tantivy_schema_to_arrow_with_multi_valued(
+        &opener.schema(),
+        multi_valued_fields,
+    );
+
+    // Build unified schema: fast fields + _score + _document.
+    let mut unified_fields: Vec<Arc<Field>> = ff_schema.fields().to_vec();
+    let score_idx = unified_fields.len();
+    unified_fields.push(Arc::new(Field::new("_score", DataType::Float32, true)));
+    let document_idx = unified_fields.len();
+    unified_fields.push(Arc::new(Field::new("_document", DataType::Utf8, false)));
+    let unified_schema = Arc::new(Schema::new(unified_fields));
+
+    // Determine projected indices.
+    let actual_indices: Vec<usize> = match projection {
+        Some(indices) => indices.clone(),
+        None => (0..unified_schema.fields().len()).collect(),
+    };
+
+    // Classify projected columns into score, document, and fast field indices.
+    let mut needs_score = false;
+    let mut needs_document = false;
+    let mut ff_indices = Vec::new();
+
+    for &idx in &actual_indices {
+        if idx == score_idx {
+            needs_score = true;
+        } else if idx == document_idx {
+            needs_document = true;
+        } else {
+            ff_indices.push(idx);
+        }
+    }
+
+    // Ensure _doc_id and _segment_ord are included (needed internally).
+    if let Ok(doc_id_idx) = ff_schema.index_of("_doc_id") {
+        if !ff_indices.contains(&doc_id_idx) {
+            ff_indices.push(doc_id_idx);
+        }
+    }
+    if let Ok(seg_ord_idx) = ff_schema.index_of("_segment_ord") {
+        if !ff_indices.contains(&seg_ord_idx) {
+            ff_indices.push(seg_ord_idx);
+        }
+    }
+    ff_indices.sort();
+    ff_indices.dedup();
+
+    let ff_projected = {
+        let fields: Vec<Field> = ff_indices
+            .iter()
+            .map(|&i| ff_schema.field(i).clone())
+            .collect();
+        Arc::new(Schema::new(fields))
+    };
+
+    let projected = {
+        let fields: Vec<Field> = actual_indices
+            .iter()
+            .map(|&i| unified_schema.field(i).clone())
+            .collect();
+        Arc::new(Schema::new(fields))
+    };
+
+    ScanSchema {
+        unified: unified_schema,
+        projected,
+        ff_projected,
+        projection: projection.clone(),
+        score_idx,
+        document_idx,
+        needs_score,
+        needs_document,
+    }
 }
 
 /// Extract serializable metadata from an opener.
@@ -206,62 +275,6 @@ impl PhysicalExtensionCodec for TantivyCodec {
             let output_partitions =
                 ds_exec.properties().partitioning.partition_count() as u32;
 
-            if let Some(ff) = ds.as_any().downcast_ref::<FastFieldDataSource>() {
-                let (id, schema_json, seg, footer_start, footer_end, mv) = opener_to_proto(ff.opener())?;
-                let (proj, has_proj) = match ff.projection() {
-                    Some(p) => (p.iter().map(|&i| i as u32).collect(), true),
-                    None => (Vec::new(), false),
-                };
-                let pushed_filters = serialize_pushed_filters(ff.pushed_filters(), self)?;
-                return TantivyScanProto {
-                    identifier: id, tantivy_schema_json: schema_json, segment_sizes: seg,
-                    projection: proj, has_projection: has_proj, output_partitions,
-                    provider_type: FAST_FIELD, raw_queries_json: String::new(), topk: 0, has_topk: false,
-                    pushed_filters,
-                    footer_start, footer_end, multi_valued_fields: mv,
-                    aggregations_json: String::new(), output_schema_bytes: Vec::new(),
-                }.encode(buf).map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
-            }
-
-            if let Some(inv) = ds.as_any().downcast_ref::<InvertedIndexDataSource>() {
-                let (id, schema_json, seg, footer_start, footer_end, mv) = opener_to_proto(inv.opener())?;
-                let (proj, has_proj) = match inv.projection() {
-                    Some(p) => (p.iter().map(|&i| i as u32).collect(), true),
-                    None => (Vec::new(), false),
-                };
-                let rq_json = serde_json::to_string(inv.raw_queries())
-                    .map_err(|e| DataFusionError::Internal(format!("serialize raw_queries: {e}")))?;
-                let (topk, has_topk) = match inv.topk() {
-                    Some(k) => (k as u32, true),
-                    None => (0, false),
-                };
-                return TantivyScanProto {
-                    identifier: id, tantivy_schema_json: schema_json, segment_sizes: seg,
-                    projection: proj, has_projection: has_proj, output_partitions,
-                    provider_type: INVERTED_INDEX, raw_queries_json: rq_json, topk, has_topk,
-                    pushed_filters: Vec::new(),
-                    footer_start, footer_end, multi_valued_fields: mv,
-                    aggregations_json: String::new(), output_schema_bytes: Vec::new(),
-                }.encode(buf).map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
-            }
-
-            if let Some(doc) = ds.as_any().downcast_ref::<DocumentDataSource>() {
-                let (id, schema_json, seg, footer_start, footer_end, mv) = opener_to_proto(doc.opener())?;
-                let (proj, has_proj) = match doc.projection() {
-                    Some(p) => (p.iter().map(|&i| i as u32).collect(), true),
-                    None => (Vec::new(), false),
-                };
-                let pushed_filters = serialize_pushed_filters(doc.pushed_filters(), self)?;
-                return TantivyScanProto {
-                    identifier: id, tantivy_schema_json: schema_json, segment_sizes: seg,
-                    projection: proj, has_projection: has_proj, output_partitions,
-                    provider_type: DOCUMENT, raw_queries_json: String::new(), topk: 0, has_topk: false,
-                    pushed_filters,
-                    footer_start, footer_end, multi_valued_fields: mv,
-                    aggregations_json: String::new(), output_schema_bytes: Vec::new(),
-                }.encode(buf).map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
-            }
-
             if let Some(st) = ds.as_any().downcast_ref::<SingleTableDataSource>() {
                 let (id, schema_json, seg, footer_start, footer_end, mv) = opener_to_proto(st.opener())?;
                 let (proj, has_proj) = match st.projection() {
@@ -274,6 +287,7 @@ impl PhysicalExtensionCodec for TantivyCodec {
                     Some(k) => (k as u32, true),
                     None => (0, false),
                 };
+                let ff_filters_json = serialize_fast_field_filters(st.fast_field_filter_exprs())?;
                 return TantivyScanProto {
                     identifier: id, tantivy_schema_json: schema_json, segment_sizes: seg,
                     projection: proj, has_projection: has_proj, output_partitions,
@@ -281,6 +295,7 @@ impl PhysicalExtensionCodec for TantivyCodec {
                     pushed_filters: Vec::new(),
                     footer_start, footer_end, multi_valued_fields: mv,
                     aggregations_json: String::new(), output_schema_bytes: Vec::new(),
+                    fast_field_filters_json: ff_filters_json,
                 }.encode(buf).map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
             }
 
@@ -298,6 +313,7 @@ impl PhysicalExtensionCodec for TantivyCodec {
                         .map_err(|e| DataFusionError::Internal(format!("encode schema bytes: {e}")))?;
                     schema_buf
                 };
+                let ff_filters_json = serialize_fast_field_filters(agg_ds.fast_field_filter_exprs())?;
                 return TantivyScanProto {
                     identifier: id, tantivy_schema_json: schema_json, segment_sizes: seg,
                     projection: Vec::new(), has_projection: false, output_partitions,
@@ -308,6 +324,7 @@ impl PhysicalExtensionCodec for TantivyCodec {
                     footer_start, footer_end, multi_valued_fields: mv,
                     aggregations_json: agg_json,
                     output_schema_bytes,
+                    fast_field_filters_json: ff_filters_json,
                 }.encode(buf).map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
             }
         }
@@ -331,6 +348,7 @@ impl PhysicalExtensionCodec for TantivyCodec {
                 multi_valued_fields: lazy.multi_valued_fields.clone(),
                 aggregations_json: lazy.aggregations_json.clone(),
                 output_schema_bytes: lazy.output_schema_bytes.clone(),
+                fast_field_filters_json: lazy.fast_field_filters_json.clone(),
             }.encode(buf).map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
         }
 
@@ -378,12 +396,12 @@ impl PhysicalExtensionCodec for TantivyCodec {
         };
 
         let arrow_schema: SchemaRef = match proto.provider_type {
-            FAST_FIELD => tantivy_schema_to_arrow_with_multi_valued(
-                &opener.schema(),
-                &proto.multi_valued_fields,
-            ),
-            INVERTED_INDEX => TantivyInvertedIndexProvider::from_opener(opener.clone()).schema(),
-            DOCUMENT => TantivyDocumentProvider::from_opener(opener.clone()).schema(),
+            FAST_FIELD | INVERTED_INDEX | DOCUMENT => {
+                return Err(DataFusionError::Internal(format!(
+                    "decomposed provider type {} is no longer supported; use SINGLE_TABLE or AGG_DATA_SOURCE",
+                    proto.provider_type
+                )));
+            }
             SINGLE_TABLE => {
                 // Build unified schema: fast fields + _score + _document
                 let ff_schema = tantivy_schema_to_arrow_with_multi_valued(
@@ -445,6 +463,7 @@ impl PhysicalExtensionCodec for TantivyCodec {
             multi_valued_fields: proto.multi_valued_fields,
             aggregations_json: proto.aggregations_json,
             output_schema_bytes: proto.output_schema_bytes,
+            fast_field_filters_json: proto.fast_field_filters_json,
             plan_properties,
             projected_schema,
             output_partitions: proto.output_partitions,
@@ -474,6 +493,8 @@ struct LazyScanExec {
     aggregations_json: String,
     /// Protobuf-encoded Arrow output schema (AGG_DATA_SOURCE only).
     output_schema_bytes: Vec<u8>,
+    /// JSON-serialized fast field filter Exprs (SINGLE_TABLE / AGG_DATA_SOURCE).
+    fast_field_filters_json: String,
     plan_properties: PlanProperties,
     projected_schema: SchemaRef,
     output_partitions: u32,
@@ -482,9 +503,7 @@ struct LazyScanExec {
 impl DisplayAs for LazyScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         let kind = match self.provider_type {
-            FAST_FIELD => "FastField",
-            INVERTED_INDEX => "InvertedIndex",
-            DOCUMENT => "Document",
+            FAST_FIELD | INVERTED_INDEX | DOCUMENT => "Legacy",
             SINGLE_TABLE => "SingleTable",
             AGG_DATA_SOURCE => "Agg",
             _ => "Unknown",
@@ -523,16 +542,17 @@ impl ExecutionPlan for LazyScanExec {
         let segment_sizes = self.segment_sizes.clone();
         let identifier = self.identifier.clone();
         let projection = self.projection.clone();
-        let output_partitions = self.output_partitions as usize;
+        let _output_partitions = self.output_partitions as usize;
         let provider_type = self.provider_type;
         let raw_queries_json = self.raw_queries_json.clone();
-        let pushed_filter_bytes = self.pushed_filter_bytes.clone();
+        let _pushed_filter_bytes = self.pushed_filter_bytes.clone();
         let topk = self.topk;
         let footer_start = self.footer_start;
         let footer_end = self.footer_end;
         let multi_valued_fields = self.multi_valued_fields.clone();
         let aggregations_json = self.aggregations_json.clone();
         let output_schema_bytes = self.output_schema_bytes.clone();
+        let fast_field_filters_json = self.fast_field_filters_json.clone();
 
         let schema_clone = self.projected_schema.clone();
         let stream = stream::once(async move {
@@ -545,86 +565,43 @@ impl ExecutionPlan for LazyScanExec {
                 multi_valued_fields,
             });
 
-            let target_partitions = output_partitions.max(1);
-            let config = context.session_config().clone()
-                .with_target_partitions(target_partitions);
-            let session = datafusion::prelude::SessionContext::new_with_config(config);
-
-            let filters: Vec<Expr> =
-                if (provider_type == INVERTED_INDEX || provider_type == SINGLE_TABLE) && !raw_queries_json.is_empty() {
-                    let rq: Vec<(String, String)> = serde_json::from_str(&raw_queries_json)
-                        .map_err(|e| DataFusionError::Internal(format!("parse raw_queries: {e}")))?;
-                    session.register_udf(full_text_udf());
-                    rq.into_iter()
-                        .map(|(field, query)| {
-                            Expr::ScalarFunction(
-                                datafusion::logical_expr::expr::ScalarFunction::new_udf(
-                                    Arc::new(full_text_udf()),
-                                    vec![datafusion::prelude::col(&field), lit(query)],
-                                ),
-                            )
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-
-            let state = session.state();
             let exec: Arc<dyn ExecutionPlan> = match provider_type {
-                FAST_FIELD => {
-                    TantivyTableProvider::from_opener(opener)
-                        .scan(&state, projection.as_ref().map(|v| v as &Vec<usize>), &filters, None)
-                        .await?
-                }
-                INVERTED_INDEX => {
-                    let inv_exec = TantivyInvertedIndexProvider::from_opener(opener)
-                        .scan(&state, projection.as_ref().map(|v| v as &Vec<usize>), &filters, None)
-                        .await?;
-                    // Re-apply topk if it was serialized.
-                    if let Some(k) = topk {
-                        if let Some(ds_exec) = inv_exec.as_any().downcast_ref::<DataSourceExec>() {
-                            if let Some(inv_ds) = ds_exec.data_source().as_any().downcast_ref::<InvertedIndexDataSource>() {
-                                let updated = inv_ds.with_topk(k);
-                                Arc::new(DataSourceExec::new(Arc::new(updated)))
-                            } else {
-                                inv_exec
-                            }
-                        } else {
-                            inv_exec
-                        }
-                    } else {
-                        inv_exec
-                    }
-                }
-                DOCUMENT => {
-                    TantivyDocumentProvider::from_opener(opener)
-                        .scan(&state, projection.as_ref().map(|v| v as &Vec<usize>), &[], None)
-                        .await?
+                FAST_FIELD | INVERTED_INDEX | DOCUMENT => {
+                    return Err(DataFusionError::Internal(format!(
+                        "decomposed provider type {} is no longer supported",
+                        provider_type
+                    )));
                 }
                 SINGLE_TABLE => {
-                    use crate::unified::single_table_provider::SingleTableProvider;
-                    let ff_schema = tantivy_schema_to_arrow_with_multi_valued(
-                        &opener.schema(),
-                        &opener.multi_valued_fields(),
+                    // Construct SingleTableDataSource directly — no SessionContext needed.
+                    let mv_fields = opener.multi_valued_fields();
+                    let seg_sizes = opener.segment_sizes();
+                    let scan_schema = build_single_table_scan_schema(
+                        &opener,
+                        &mv_fields,
+                        &projection,
                     );
-                    let provider = SingleTableProvider::from_opener_with_ff_schema(opener, ff_schema);
-                    // full_text UDF already registered above for SINGLE_TABLE
-                    let st_exec = provider.scan(&state, projection.as_ref().map(|v| v as &Vec<usize>), &filters, None).await?;
-                    // Re-apply topk if present
-                    if let Some(k) = topk {
-                        if let Some(ds_exec) = st_exec.as_any().downcast_ref::<DataSourceExec>() {
-                            if let Some(st_ds) = ds_exec.data_source().as_any().downcast_ref::<SingleTableDataSource>() {
-                                let updated = st_ds.with_topk(k);
-                                Arc::new(DataSourceExec::new(Arc::new(updated)))
-                            } else {
-                                st_exec
-                            }
-                        } else {
-                            st_exec
-                        }
+                    let raw_queries: Vec<(String, String)> = if raw_queries_json.is_empty() {
+                        Vec::new()
                     } else {
-                        st_exec
-                    }
+                        serde_json::from_str(&raw_queries_json)
+                            .map_err(|e| DataFusionError::Internal(format!("parse raw_queries: {e}")))?
+                    };
+                    // Re-derive pre_built_query from serialized fast field filters.
+                    let pre_built_query = reconstruct_pre_built_query(
+                        &fast_field_filters_json,
+                        &opener.schema(),
+                    )?;
+                    let num_segments = seg_sizes.len().max(1);
+                    let ds = SingleTableDataSource::new_from_codec(
+                        opener,
+                        scan_schema,
+                        raw_queries,
+                        pre_built_query,
+                        topk,
+                        num_segments,
+                    );
+                    Arc::new(DataSourceExec::new(Arc::new(ds)))
                 }
                 AGG_DATA_SOURCE => {
                     // Construct AggDataSource directly — no SessionContext needed.
@@ -649,60 +626,28 @@ impl ExecutionPlan for LazyScanExec {
                                 })?,
                         )
                     };
+                    // Re-derive pre_built_query from serialized fast field filters.
+                    let pre_built_query = reconstruct_pre_built_query(
+                        &fast_field_filters_json,
+                        &opener.schema(),
+                    )?;
                     let agg_ds = AggDataSource::new(
                         opener,
                         Arc::new(aggs),
                         output_schema,
                         raw_queries,
-                        None, // pre_built_query is not serializable; worker re-derives from filters
+                        pre_built_query,
+                        Vec::new(), // exprs not needed on worker — query already reconstructed
                     );
                     Arc::new(DataSourceExec::new(Arc::new(agg_ds)))
                 }
                 other => return Err(DataFusionError::Internal(format!("unknown provider type: {other}"))),
             };
 
-            // Re-apply pushed filters that survived serialization.
-            let exec: Arc<dyn ExecutionPlan> =
-                if !pushed_filter_bytes.is_empty() {
-                    if let Some(ds_exec) =
-                        exec.as_any().downcast_ref::<DataSourceExec>()
-                    {
-                        let ds_schema = ds_exec.schema();
-                        if let Some(ff_ds) = ds_exec
-                            .data_source()
-                            .as_any()
-                            .downcast_ref::<FastFieldDataSource>()
-                        {
-                            let deserialized = deserialize_pushed_filters(
-                                &pushed_filter_bytes,
-                                &context,
-                                ds_schema.as_ref(),
-                                &TantivyCodec,
-                            )?;
-                            let updated = ff_ds.with_pushed_filters(deserialized);
-                            Arc::new(DataSourceExec::new(Arc::new(updated)))
-                        } else if let Some(doc_ds) = ds_exec
-                            .data_source()
-                            .as_any()
-                            .downcast_ref::<DocumentDataSource>()
-                        {
-                            let deserialized = deserialize_pushed_filters(
-                                &pushed_filter_bytes,
-                                &context,
-                                ds_schema.as_ref(),
-                                &TantivyCodec,
-                            )?;
-                            let updated = doc_ds.with_pushed_filters(deserialized);
-                            Arc::new(DataSourceExec::new(Arc::new(updated)))
-                        } else {
-                            exec
-                        }
-                    } else {
-                        exec
-                    }
-                } else {
-                    exec
-                };
+            // Pushed filters are no longer used — SingleTableDataSource
+            // returns PushedDown::No, so pushed_filter_bytes is always empty.
+            // This block is retained for backward compatibility with serialized
+            // plans that may contain pushed filters from older coordinators.
 
             // Forward the inner stream directly — no collecting into Vec.
             exec.execute(partition, context)

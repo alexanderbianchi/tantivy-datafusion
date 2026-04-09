@@ -15,7 +15,7 @@ use tantivy::aggregation::metric::{
 
 use crate::unified::agg_data_source::AggDataSource;
 use crate::unified::plan_traversal::{
-    find_fast_field_datasource, find_partial_aggregate, find_single_table_datasource,
+    find_partial_aggregate, find_single_table_datasource,
 };
 use datafusion_datasource::source::DataSourceExec;
 
@@ -103,34 +103,6 @@ fn try_rewrite_single(
 
     let input = agg.input();
 
-    // Try FastFieldDataSource first
-    if let Some(ff_ds) = find_fast_field_datasource(input) {
-        // Check stashed aggregations (backward compat)
-        if let Some(tantivy_aggs) = ff_ds.aggregations() {
-            let agg_ds = AggDataSource::new(
-                ff_ds.opener().clone(),
-                tantivy_aggs.clone(),
-                agg.schema(),
-                vec![],  // decomposed path has no raw text queries
-                ff_ds.query().map(|q| Arc::from(q.box_clone())),
-            );
-            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(agg_ds)))));
-        }
-
-        // Fallback: derive from AggregateExec expressions
-        if let Some(tantivy_aggs) = derive_tantivy_aggregations(agg) {
-            let agg_ds = AggDataSource::new(
-                ff_ds.opener().clone(),
-                Arc::new(tantivy_aggs),
-                agg.schema(),
-                vec![],  // decomposed path has no raw text queries
-                ff_ds.query().map(|q| Arc::from(q.box_clone())),
-            );
-            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(agg_ds)))));
-        }
-    }
-
-    // Try SingleTableDataSource: create a dedicated AggDataSource
     if let Some(st_ds) = find_single_table_datasource(input) {
         if let Some(tantivy_aggs) = derive_tantivy_aggregations(agg).map(Arc::new) {
             let agg_ds = AggDataSource::new(
@@ -139,6 +111,7 @@ fn try_rewrite_single(
                 agg.schema(),
                 st_ds.raw_queries().to_vec(),
                 st_ds.pre_built_query().cloned(),
+                st_ds.fast_field_filter_exprs().to_vec(),
             );
             return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(agg_ds)))));
         }
@@ -166,34 +139,6 @@ fn try_rewrite_two_phase(
 
     let partial_input = partial_agg.input();
 
-    // Try FastFieldDataSource first
-    if let Some(ff_ds) = find_fast_field_datasource(partial_input) {
-        // Check stashed aggregations (backward compat)
-        if let Some(tantivy_aggs) = ff_ds.aggregations() {
-            let agg_ds = AggDataSource::new(
-                ff_ds.opener().clone(),
-                tantivy_aggs.clone(),
-                final_agg.schema(),
-                vec![],  // decomposed path has no raw text queries
-                ff_ds.query().map(|q| Arc::from(q.box_clone())),
-            );
-            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(agg_ds)))));
-        }
-
-        // Fallback: derive from the Final AggregateExec expressions
-        if let Some(tantivy_aggs) = derive_tantivy_aggregations(final_agg) {
-            let agg_ds = AggDataSource::new(
-                ff_ds.opener().clone(),
-                Arc::new(tantivy_aggs),
-                final_agg.schema(),
-                vec![],  // decomposed path has no raw text queries
-                ff_ds.query().map(|q| Arc::from(q.box_clone())),
-            );
-            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(agg_ds)))));
-        }
-    }
-
-    // Try SingleTableDataSource: create a dedicated AggDataSource
     if let Some(st_ds) = find_single_table_datasource(partial_input) {
         if let Some(tantivy_aggs) = derive_tantivy_aggregations(final_agg).map(Arc::new) {
             let agg_ds = AggDataSource::new(
@@ -202,6 +147,7 @@ fn try_rewrite_two_phase(
                 final_agg.schema(),
                 st_ds.raw_queries().to_vec(),
                 st_ds.pre_built_query().cloned(),
+                st_ds.fast_field_filter_exprs().to_vec(),
             );
             return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(agg_ds)))));
         }

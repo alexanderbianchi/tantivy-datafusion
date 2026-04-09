@@ -8,6 +8,5 @@
 pub mod agg_data_source;
 pub(crate) mod agg_exec;
 pub mod agg_pushdown;
-pub mod ordinal_group_by;
 pub(crate) mod plan_traversal;
 pub mod single_table_provider;

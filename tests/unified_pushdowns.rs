@@ -8,7 +8,7 @@ use datafusion::prelude::*;
 use tantivy::schema::{Field, SchemaBuilder, FAST, STORED, TEXT};
 use tantivy::{DateTime, Index, IndexWriter, TantivyDocument};
 use tantivy_datafusion::{
-    full_text_udf, AggPushdown, OrdinalGroupByOptimization, SingleTableProvider,
+    full_text_udf, AggPushdown, SingleTableProvider,
 };
 
 // ---------------------------------------------------------------------------
@@ -123,7 +123,6 @@ fn setup_ctx(index: Index) -> SessionContext {
         .with_config(config)
         .with_default_features()
         .with_physical_optimizer_rule(Arc::new(AggPushdown::new()))
-        .with_physical_optimizer_rule(Arc::new(OrdinalGroupByOptimization::new()))
         .build();
     let ctx = SessionContext::new_with_state(state);
     ctx.register_udf(full_text_udf());

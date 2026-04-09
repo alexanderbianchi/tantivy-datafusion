@@ -22,6 +22,8 @@ use datafusion_physical_expr::PhysicalExpr;
 use futures::stream::{self, StreamExt};
 use tantivy::aggregation::agg_req::Aggregations;
 
+use datafusion::logical_expr::Expr;
+
 use crate::index_opener::IndexOpener;
 use crate::util::build_combined_query;
 
@@ -45,6 +47,9 @@ pub struct AggDataSource {
     raw_queries: Vec<(String, String)>,
     /// Pre-built tantivy queries from fast field filter conversion.
     pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
+    /// Source logical `Expr`s that produced `pre_built_query`. Stored for
+    /// codec serialization so workers can re-derive the tantivy query.
+    fast_field_filter_exprs: Vec<Expr>,
     /// Shared metrics set for all partitions.
     metrics: ExecutionPlanMetricsSet,
 }
@@ -56,6 +61,7 @@ impl AggDataSource {
         output_schema: SchemaRef,
         raw_queries: Vec<(String, String)>,
         pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
+        fast_field_filter_exprs: Vec<Expr>,
     ) -> Self {
         Self {
             opener,
@@ -63,6 +69,7 @@ impl AggDataSource {
             output_schema,
             raw_queries,
             pre_built_query,
+            fast_field_filter_exprs,
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -85,6 +92,12 @@ impl AggDataSource {
     /// Access the raw full-text queries.
     pub fn raw_queries(&self) -> &[(String, String)] {
         &self.raw_queries
+    }
+
+    /// Access the source logical `Expr`s that produced `pre_built_query`.
+    /// Used by the codec for serialization.
+    pub fn fast_field_filter_exprs(&self) -> &[Expr] {
+        &self.fast_field_filter_exprs
     }
 }
 

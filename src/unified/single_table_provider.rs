@@ -291,6 +291,7 @@ impl TableProvider for SingleTableProvider {
         let tantivy_schema = self.opener.schema();
         let mut raw_queries: Vec<(String, String)> = Vec::new();
         let mut tantivy_queries: Vec<Box<dyn tantivy::query::Query>> = Vec::new();
+        let mut fast_field_filter_exprs: Vec<Expr> = Vec::new();
         for filter in filters {
             if let Some((field_name, query_string)) = extract_full_text_call(filter) {
                 tantivy_schema.get_field(&field_name).map_err(|e| {
@@ -301,6 +302,7 @@ impl TableProvider for SingleTableProvider {
                 raw_queries.push((field_name, query_string));
             } else if let Some(q) = logical_expr_to_tantivy_query(filter, &tantivy_schema) {
                 tantivy_queries.push(q);
+                fast_field_filter_exprs.push(filter.clone());
             }
         }
         // Combine fast field tantivy queries into a single pre-built query.
@@ -393,6 +395,7 @@ impl TableProvider for SingleTableProvider {
             },
             raw_queries,
             pre_built_query,
+            fast_field_filter_exprs,
             topk: None,
             num_segments,
             partition_stats,
@@ -410,15 +413,15 @@ impl TableProvider for SingleTableProvider {
 
 /// Bundles the eight schema-related fields that travel together.
 #[derive(Debug, Clone)]
-struct ScanSchema {
-    unified: SchemaRef,
-    projected: SchemaRef,
-    ff_projected: SchemaRef,
-    projection: Option<Vec<usize>>,
-    score_idx: usize,
-    document_idx: usize,
-    needs_score: bool,
-    needs_document: bool,
+pub(crate) struct ScanSchema {
+    pub(crate) unified: SchemaRef,
+    pub(crate) projected: SchemaRef,
+    pub(crate) ff_projected: SchemaRef,
+    pub(crate) projection: Option<Vec<usize>>,
+    pub(crate) score_idx: usize,
+    pub(crate) document_idx: usize,
+    pub(crate) needs_score: bool,
+    pub(crate) needs_document: bool,
 }
 
 #[derive(Debug)]
@@ -428,6 +431,10 @@ pub struct SingleTableDataSource {
     raw_queries: Vec<(String, String)>,
     /// Pre-built tantivy queries from fast field filters converted at scan time.
     pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
+    /// Source logical `Expr`s that were successfully converted to tantivy
+    /// queries. Stored for serialization: the codec encodes these and the
+    /// worker re-derives `pre_built_query` from them.
+    fast_field_filter_exprs: Vec<Expr>,
     pub(crate) topk: Option<usize>,
     num_segments: usize,
     /// Per-partition (segment) statistics for partition pruning.
@@ -441,12 +448,39 @@ pub struct SingleTableDataSource {
 }
 
 impl SingleTableDataSource {
+    /// Construct a `SingleTableDataSource` directly from deserialized codec
+    /// fields, bypassing `TableProvider::scan` and `SessionContext`. Used by
+    /// `LazyScanExec::execute` so that each partition avoids re-computing
+    /// schemas and stats for all segments.
+    pub(crate) fn new_from_codec(
+        opener: Arc<dyn IndexOpener>,
+        schema: ScanSchema,
+        raw_queries: Vec<(String, String)>,
+        pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
+        topk: Option<usize>,
+        num_segments: usize,
+    ) -> Self {
+        Self {
+            opener,
+            schema,
+            raw_queries,
+            pre_built_query,
+            fast_field_filter_exprs: Vec::new(),
+            topk,
+            num_segments,
+            partition_stats: vec![None; num_segments],
+            warmup_done: Arc::new(tokio::sync::OnceCell::new()),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+
     fn clone_with(&self, f: impl FnOnce(&mut Self)) -> Self {
         let mut new = SingleTableDataSource {
             opener: self.opener.clone(),
             schema: self.schema.clone(),
             raw_queries: self.raw_queries.clone(),
             pre_built_query: self.pre_built_query.clone(),
+            fast_field_filter_exprs: self.fast_field_filter_exprs.clone(),
             topk: self.topk,
             num_segments: self.num_segments,
             partition_stats: self.partition_stats.clone(),
@@ -490,6 +524,12 @@ impl SingleTableDataSource {
     /// Access the pre-built tantivy query from fast field filters.
     pub fn pre_built_query(&self) -> Option<&Arc<dyn tantivy::query::Query>> {
         self.pre_built_query.as_ref()
+    }
+
+    /// Access the source logical `Expr`s that produced `pre_built_query`.
+    /// Used by the codec for serialization.
+    pub fn fast_field_filter_exprs(&self) -> &[Expr] {
+        &self.fast_field_filter_exprs
     }
 
     /// SingleTableDataSource does not carry pre-set aggregations.
@@ -1253,5 +1293,196 @@ fn logical_scalar_to_term(
             Some(Term::from_field_bytes(field, b))
         }
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Serializable representation of fast field filters for the codec
+// ---------------------------------------------------------------------------
+
+/// A simple, serializable representation of a `column op literal` filter
+/// expression. Used by the codec to serialize fast field filters that were
+/// converted to tantivy queries so workers can re-derive `pre_built_query`.
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub(crate) struct FastFieldFilter {
+    field: String,
+    op: String,
+    value: String,
+    value_type: String,
+}
+
+/// Serialize a slice of logical `Expr`s (each `column op literal`) to JSON.
+pub(crate) fn serialize_fast_field_filters(exprs: &[Expr]) -> Result<String> {
+    let filters: Vec<FastFieldFilter> = exprs
+        .iter()
+        .filter_map(|expr| {
+            let Expr::BinaryExpr(binary) = expr else {
+                return None;
+            };
+            let (col_name, scalar, col_on_left) =
+                match (binary.left.as_ref(), binary.right.as_ref()) {
+                    (Expr::Column(col), Expr::Literal(sv, _)) => {
+                        (col.name.clone(), sv.clone(), true)
+                    }
+                    (Expr::Literal(sv, _), Expr::Column(col)) => {
+                        (col.name.clone(), sv.clone(), false)
+                    }
+                    _ => return None,
+                };
+            let op = if col_on_left {
+                binary.op
+            } else {
+                logical_flip_operator(&binary.op)?
+            };
+            let op_str = match op {
+                Operator::Eq => "eq",
+                Operator::NotEq => "neq",
+                Operator::Gt => "gt",
+                Operator::GtEq => "gte",
+                Operator::Lt => "lt",
+                Operator::LtEq => "lte",
+                _ => return None,
+            };
+            let (value, value_type) = scalar_to_json_pair(&scalar)?;
+            Some(FastFieldFilter {
+                field: col_name,
+                op: op_str.to_string(),
+                value,
+                value_type,
+            })
+        })
+        .collect();
+    serde_json::to_string(&filters).map_err(|e| {
+        DataFusionError::Internal(format!("serialize fast field filters: {e}"))
+    })
+}
+
+/// Deserialize fast field filter JSON and reconstruct tantivy queries.
+///
+/// Returns the reconstructed tantivy queries; the caller combines them with
+/// `BooleanQuery::intersection` as usual.
+pub(crate) fn deserialize_fast_field_filters(
+    json: &str,
+    tantivy_schema: &TantivySchema,
+) -> Result<Vec<Box<dyn tantivy::query::Query>>> {
+    if json.is_empty() {
+        return Ok(Vec::new());
+    }
+    let filters: Vec<FastFieldFilter> = serde_json::from_str(json).map_err(|e| {
+        DataFusionError::Internal(format!("deserialize fast field filters: {e}"))
+    })?;
+    let mut queries = Vec::with_capacity(filters.len());
+    for f in &filters {
+        let scalar = json_pair_to_scalar(&f.value, &f.value_type)?;
+        let op = match f.op.as_str() {
+            "eq" => Operator::Eq,
+            "neq" => Operator::NotEq,
+            "gt" => Operator::Gt,
+            "gte" => Operator::GtEq,
+            "lt" => Operator::Lt,
+            "lte" => Operator::LtEq,
+            other => {
+                return Err(DataFusionError::Internal(format!(
+                    "unknown fast field filter op: {other}"
+                )))
+            }
+        };
+        let expr = Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr {
+            left: Box::new(Expr::Column(datafusion::common::Column::new_unqualified(
+                &f.field,
+            ))),
+            op,
+            right: Box::new(Expr::Literal(scalar, None)),
+        });
+        if let Some(q) = logical_expr_to_tantivy_query(&expr, tantivy_schema) {
+            queries.push(q);
+        }
+    }
+    Ok(queries)
+}
+
+/// Encode a `ScalarValue` as a `(value_string, type_tag)` pair for JSON.
+fn scalar_to_json_pair(scalar: &ScalarValue) -> Option<(String, String)> {
+    match scalar {
+        ScalarValue::Int8(Some(v)) => Some((v.to_string(), "i8".into())),
+        ScalarValue::Int16(Some(v)) => Some((v.to_string(), "i16".into())),
+        ScalarValue::Int32(Some(v)) => Some((v.to_string(), "i32".into())),
+        ScalarValue::Int64(Some(v)) => Some((v.to_string(), "i64".into())),
+        ScalarValue::UInt8(Some(v)) => Some((v.to_string(), "u8".into())),
+        ScalarValue::UInt16(Some(v)) => Some((v.to_string(), "u16".into())),
+        ScalarValue::UInt32(Some(v)) => Some((v.to_string(), "u32".into())),
+        ScalarValue::UInt64(Some(v)) => Some((v.to_string(), "u64".into())),
+        ScalarValue::Float32(Some(v)) => Some((v.to_string(), "f32".into())),
+        ScalarValue::Float64(Some(v)) => Some((v.to_string(), "f64".into())),
+        ScalarValue::Boolean(Some(v)) => Some((v.to_string(), "bool".into())),
+        ScalarValue::Utf8(Some(v)) => Some((v.clone(), "utf8".into())),
+        ScalarValue::Binary(Some(v)) => {
+            use base64::Engine;
+            Some((
+                base64::engine::general_purpose::STANDARD.encode(v),
+                "binary".into(),
+            ))
+        }
+        ScalarValue::TimestampSecond(Some(v), _) => Some((v.to_string(), "ts_s".into())),
+        ScalarValue::TimestampMillisecond(Some(v), _) => Some((v.to_string(), "ts_ms".into())),
+        ScalarValue::TimestampMicrosecond(Some(v), _) => Some((v.to_string(), "ts_us".into())),
+        ScalarValue::TimestampNanosecond(Some(v), _) => Some((v.to_string(), "ts_ns".into())),
+        _ => None,
+    }
+}
+
+/// Decode a `(value_string, type_tag)` pair back to a `ScalarValue`.
+fn json_pair_to_scalar(value: &str, value_type: &str) -> Result<ScalarValue> {
+    let parse_err = |e: std::num::ParseIntError| {
+        DataFusionError::Internal(format!("parse {value_type} '{value}': {e}"))
+    };
+    let parse_float_err = |e: std::num::ParseFloatError| {
+        DataFusionError::Internal(format!("parse {value_type} '{value}': {e}"))
+    };
+    match value_type {
+        "i8" => Ok(ScalarValue::Int8(Some(value.parse().map_err(parse_err)?))),
+        "i16" => Ok(ScalarValue::Int16(Some(value.parse().map_err(parse_err)?))),
+        "i32" => Ok(ScalarValue::Int32(Some(value.parse().map_err(parse_err)?))),
+        "i64" => Ok(ScalarValue::Int64(Some(value.parse().map_err(parse_err)?))),
+        "u8" => Ok(ScalarValue::UInt8(Some(value.parse().map_err(parse_err)?))),
+        "u16" => Ok(ScalarValue::UInt16(Some(value.parse().map_err(parse_err)?))),
+        "u32" => Ok(ScalarValue::UInt32(Some(value.parse().map_err(parse_err)?))),
+        "u64" => Ok(ScalarValue::UInt64(Some(value.parse().map_err(parse_err)?))),
+        "f32" => Ok(ScalarValue::Float32(Some(
+            value.parse().map_err(parse_float_err)?,
+        ))),
+        "f64" => Ok(ScalarValue::Float64(Some(
+            value.parse().map_err(parse_float_err)?,
+        ))),
+        "bool" => Ok(ScalarValue::Boolean(Some(value == "true"))),
+        "utf8" => Ok(ScalarValue::Utf8(Some(value.to_string()))),
+        "binary" => {
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(value)
+                .map_err(|e| {
+                    DataFusionError::Internal(format!("decode base64 binary: {e}"))
+                })?;
+            Ok(ScalarValue::Binary(Some(bytes)))
+        }
+        "ts_s" => Ok(ScalarValue::TimestampSecond(
+            Some(value.parse().map_err(parse_err)?),
+            None,
+        )),
+        "ts_ms" => Ok(ScalarValue::TimestampMillisecond(
+            Some(value.parse().map_err(parse_err)?),
+            None,
+        )),
+        "ts_us" => Ok(ScalarValue::TimestampMicrosecond(
+            Some(value.parse().map_err(parse_err)?),
+            None,
+        )),
+        "ts_ns" => Ok(ScalarValue::TimestampNanosecond(
+            Some(value.parse().map_err(parse_err)?),
+            None,
+        )),
+        other => Err(DataFusionError::Internal(format!(
+            "unknown scalar type tag: {other}"
+        ))),
     }
 }
