@@ -26,9 +26,27 @@ pub(crate) fn execute_tantivy_agg(
     query: Option<&Arc<dyn Query>>,
     output_schema: &SchemaRef,
 ) -> Result<RecordBatch> {
-    let reader = index
-        .reader()
-        .map_err(|e| DataFusionError::Internal(format!("open reader: {e}")))?;
+    execute_tantivy_agg_with_reader(index, aggs, query, output_schema, None)
+}
+
+/// Execute tantivy aggregation, optionally reusing an existing `IndexReader`.
+pub(crate) fn execute_tantivy_agg_with_reader(
+    index: &Index,
+    aggs: &Aggregations,
+    query: Option<&Arc<dyn Query>>,
+    output_schema: &SchemaRef,
+    existing_reader: Option<&tantivy::IndexReader>,
+) -> Result<RecordBatch> {
+    let owned_reader;
+    let reader = match existing_reader {
+        Some(r) => r,
+        None => {
+            owned_reader = index
+                .reader()
+                .map_err(|e| DataFusionError::Internal(format!("open reader: {e}")))?;
+            &owned_reader
+        }
+    };
     let searcher = reader.searcher();
 
     let context = AggContextParams::default();

@@ -128,7 +128,7 @@ impl DataSource for AggDataSource {
         let stream = stream::once(async move {
             let index = opener.open().await?;
 
-            // Warm up inverted index for queried text fields
+            // Warm only the fields the aggregation needs
             let queried_fields: Vec<tantivy::schema::Field> = raw_queries
                 .iter()
                 .filter_map(|(field_name, _)| index.schema().get_field(field_name).ok())
@@ -136,8 +136,6 @@ impl DataSource for AggDataSource {
             if !queried_fields.is_empty() {
                 crate::warmup::warmup_inverted_index(&index, &queried_fields).await?;
             }
-
-            // Warm only the fast fields referenced by the aggregation
             let agg_fields = extract_agg_field_names(&aggs);
             let agg_field_refs: Vec<&str> = agg_fields.iter().map(|s| s.as_str()).collect();
             if !agg_field_refs.is_empty() {
@@ -145,13 +143,17 @@ impl DataSource for AggDataSource {
             }
 
             // Move sync work (including query building) to blocking thread.
+            // Create the IndexReader before spawn_blocking so it's reused.
+            let reader = index.reader()
+                .map_err(|e| DataFusionError::Internal(format!("open reader: {e}")))?;
             tokio::task::spawn_blocking(move || {
                 let query = build_combined_query(&index, pre_built_query.as_ref(), &raw_queries)?;
-                crate::unified::agg_exec::execute_tantivy_agg(
+                crate::unified::agg_exec::execute_tantivy_agg_with_reader(
                     &index,
                     &aggs,
                     query.as_ref(),
                     &schema,
+                    Some(&reader),
                 )
             })
             .await
