@@ -24,17 +24,15 @@ use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{DisplayFormatType, Partitioning, SendableRecordBatchStream};
 use futures::stream::StreamExt;
 use tantivy::aggregation::agg_req::Aggregations;
-use tantivy::collector::TopNComputer;
-use tantivy::query::EnableScoring;
 use tantivy::query::RangeQuery;
 use tantivy::schema::{FieldType, IndexRecordOption, Schema as TantivySchema, Term};
-use tantivy::{DateTime, DocId, Document, Index, Score};
+use tantivy::{DateTime, Document, Index};
 
 use crate::fast_field_reader::read_segment_fast_fields_to_batch;
 use crate::full_text_udf::extract_full_text_call;
 use crate::index_opener::{DirectIndexOpener, IndexOpener};
 use crate::schema_mapping::{tantivy_schema_to_arrow, tantivy_schema_to_arrow_from_index};
-use crate::util::{build_combined_query, segment_hash_partitioning};
+use crate::util::{build_combined_query, collect_matching_docs, segment_hash_partitioning};
 
 /// Guard that calls `BaselineMetrics::done()` on drop so elapsed time is
 /// recorded even when the stream is cancelled.
@@ -878,10 +876,147 @@ impl DataSource for SingleTableDataSource {
 // Core batch generation
 // ---------------------------------------------------------------------------
 
+/// Holds immutable context for assembling one `RecordBatch` from a chunk of
+/// doc_ids + optional scores. Created once per segment and reused for every
+/// chunk, avoiding 14-parameter function signatures.
+struct ChunkBuilder<'a> {
+    segment_reader: &'a tantivy::SegmentReader,
+    ff_projected_schema: &'a SchemaRef,
+    unified_schema: &'a SchemaRef,
+    projected_schema: &'a SchemaRef,
+    projected_indices: Vec<usize>,
+    score_column_idx: usize,
+    document_column_idx: usize,
+    needs_score: bool,
+    needs_document: bool,
+    segment_ord: u32,
+    tantivy_schema: tantivy::schema::Schema,
+    store_reader: Option<tantivy::store::StoreReader>,
+}
+
+impl<'a> ChunkBuilder<'a> {
+    /// Assemble a single `RecordBatch` from a chunk of doc_ids and optional
+    /// scores. Reads fast fields, builds score/document arrays, and projects
+    /// to the output schema.
+    fn build(
+        &self,
+        chunk_ids: &[u32],
+        chunk_scores: Option<&[f32]>,
+    ) -> Result<RecordBatch> {
+        // Read fast fields for this chunk.
+        let ff_batch = read_segment_fast_fields_to_batch(
+            self.segment_reader,
+            self.ff_projected_schema,
+            Some(chunk_ids),
+            None,
+            None,
+            self.segment_ord,
+        )?;
+
+        let chunk_rows = ff_batch.num_rows();
+
+        // Build score array.
+        let score_array: Option<Arc<dyn arrow::array::Array>> = if self.needs_score {
+            match chunk_scores {
+                Some(sc) => Some(Arc::new(Float32Array::from(sc.to_vec()))),
+                None => Some(arrow::array::new_null_array(&DataType::Float32, chunk_rows)),
+            }
+        } else {
+            None
+        };
+
+        // Build document array.
+        let doc_array: Option<Arc<dyn arrow::array::Array>> = if self.needs_document {
+            let store = self
+                .store_reader
+                .as_ref()
+                .expect("store_reader required when needs_document");
+            let mut doc_builder =
+                StringBuilder::with_capacity(chunk_ids.len(), chunk_ids.len() * 256);
+            for &doc_id in chunk_ids {
+                let doc: tantivy::TantivyDocument = store.get(doc_id).map_err(|e| {
+                    DataFusionError::Internal(format!("read doc {doc_id}: {e}"))
+                })?;
+                doc_builder.append_value(&doc.to_json(&self.tantivy_schema));
+            }
+            Some(Arc::new(doc_builder.finish()) as Arc<dyn arrow::array::Array>)
+        } else {
+            None
+        };
+
+        // Assemble output columns.
+        let mut output_columns: Vec<Arc<dyn arrow::array::Array>> =
+            Vec::with_capacity(self.projected_indices.len());
+
+        for &unified_idx in &self.projected_indices {
+            if unified_idx == self.score_column_idx {
+                output_columns.push(
+                    score_array.clone().unwrap_or_else(|| {
+                        arrow::array::new_null_array(&DataType::Float32, chunk_rows)
+                    }),
+                );
+            } else if unified_idx == self.document_column_idx {
+                output_columns.push(
+                    doc_array
+                        .clone()
+                        .expect("_document requested but not built"),
+                );
+            } else {
+                let col_name = self.unified_schema.field(unified_idx).name();
+                let ff_col_idx = ff_batch.schema().index_of(col_name).map_err(|_| {
+                    DataFusionError::Internal(format!(
+                        "fast field column '{col_name}' not found in ff_batch"
+                    ))
+                })?;
+                output_columns.push(ff_batch.column(ff_col_idx).clone());
+            }
+        }
+
+        RecordBatch::try_new(self.projected_schema.clone(), output_columns)
+            .map_err(|e| DataFusionError::Internal(format!("build output batch: {e}")))
+    }
+}
+
+/// Apply a sequence of pushed-down filter expressions to a `RecordBatch`,
+/// returning the filtered batch. Short-circuits on empty batches and
+/// constant-false filters.
+fn apply_pushed_filters(
+    mut batch: RecordBatch,
+    filters: &[Arc<dyn PhysicalExpr>],
+) -> Result<RecordBatch> {
+    for filter in filters {
+        if batch.num_rows() == 0 {
+            break;
+        }
+        let result = filter.evaluate(&batch)?;
+        let mask = match result {
+            datafusion::physical_plan::ColumnarValue::Scalar(
+                ScalarValue::Boolean(Some(true)),
+            ) => continue,
+            datafusion::physical_plan::ColumnarValue::Scalar(
+                ScalarValue::Boolean(Some(false)),
+            ) => {
+                return Ok(batch.slice(0, 0));
+            }
+            datafusion::physical_plan::ColumnarValue::Array(arr) => arr.as_boolean().clone(),
+            other => {
+                let arr = other.into_array(batch.num_rows())?;
+                arr.as_boolean().clone()
+            }
+        };
+        batch = filter_record_batch(&batch, &mask)?;
+    }
+    Ok(batch)
+}
+
 /// Generate batches for a single segment, streaming each batch through the
 /// `emit` callback as it is produced. Returns `Ok(())` when all batches have
 /// been emitted. If `emit` returns `false` (receiver dropped), production
 /// stops early.
+///
+/// This is a thin orchestrator: query execution is delegated to
+/// [`collect_matching_docs`], batch assembly to [`ChunkBuilder::build`],
+/// and filter application to [`apply_pushed_filters`].
 #[allow(clippy::too_many_arguments)]
 fn generate_single_table_batch_streaming(
     index: &Index,
@@ -910,141 +1045,21 @@ fn generate_single_table_batch_streaming(
     }
     let segment_reader = &segment_readers[segment_idx];
 
-    // Step 1: Run query (if any) to collect doc_ids and optional scores.
-    let (doc_ids, scores): (Vec<u32>, Option<Vec<f32>>) = match query {
-        Some(query) => {
-            if needs_score {
-                // BM25 scoring enabled.
-                let weight = query
-                    .weight(EnableScoring::enabled_from_searcher(&searcher))
-                    .map_err(|e| DataFusionError::Internal(format!("create weight: {e}")))?;
-
-                if let Some(k) = topk {
-                    // TopK with Block-WAND pruning.
-                    let mut top_n: TopNComputer<Score, DocId, _> = TopNComputer::new(k);
-
-                    let alive_bitset = segment_reader.alive_bitset();
-                    if let Some(alive_bitset) = alive_bitset {
-                        let mut threshold = Score::MIN;
-                        top_n.threshold = Some(threshold);
-                        weight
-                            .for_each_pruning(
-                                Score::MIN,
-                                segment_reader,
-                                &mut |doc, score| {
-                                    if alive_bitset.is_deleted(doc) {
-                                        return threshold;
-                                    }
-                                    top_n.push(score, doc);
-                                    threshold = top_n.threshold.unwrap_or(Score::MIN);
-                                    threshold
-                                },
-                            )
-                            .map_err(|e| {
-                                DataFusionError::Internal(format!("topk query execution: {e}"))
-                            })?;
-                    } else {
-                        weight
-                            .for_each_pruning(
-                                Score::MIN,
-                                segment_reader,
-                                &mut |doc, score| {
-                                    top_n.push(score, doc);
-                                    top_n.threshold.unwrap_or(Score::MIN)
-                                },
-                            )
-                            .map_err(|e| {
-                                DataFusionError::Internal(format!("topk query execution: {e}"))
-                            })?;
-                    }
-
-                    let results = top_n.into_sorted_vec();
-                    let mut ids = Vec::with_capacity(results.len());
-                    let mut sc = Vec::with_capacity(results.len());
-                    for item in results {
-                        ids.push(item.doc);
-                        sc.push(item.sort_key);
-                    }
-                    (ids, Some(sc))
-                } else {
-                    // Full scoring without topK.
-                    // Filter deleted docs inside the callback to avoid
-                    // collecting and then discarding them in a second pass.
-                    let alive_bitset = segment_reader.alive_bitset();
-                    let mut ids = Vec::new();
-                    let mut sc = Vec::new();
-                    if let Some(alive) = alive_bitset {
-                        weight
-                            .for_each(segment_reader, &mut |doc, score| {
-                                if alive.is_alive(doc) {
-                                    ids.push(doc);
-                                    sc.push(score);
-                                }
-                            })
-                            .map_err(|e| {
-                                DataFusionError::Internal(format!("query execution: {e}"))
-                            })?;
-                    } else {
-                        weight
-                            .for_each(segment_reader, &mut |doc, score| {
-                                ids.push(doc);
-                                sc.push(score);
-                            })
-                            .map_err(|e| {
-                                DataFusionError::Internal(format!("query execution: {e}"))
-                            })?;
-                    }
-                    (ids, Some(sc))
-                }
-            } else {
-                // No scoring needed — boolean filter only.
-                let tantivy_schema = index.schema();
-                let weight = query
-                    .weight(EnableScoring::disabled_from_schema(&tantivy_schema))
-                    .map_err(|e| DataFusionError::Internal(format!("create weight: {e}")))?;
-                // Filter deleted docs inside the callback to avoid a
-                // separate retain pass over the collected doc ids.
-                let alive_bitset = segment_reader.alive_bitset();
-                let mut matching_docs = Vec::new();
-                if let Some(alive) = alive_bitset {
-                    weight
-                        .for_each_no_score(segment_reader, &mut |docs| {
-                            matching_docs.extend(docs.iter().filter(|&&d| alive.is_alive(d)));
-                        })
-                        .map_err(|e| {
-                            DataFusionError::Internal(format!("query execution: {e}"))
-                        })?;
-                } else {
-                    weight
-                        .for_each_no_score(segment_reader, &mut |docs| {
-                            matching_docs.extend_from_slice(docs);
-                        })
-                        .map_err(|e| {
-                            DataFusionError::Internal(format!("query execution: {e}"))
-                        })?;
-                }
-                (matching_docs, None)
-            }
-        }
-        None => {
-            // No query — iterate all alive docs.
-            let max_doc = segment_reader.max_doc();
-            let alive_bitset = segment_reader.alive_bitset();
-            let ids: Vec<u32> = (0..max_doc)
-                .filter(|&doc_id| alive_bitset.map_or(true, |bitset| bitset.is_alive(doc_id)))
-                .collect();
-            (ids, None)
-        }
-    };
+    // Collect matching docs via shared query execution logic.
+    let (doc_ids, scores) = collect_matching_docs(
+        segment_reader,
+        &searcher,
+        query,
+        &index.schema(),
+        needs_score,
+        topk,
+    )?;
 
     if doc_ids.is_empty() {
         return Ok(());
     }
 
-    // Step 2: Process doc_ids in batch_size chunks so that fast-field reads,
-    // document fetches, score arrays, and filter application are bounded by
-    // batch_size rather than the full segment size.
-    let tantivy_schema = index.schema();
+    // Build the chunk builder once for this segment.
     let store_reader = if needs_document {
         Some(
             segment_reader
@@ -1060,113 +1075,35 @@ fn generate_single_table_batch_streaming(
         None => (0..unified_schema.fields().len()).collect(),
     };
 
+    let builder = ChunkBuilder {
+        segment_reader,
+        ff_projected_schema,
+        unified_schema,
+        projected_schema,
+        projected_indices,
+        score_column_idx,
+        document_column_idx,
+        needs_score,
+        needs_document,
+        segment_ord: segment_idx as u32,
+        tantivy_schema: index.schema(),
+        store_reader,
+    };
+
+    // Process doc_ids in batch_size chunks.
     let total = doc_ids.len();
     let mut offset = 0;
 
     while offset < total {
         let end = (offset + batch_size).min(total);
         let chunk_ids = &doc_ids[offset..end];
-        let chunk_scores: Option<&[f32]> = scores.as_ref().map(|s| &s[offset..end]);
+        let chunk_scores = scores.as_ref().map(|s| &s[offset..end]);
 
-        // Read fast fields for this chunk only.
-        let ff_batch = read_segment_fast_fields_to_batch(
-            segment_reader,
-            ff_projected_schema,
-            Some(chunk_ids),
-            None,
-            None,
-            segment_idx as u32,
-        )?;
+        let batch = builder.build(chunk_ids, chunk_scores)?;
+        let filtered = apply_pushed_filters(batch, pushed_filters)?;
 
-        let chunk_rows = ff_batch.num_rows();
-
-        // Build score array for this chunk.
-        let score_array: Option<Arc<dyn arrow::array::Array>> = if needs_score {
-            match chunk_scores {
-                Some(sc) => Some(Arc::new(Float32Array::from(sc.to_vec()))),
-                None => Some(arrow::array::new_null_array(&DataType::Float32, chunk_rows)),
-            }
-        } else {
-            None
-        };
-
-        // Build document array for this chunk.
-        let doc_array: Option<Arc<dyn arrow::array::Array>> = if needs_document {
-            let store = store_reader.as_ref().unwrap();
-            let mut doc_builder =
-                StringBuilder::with_capacity(chunk_ids.len(), chunk_ids.len() * 256);
-            for &doc_id in chunk_ids {
-                let doc: tantivy::TantivyDocument = store.get(doc_id).map_err(|e| {
-                    DataFusionError::Internal(format!("read doc {doc_id}: {e}"))
-                })?;
-                let json = doc.to_json(&tantivy_schema);
-                doc_builder.append_value(&json);
-            }
-            Some(Arc::new(doc_builder.finish()) as Arc<dyn arrow::array::Array>)
-        } else {
-            None
-        };
-
-        // Assemble output columns for this chunk.
-        let mut output_columns: Vec<Arc<dyn arrow::array::Array>> =
-            Vec::with_capacity(projected_indices.len());
-
-        for &unified_idx in &projected_indices {
-            if unified_idx == score_column_idx {
-                output_columns.push(
-                    score_array.clone().unwrap_or_else(|| {
-                        arrow::array::new_null_array(&DataType::Float32, chunk_rows)
-                    }),
-                );
-            } else if unified_idx == document_column_idx {
-                output_columns.push(
-                    doc_array
-                        .clone()
-                        .expect("_document requested but not built"),
-                );
-            } else {
-                let col_name = unified_schema.field(unified_idx).name();
-                let ff_col_idx = ff_batch.schema().index_of(col_name).map_err(|_| {
-                    DataFusionError::Internal(format!(
-                        "fast field column '{col_name}' not found in ff_batch"
-                    ))
-                })?;
-                output_columns.push(ff_batch.column(ff_col_idx).clone());
-            }
-        }
-
-        let mut output_batch = RecordBatch::try_new(projected_schema.clone(), output_columns)
-            .map_err(|e| DataFusionError::Internal(format!("build output batch: {e}")))?;
-
-        // Apply pushed-down filters on this chunk.
-        for filter in pushed_filters {
-            if output_batch.num_rows() == 0 {
-                break;
-            }
-            let result = filter.evaluate(&output_batch)?;
-            let mask = match result {
-                datafusion::physical_plan::ColumnarValue::Scalar(
-                    datafusion::common::ScalarValue::Boolean(Some(true)),
-                ) => continue,
-                datafusion::physical_plan::ColumnarValue::Scalar(
-                    datafusion::common::ScalarValue::Boolean(Some(false)),
-                ) => {
-                    output_batch = RecordBatch::new_empty(projected_schema.clone());
-                    break;
-                }
-                datafusion::physical_plan::ColumnarValue::Array(arr) => arr.as_boolean().clone(),
-                other => {
-                    let arr = other.into_array(output_batch.num_rows())?;
-                    arr.as_boolean().clone()
-                }
-            };
-            output_batch = filter_record_batch(&output_batch, &mask)?;
-        }
-
-        if output_batch.num_rows() > 0 {
-            if !emit(output_batch) {
-                return Ok(()); // receiver dropped, stop producing
-            }
+        if filtered.num_rows() > 0 && !emit(filtered) {
+            return Ok(()); // receiver dropped, stop producing
         }
 
         offset = end;

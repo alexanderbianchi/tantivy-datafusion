@@ -20,10 +20,9 @@ use datafusion_physical_plan::projection::ProjectionExprs;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{DisplayFormatType, Partitioning, SendableRecordBatchStream};
 use futures::stream::{self, StreamExt};
-use tantivy::collector::TopNComputer;
-use tantivy::query::{BooleanQuery, EnableScoring};
+use tantivy::query::BooleanQuery;
 use tantivy::schema::FieldType;
-use tantivy::{DocId, Index, Score};
+use tantivy::Index;
 
 use crate::full_text_udf::extract_full_text_call;
 use crate::index_opener::{DirectIndexOpener, IndexOpener};
@@ -485,129 +484,15 @@ fn generate_inverted_index_batch(
     let score_col_idx = full_schema.index_of("_score").unwrap();
     let needs_scoring = projection.map_or(true, |p| p.contains(&score_col_idx));
 
-    // Collect matching docs (with optional scores)
-    let (doc_ids, scores): (Vec<u32>, Option<Vec<f32>>) = match query {
-        Some(query) => {
-            if needs_scoring {
-                // BM25 scoring enabled
-                let weight = query
-                    .weight(EnableScoring::enabled_from_searcher(&searcher))
-                    .map_err(|e| DataFusionError::Internal(format!("create weight: {e}")))?;
-
-                if let Some(k) = topk {
-                    // TopK with Block-WAND pruning via TopNComputer
-                    let mut top_n: TopNComputer<Score, DocId, _> =
-                        TopNComputer::new(k);
-
-                    let alive_bitset = segment_reader.alive_bitset();
-                    if let Some(alive_bitset) = alive_bitset {
-                        let mut threshold = Score::MIN;
-                        top_n.threshold = Some(threshold);
-                        weight
-                            .for_each_pruning(
-                                Score::MIN,
-                                segment_reader,
-                                &mut |doc, score| {
-                                    if alive_bitset.is_deleted(doc) {
-                                        return threshold;
-                                    }
-                                    top_n.push(score, doc);
-                                    threshold =
-                                        top_n.threshold.unwrap_or(Score::MIN);
-                                    threshold
-                                },
-                            )
-                            .map_err(|e| {
-                                DataFusionError::Internal(format!(
-                                    "topk query execution: {e}"
-                                ))
-                            })?;
-                    } else {
-                        weight
-                            .for_each_pruning(
-                                Score::MIN,
-                                segment_reader,
-                                &mut |doc, score| {
-                                    top_n.push(score, doc);
-                                    top_n.threshold.unwrap_or(Score::MIN)
-                                },
-                            )
-                            .map_err(|e| {
-                                DataFusionError::Internal(format!(
-                                    "topk query execution: {e}"
-                                ))
-                            })?;
-                    }
-
-                    let results = top_n.into_sorted_vec();
-                    let mut ids = Vec::with_capacity(results.len());
-                    let mut sc = Vec::with_capacity(results.len());
-                    for item in results {
-                        ids.push(item.doc);
-                        sc.push(item.sort_key);
-                    }
-                    (ids, Some(sc))
-                } else {
-                    // Full scoring without topK
-                    let mut ids = Vec::new();
-                    let mut sc = Vec::new();
-                    weight
-                        .for_each(segment_reader, &mut |doc, score| {
-                            ids.push(doc);
-                            sc.push(score);
-                        })
-                        .map_err(|e| {
-                            DataFusionError::Internal(format!("query execution: {e}"))
-                        })?;
-
-                    // Filter deleted docs
-                    if let Some(alive_bitset) = segment_reader.alive_bitset() {
-                        let mut filtered_ids = Vec::new();
-                        let mut filtered_sc = Vec::new();
-                        for (doc, score) in ids.into_iter().zip(sc) {
-                            if alive_bitset.is_alive(doc) {
-                                filtered_ids.push(doc);
-                                filtered_sc.push(score);
-                            }
-                        }
-                        (filtered_ids, Some(filtered_sc))
-                    } else {
-                        (ids, Some(sc))
-                    }
-                }
-            } else {
-                // No scoring needed — boolean filter only
-                let tantivy_schema = index.schema();
-                let weight = query
-                    .weight(EnableScoring::disabled_from_schema(&tantivy_schema))
-                    .map_err(|e| DataFusionError::Internal(format!("create weight: {e}")))?;
-                let mut matching_docs = Vec::new();
-                weight
-                    .for_each_no_score(segment_reader, &mut |docs| {
-                        matching_docs.extend_from_slice(docs);
-                    })
-                    .map_err(|e| {
-                        DataFusionError::Internal(format!("query execution: {e}"))
-                    })?;
-                // Filter deleted docs
-                if let Some(alive_bitset) = segment_reader.alive_bitset() {
-                    matching_docs.retain(|&doc| alive_bitset.is_alive(doc));
-                }
-                (matching_docs, None)
-            }
-        }
-        None => {
-            // No query — iterate all alive docs, scores are null
-            let max_doc = segment_reader.max_doc();
-            let alive_bitset = segment_reader.alive_bitset();
-            let ids: Vec<u32> = (0..max_doc)
-                .filter(|&doc_id| {
-                    alive_bitset.map_or(true, |bitset| bitset.is_alive(doc_id))
-                })
-                .collect();
-            (ids, None)
-        }
-    };
+    // Collect matching docs using shared query execution logic.
+    let (doc_ids, scores) = crate::util::collect_matching_docs(
+        segment_reader,
+        &searcher,
+        query,
+        &index.schema(),
+        needs_scoring,
+        topk,
+    )?;
 
     if doc_ids.is_empty() {
         let projected_schema = match projection {
