@@ -66,6 +66,9 @@ impl Drop for AbortOnDrop {
 #[derive(Debug, Clone)]
 struct PartitionStat {
     num_rows: usize,
+    /// Whether this segment has deleted documents. When true, `num_rows` is
+    /// an estimate (alive count) rather than an exact value.
+    has_deletes: bool,
     /// Column name -> (min, max) as `ScalarValue`.
     column_stats: Vec<(String, Option<ScalarValue>, Option<ScalarValue>)>,
 }
@@ -163,8 +166,10 @@ fn compute_partition_stats(
             column_stats.push((name.to_string(), min_val, max_val));
         }
 
+        let has_deletes = seg_reader.alive_bitset().is_some();
         stats.push(Some(PartitionStat {
             num_rows: alive,
+            has_deletes,
             column_stats,
         }));
     }
@@ -546,7 +551,12 @@ impl SingleTableDataSource {
         }
 
         let total_rows: usize = known.iter().map(|s| s.num_rows).sum();
-        let num_rows = Precision::Exact(total_rows);
+        let any_deletes = known.iter().any(|s| s.has_deletes);
+        let num_rows = if any_deletes {
+            Precision::Inexact(total_rows)
+        } else {
+            Precision::Exact(total_rows)
+        };
 
         let column_statistics: Vec<ColumnStatistics> = self
             .projected_schema
@@ -770,7 +780,11 @@ impl DataSource for SingleTableDataSource {
             _ => return Ok(Statistics::new_unknown(&self.projected_schema)),
         };
 
-        let num_rows = Precision::Exact(stat.num_rows);
+        let num_rows = if stat.has_deletes {
+            Precision::Inexact(stat.num_rows)
+        } else {
+            Precision::Exact(stat.num_rows)
+        };
 
         let column_statistics: Vec<ColumnStatistics> = self
             .projected_schema
@@ -809,22 +823,24 @@ impl DataSource for SingleTableDataSource {
         })
     }
 
-    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
-        // Only useful when scoring is active (enables Block-WAND early termination).
-        // For non-scored queries, DataFusion's GlobalLimitExec handles LIMIT.
-        if self.needs_score {
-            limit.map(|k| {
-                Arc::new(self.clone_with(|ds| {
-                    ds.topk = Some(k);
-                })) as Arc<dyn DataSource>
-            })
-        } else {
-            None
+    fn with_fetch(&self, fetch: Option<usize>) -> Option<Arc<dyn DataSource>> {
+        let topk = fetch?;
+        if !self.needs_score {
+            return None; // Only for scored queries (Block-WAND)
         }
+        Some(Arc::new(self.clone_with(|ds| {
+            ds.topk = Some(topk);
+        })))
     }
 
     fn fetch(&self) -> Option<usize> {
-        self.topk
+        // Only report fetch guarantee when single partition — per-segment TopK
+        // cannot guarantee a global row limit across multiple partitions.
+        if self.num_segments <= 1 {
+            self.topk
+        } else {
+            None
+        }
     }
 
     fn metrics(&self) -> ExecutionPlanMetricsSet {

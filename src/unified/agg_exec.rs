@@ -136,6 +136,9 @@ impl ExecutionPlan for TantivyAggregateExec {
             // Warm fast fields for aggregation.
             crate::warmup::warmup_fast_fields(&index).await?;
             // Warm inverted index if a query filter is active.
+            // TantivyAggregateExec doesn't track which text fields the query references,
+            // so we warm all text fields. AggDataSource (the unified path) does selective
+            // warmup via raw_queries. This is only a performance concern, not correctness.
             if query.is_some() {
                 let tantivy_schema = index.schema();
                 let text_fields: Vec<tantivy::schema::Field> = tantivy_schema
@@ -153,6 +156,9 @@ impl ExecutionPlan for TantivyAggregateExec {
                 }
             }
 
+            // Note: spawn_blocking tasks cannot be aborted. If the stream is dropped
+            // mid-computation, the blocking task runs to completion and the result is
+            // discarded. This is bounded to one aggregation computation per partition.
             tokio::task::spawn_blocking(move || {
                 execute_tantivy_agg(&index, &aggs, query.as_ref(), &schema)
             })
@@ -216,7 +222,10 @@ pub(crate) fn execute_tantivy_agg(
     }
 
     // Merge across segments
-    let merged = merged.ok_or_else(|| DataFusionError::Internal("no segments".into()))?;
+    let merged = match merged {
+        Some(m) => m,
+        None => return Ok(RecordBatch::new_empty(output_schema.clone())),
+    };
 
     // Convert to final results
     let final_result = merged
