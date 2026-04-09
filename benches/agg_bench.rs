@@ -223,32 +223,36 @@ fn main() {
     let pushdown_10m: Vec<Arc<UnifiedPushdownCtx>> = cases.iter()
         .map(|c| Arc::new(UnifiedPushdownCtx::new(&index_10m, c.sql))).collect();
 
+    // Run each case × each index size separately to avoid per-iteration index detection
     for (i, case) in cases.iter().enumerate() {
-        let pd_1m = pushdown_1m[i].clone();
-        let pd_10m = pushdown_10m[i].clone();
+        // 1M benchmark
+        {
+            let pd = pushdown_1m[i].clone();
+            let mut group = InputGroup::new_with_inputs(vec![("1M_docs", index_1m.clone())]);
+            let json = case.json.clone();
+            group.register(&format!("native/{}", case.name), move |index| {
+                run_native(index, &json);
+            });
+            let pd_clone = pd.clone();
+            group.register(&format!("unified_pushdown/{}", case.name), move |_| {
+                pd_clone.run();
+            });
+            group.run();
+        }
 
-        let mut group = InputGroup::new_with_inputs(
-            inputs.iter().map(|(name, idx)| (*name, idx.clone())).collect(),
-        );
-
-        // Baseline: tantivy native
-        let json_native = case.json.clone();
-        group.register(&format!("native/{}", case.name), move |index| {
-            run_native(index, &json_native);
-        });
-
-        // Unified + AggPushdown (should match native)
-        let pd1 = pd_1m.clone();
-        let pd10 = pd_10m.clone();
-        group.register(&format!("unified_pushdown/{}", case.name), move |index| {
-            // Select context based on index size
-            if index.reader().unwrap().searcher().num_docs() > 5_000_000 {
-                pd10.run();
-            } else {
-                pd1.run();
-            }
-        });
-
-        group.run();
+        // 10M benchmark
+        {
+            let pd = pushdown_10m[i].clone();
+            let mut group = InputGroup::new_with_inputs(vec![("10M_docs", index_10m.clone())]);
+            let json = case.json.clone();
+            group.register(&format!("native/{}", case.name), move |index| {
+                run_native(index, &json);
+            });
+            let pd_clone = pd.clone();
+            group.register(&format!("unified_pushdown/{}", case.name), move |_| {
+                pd_clone.run();
+            });
+            group.run();
+        }
     }
 }

@@ -4,8 +4,6 @@ use datafusion::datasource::TableProvider;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::*;
 use datafusion_datasource::source::DataSourceExec;
-use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
-use datafusion_physical_expr::PhysicalExpr;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use tantivy::schema::{SchemaBuilder, FAST, STORED, TEXT};
 use tantivy::{Index, IndexWriter, TantivyDocument};

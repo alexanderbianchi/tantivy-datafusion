@@ -445,8 +445,7 @@ pub struct SingleTableDataSource {
 impl SingleTableDataSource {
     /// Construct a `SingleTableDataSource` directly from deserialized codec
     /// fields, bypassing `TableProvider::scan` and `SessionContext`. Used by
-    /// `LazyScanExec::execute` so that each partition avoids re-computing
-    /// schemas and stats for all segments.
+    /// `TantivyCodec::try_decode` to reconstruct a `DataSourceExec` on workers.
     pub(crate) fn new_from_codec(
         opener: Arc<dyn IndexOpener>,
         schema: ScanSchema,

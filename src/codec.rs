@@ -16,25 +16,15 @@
 //! builder.set_distributed_user_codec(TantivyCodec);
 //! ```
 
-use std::any::Any;
-use std::fmt;
 use std::sync::Arc;
 
-use arrow::datatypes::SchemaRef;
 use datafusion::common::Result;
 use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-    SendableRecordBatchStream,
-};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionConfig;
 use datafusion_datasource::source::DataSourceExec;
-use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
-use futures::stream::{self, StreamExt};
 use prost::Message;
 
 use crate::index_opener::{IndexOpener, OpenerMetadata};
@@ -329,29 +319,6 @@ impl PhysicalExtensionCodec for TantivyCodec {
             }
         }
 
-        if let Some(lazy) = node.as_any().downcast_ref::<LazyScanExec>() {
-            return TantivyScanProto {
-                identifier: lazy.identifier.clone(),
-                tantivy_schema_json: lazy.tantivy_schema_json.clone(),
-                segment_sizes: lazy.segment_sizes.clone(),
-                projection: lazy.projection.as_ref()
-                    .map(|p| p.iter().map(|&i| i as u32).collect()).unwrap_or_default(),
-                has_projection: lazy.projection.is_some(),
-                output_partitions: lazy.output_partitions,
-                provider_type: lazy.provider_type,
-                raw_queries_json: lazy.raw_queries_json.clone(),
-                topk: lazy.topk.map(|k| k as u32).unwrap_or(0),
-                has_topk: lazy.topk.is_some(),
-                pushed_filters: lazy.pushed_filter_bytes.clone(),
-                footer_start: lazy.footer_start,
-                footer_end: lazy.footer_end,
-                multi_valued_fields: lazy.multi_valued_fields.clone(),
-                aggregations_json: lazy.aggregations_json.clone(),
-                output_schema_bytes: lazy.output_schema_bytes.clone(),
-                fast_field_filters_json: lazy.fast_field_filters_json.clone(),
-            }.encode(buf).map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
-        }
-
         Err(DataFusionError::Internal(format!(
             "TantivyCodec: unsupported node {}", node.name()
         )))
@@ -395,270 +362,102 @@ impl PhysicalExtensionCodec for TantivyCodec {
             None
         };
 
-        let arrow_schema: SchemaRef = match proto.provider_type {
+        match proto.provider_type {
             FAST_FIELD | INVERTED_INDEX | DOCUMENT => {
-                return Err(DataFusionError::Internal(format!(
-                    "decomposed provider type {} is no longer supported; use SINGLE_TABLE or AGG_DATA_SOURCE",
+                Err(DataFusionError::Internal(format!(
+                    "decomposed provider type {} is no longer supported; \
+                     use SINGLE_TABLE or AGG_DATA_SOURCE",
                     proto.provider_type
-                )));
+                )))
             }
             SINGLE_TABLE => {
-                // Build unified schema: fast fields + _score + _document
-                let ff_schema = tantivy_schema_to_arrow_with_multi_valued(
-                    &opener.schema(),
-                    &proto.multi_valued_fields,
-                );
-                let mut unified_fields: Vec<arrow::datatypes::Field> = ff_schema.fields().iter().map(|f| f.as_ref().clone()).collect();
-                unified_fields.push(arrow::datatypes::Field::new("_score", arrow::datatypes::DataType::Float32, true));
-                unified_fields.push(arrow::datatypes::Field::new("_document", arrow::datatypes::DataType::Utf8, false));
-                Arc::new(arrow::datatypes::Schema::new(unified_fields))
+                decode_single_table(opener, projection, &proto)
             }
             AGG_DATA_SOURCE => {
-                if proto.output_schema_bytes.is_empty() {
-                    return Err(DataFusionError::Internal(
-                        "missing output schema for AGG_DATA_SOURCE".into(),
-                    ));
-                }
-                let proto_schema = datafusion_proto::protobuf::Schema::decode(
-                    proto.output_schema_bytes.as_slice(),
-                )
-                .map_err(|e| DataFusionError::Internal(format!("decode schema: {e}")))?;
-                Arc::new(
-                    arrow::datatypes::Schema::try_from(&proto_schema)
-                        .map_err(|e| {
-                            DataFusionError::Internal(format!("convert schema: {e}"))
-                        })?,
-                )
+                decode_agg(opener, &proto)
             }
-            other => return Err(DataFusionError::Internal(format!("unknown provider type: {other}"))),
-        };
-
-        let projected_schema = match &projection {
-            Some(indices) => {
-                let fields: Vec<_> = indices.iter().map(|&i| arrow_schema.field(i).clone()).collect();
-                Arc::new(arrow::datatypes::Schema::new(fields))
-            }
-            None => arrow_schema,
-        };
-
-        let output_partitions = (proto.output_partitions as usize).max(1);
-        let plan_properties = PlanProperties::new(
-            EquivalenceProperties::new(projected_schema.clone()),
-            Partitioning::UnknownPartitioning(output_partitions),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        );
-
-        Ok(Arc::new(LazyScanExec {
-            identifier: proto.identifier,
-            tantivy_schema_json: proto.tantivy_schema_json,
-            segment_sizes: proto.segment_sizes,
-            projection,
-            provider_type: proto.provider_type,
-            raw_queries_json: proto.raw_queries_json,
-            topk: if proto.has_topk { Some(proto.topk as usize) } else { None },
-            pushed_filter_bytes: proto.pushed_filters,
-            footer_start: proto.footer_start,
-            footer_end: proto.footer_end,
-            multi_valued_fields: proto.multi_valued_fields,
-            aggregations_json: proto.aggregations_json,
-            output_schema_bytes: proto.output_schema_bytes,
-            fast_field_filters_json: proto.fast_field_filters_json,
-            plan_properties,
-            projected_schema,
-            output_partitions: proto.output_partitions,
-        }))
+            other => Err(DataFusionError::Internal(
+                format!("unknown provider type: {other}"),
+            )),
+        }
     }
 }
 
-// ── LazyScanExec ────────────────────────────────────────────────────
-
-/// Execution plan reconstructed on the worker from serialized metadata.
-/// At execution time, reads the [`OpenerFactory`] from the
-/// [`TaskContext`]'s session config to create the opener.
-#[derive(Debug)]
-struct LazyScanExec {
-    identifier: String,
-    tantivy_schema_json: String,
-    segment_sizes: Vec<u32>,
+/// Decode a `SINGLE_TABLE` proto into a [`DataSourceExec`].
+fn decode_single_table(
+    opener: Arc<dyn IndexOpener>,
     projection: Option<Vec<usize>>,
-    provider_type: u32,
-    raw_queries_json: String,
-    topk: Option<usize>,
-    pushed_filter_bytes: Vec<Vec<u8>>,
-    footer_start: u64,
-    footer_end: u64,
-    multi_valued_fields: Vec<String>,
-    /// JSON-serialized tantivy aggregation specification (AGG_DATA_SOURCE only).
-    aggregations_json: String,
-    /// Protobuf-encoded Arrow output schema (AGG_DATA_SOURCE only).
-    output_schema_bytes: Vec<u8>,
-    /// JSON-serialized fast field filter Exprs (SINGLE_TABLE / AGG_DATA_SOURCE).
-    fast_field_filters_json: String,
-    plan_properties: PlanProperties,
-    projected_schema: SchemaRef,
-    output_partitions: u32,
+    proto: &TantivyScanProto,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let mv_fields = opener.multi_valued_fields();
+    let scan_schema = build_single_table_scan_schema(&opener, &mv_fields, &projection);
+
+    let raw_queries: Vec<(String, String)> = if proto.raw_queries_json.is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(&proto.raw_queries_json)
+            .map_err(|e| DataFusionError::Internal(format!("parse raw_queries: {e}")))?
+    };
+
+    let pre_built_query = reconstruct_pre_built_query(
+        &proto.fast_field_filters_json,
+        &opener.schema(),
+    )?;
+
+    let topk = if proto.has_topk { Some(proto.topk as usize) } else { None };
+    let num_segments = (proto.output_partitions as usize).max(1);
+
+    let ds = SingleTableDataSource::new_from_codec(
+        opener, scan_schema, raw_queries, pre_built_query, topk, num_segments,
+    );
+    Ok(Arc::new(DataSourceExec::new(Arc::new(ds))))
 }
 
-impl DisplayAs for LazyScanExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        let kind = match self.provider_type {
-            FAST_FIELD | INVERTED_INDEX | DOCUMENT => "Legacy",
-            SINGLE_TABLE => "SingleTable",
-            AGG_DATA_SOURCE => "Agg",
-            _ => "Unknown",
-        };
-        write!(f, "LazyScanExec(id={}, type={})", self.identifier, kind)
+/// Decode an `AGG_DATA_SOURCE` proto into a [`DataSourceExec`].
+fn decode_agg(
+    opener: Arc<dyn IndexOpener>,
+    proto: &TantivyScanProto,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let aggs: tantivy::aggregation::agg_req::Aggregations =
+        serde_json::from_str(&proto.aggregations_json)
+            .map_err(|e| DataFusionError::Internal(format!("parse aggregations: {e}")))?;
+
+    let raw_queries: Vec<(String, String)> = if proto.raw_queries_json.is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(&proto.raw_queries_json)
+            .map_err(|e| DataFusionError::Internal(format!("parse raw_queries: {e}")))?
+    };
+
+    if proto.output_schema_bytes.is_empty() {
+        return Err(DataFusionError::Internal(
+            "missing output schema for AGG_DATA_SOURCE".into(),
+        ));
     }
+    let output_schema = {
+        let proto_schema = datafusion_proto::protobuf::Schema::decode(
+            proto.output_schema_bytes.as_slice(),
+        )
+        .map_err(|e| DataFusionError::Internal(format!("decode schema: {e}")))?;
+        Arc::new(
+            arrow::datatypes::Schema::try_from(&proto_schema)
+                .map_err(|e| DataFusionError::Internal(format!("convert schema: {e}")))?,
+        )
+    };
+
+    let pre_built_query = reconstruct_pre_built_query(
+        &proto.fast_field_filters_json,
+        &opener.schema(),
+    )?;
+
+    let ds = AggDataSource::new(
+        opener,
+        Arc::new(aggs),
+        output_schema,
+        raw_queries,
+        pre_built_query,
+        Vec::new(), // exprs not needed on worker — query already reconstructed
+    );
+    Ok(Arc::new(DataSourceExec::new(Arc::new(ds))))
 }
 
-impl ExecutionPlan for LazyScanExec {
-    fn name(&self) -> &str { "LazyScanExec" }
-    fn as_any(&self) -> &dyn Any { self }
-    fn properties(&self) -> &PlanProperties { &self.plan_properties }
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![] }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        // Read the opener factory from session config (set at worker startup).
-        let opener_factory = context
-            .session_config()
-            .get_opener_factory()
-            .ok_or_else(|| DataFusionError::Internal(
-                "no OpenerFactory on session config".to_string(),
-            ))?;
-
-        let tantivy_schema_json = self.tantivy_schema_json.clone();
-        let segment_sizes = self.segment_sizes.clone();
-        let identifier = self.identifier.clone();
-        let projection = self.projection.clone();
-        let output_partitions = self.output_partitions as usize;
-        let provider_type = self.provider_type;
-        let raw_queries_json = self.raw_queries_json.clone();
-        let topk = self.topk;
-        let footer_start = self.footer_start;
-        let footer_end = self.footer_end;
-        let multi_valued_fields = self.multi_valued_fields.clone();
-        let aggregations_json = self.aggregations_json.clone();
-        let output_schema_bytes = self.output_schema_bytes.clone();
-        let fast_field_filters_json = self.fast_field_filters_json.clone();
-
-        let schema_clone = self.projected_schema.clone();
-        let stream = stream::once(async move {
-            let tantivy_schema: tantivy::schema::Schema =
-                serde_json::from_str(&tantivy_schema_json)
-                    .map_err(|e| DataFusionError::Internal(format!("parse schema: {e}")))?;
-
-            let opener = opener_factory(OpenerMetadata {
-                identifier, tantivy_schema, segment_sizes, footer_start, footer_end,
-                multi_valued_fields,
-            });
-
-            let exec: Arc<dyn ExecutionPlan> = match provider_type {
-                FAST_FIELD | INVERTED_INDEX | DOCUMENT => {
-                    return Err(DataFusionError::Internal(format!(
-                        "decomposed provider type {} is no longer supported",
-                        provider_type
-                    )));
-                }
-                SINGLE_TABLE => {
-                    // Construct SingleTableDataSource directly — no SessionContext needed.
-                    let mv_fields = opener.multi_valued_fields();
-                    let scan_schema = build_single_table_scan_schema(
-                        &opener,
-                        &mv_fields,
-                        &projection,
-                    );
-                    let raw_queries: Vec<(String, String)> = if raw_queries_json.is_empty() {
-                        Vec::new()
-                    } else {
-                        serde_json::from_str(&raw_queries_json)
-                            .map_err(|e| DataFusionError::Internal(format!("parse raw_queries: {e}")))?
-                    };
-                    // Re-derive pre_built_query from serialized fast field filters.
-                    let pre_built_query = reconstruct_pre_built_query(
-                        &fast_field_filters_json,
-                        &opener.schema(),
-                    )?;
-                    let num_segments = output_partitions.max(1);
-                    let ds = SingleTableDataSource::new_from_codec(
-                        opener,
-                        scan_schema,
-                        raw_queries,
-                        pre_built_query,
-                        topk,
-                        num_segments,
-                    );
-                    Arc::new(DataSourceExec::new(Arc::new(ds)))
-                }
-                AGG_DATA_SOURCE => {
-                    // Construct AggDataSource directly — no SessionContext needed.
-                    let aggs: tantivy::aggregation::agg_req::Aggregations =
-                        serde_json::from_str(&aggregations_json)
-                            .map_err(|e| DataFusionError::Internal(format!("parse aggregations: {e}")))?;
-                    let raw_queries: Vec<(String, String)> = if raw_queries_json.is_empty() {
-                        Vec::new()
-                    } else {
-                        serde_json::from_str(&raw_queries_json)
-                            .map_err(|e| DataFusionError::Internal(format!("parse raw_queries: {e}")))?
-                    };
-                    let output_schema: SchemaRef = {
-                        let proto_schema = datafusion_proto::protobuf::Schema::decode(
-                            output_schema_bytes.as_slice(),
-                        )
-                        .map_err(|e| DataFusionError::Internal(format!("decode schema: {e}")))?;
-                        Arc::new(
-                            arrow::datatypes::Schema::try_from(&proto_schema)
-                                .map_err(|e| {
-                                    DataFusionError::Internal(format!("convert schema: {e}"))
-                                })?,
-                        )
-                    };
-                    // Re-derive pre_built_query from serialized fast field filters.
-                    let pre_built_query = reconstruct_pre_built_query(
-                        &fast_field_filters_json,
-                        &opener.schema(),
-                    )?;
-                    let agg_ds = AggDataSource::new(
-                        opener,
-                        Arc::new(aggs),
-                        output_schema,
-                        raw_queries,
-                        pre_built_query,
-                        Vec::new(), // exprs not needed on worker — query already reconstructed
-                    );
-                    Arc::new(DataSourceExec::new(Arc::new(agg_ds)))
-                }
-                other => return Err(DataFusionError::Internal(format!("unknown provider type: {other}"))),
-            };
-
-            // Pushed filters are no longer used — SingleTableDataSource
-            // returns PushedDown::No, so pushed_filter_bytes is always empty.
-            // This block is retained for backward compatibility with serialized
-            // plans that may contain pushed filters from older coordinators.
-
-            // Forward the inner stream directly — no collecting into Vec.
-            exec.execute(partition, context)
-        })
-        // Flatten Result<Stream<Result<Batch>>> into Stream<Result<Batch>>
-        .flat_map(move |result: Result<SendableRecordBatchStream>| match result {
-            Ok(inner_stream) => inner_stream.left_stream(),
-            Err(e) => stream::once(async move { Err(e) }).right_stream(),
-        });
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema_clone,
-            stream,
-        )))
-    }
-}
