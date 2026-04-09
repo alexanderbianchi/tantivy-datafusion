@@ -90,41 +90,27 @@ fn collect_into_segment_collector(
 ) -> tantivy::Result<()> {
     let alive_bitset = seg_reader.alive_bitset();
 
-    match query {
-        Some(q) => {
-            let weight = q.weight(EnableScoring::disabled_from_schema(schema))?;
-            // for_each_no_score delivers docs in ~512-doc chunks from the scorer.
-            // Feed each chunk directly to the collector — no intermediate Vec.
-            if let Some(alive) = alive_bitset {
-                let mut buf = Vec::with_capacity(COLLECT_BLOCK_SIZE);
-                weight.for_each_no_score(seg_reader, &mut |docs| {
-                    buf.clear();
-                    buf.extend(docs.iter().filter(|&&d| alive.is_alive(d)));
-                    collector.collect_block(&buf);
-                })?;
-            } else {
-                weight.for_each_no_score(seg_reader, &mut |docs| {
-                    collector.collect_block(docs);
-                })?;
-            }
-        }
-        None => {
-            let max_doc = seg_reader.max_doc();
-            let mut block = Vec::with_capacity(COLLECT_BLOCK_SIZE);
-            for doc_id in 0..max_doc {
-                if alive_bitset.map_or(true, |b| b.is_alive(doc_id)) {
-                    block.push(doc_id);
-                    if block.len() == COLLECT_BLOCK_SIZE {
-                        collector.collect_block(&block);
-                        block.clear();
-                    }
-                }
-            }
-            if !block.is_empty() {
-                collector.collect_block(&block);
-            }
-        }
+    // Use AllQuery for the no-query case — tantivy's AllScorer delivers docs
+    // in bulk blocks, much faster than per-doc iteration with alive_bitset checks.
+    let effective_query: Box<dyn Query> = match query {
+        Some(q) => q.box_clone(),
+        None => Box::new(tantivy::query::AllQuery),
+    };
+    let weight = effective_query.weight(EnableScoring::disabled_from_schema(schema))?;
+
+    if let Some(alive) = alive_bitset {
+        let mut buf = Vec::with_capacity(COLLECT_BLOCK_SIZE);
+        weight.for_each_no_score(seg_reader, &mut |docs| {
+            buf.clear();
+            buf.extend(docs.iter().filter(|&&d| alive.is_alive(d)));
+            collector.collect_block(&buf);
+        })?;
+    } else {
+        weight.for_each_no_score(seg_reader, &mut |docs| {
+            collector.collect_block(docs);
+        })?;
     }
+
     Ok(())
 }
 

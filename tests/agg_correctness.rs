@@ -412,3 +412,7 @@ async fn test_sum_avg_without_group_by() {
     assert!((sum_val - 17.5).abs() < eps, "SUM should be 17.5, got {sum_val}");
     assert!((avg_val - 3.5).abs() < eps, "AVG should be 3.5, got {avg_val}");
 }
+
+
+
+

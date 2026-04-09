@@ -212,6 +212,16 @@ fn main() {
     let index_1m = build_bench_index(1_000_000);
     let index_10m = build_bench_index(10_000_000);
 
+    // Print segment info
+    for (name, idx) in &[("1M", &index_1m), ("10M", &index_10m)] {
+        let r = idx.reader().unwrap();
+        let s = r.searcher();
+        eprintln!("{name}: {} segments", s.segment_readers().len());
+        for (i, sr) in s.segment_readers().iter().enumerate() {
+            eprintln!("  seg {i}: {} docs", sr.max_doc());
+        }
+    }
+
     let inputs: Vec<(&str, Index)> = vec![
         ("1M_docs", index_1m.clone()),
         ("10M_docs", index_10m.clone()),
