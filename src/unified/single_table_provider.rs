@@ -27,7 +27,7 @@ use tantivy::aggregation::agg_req::Aggregations;
 use tantivy::collector::TopNComputer;
 use tantivy::query::EnableScoring;
 use tantivy::query::RangeQuery;
-use tantivy::schema::{FieldType, Schema as TantivySchema, Term};
+use tantivy::schema::{FieldType, IndexRecordOption, Schema as TantivySchema, Term};
 use tantivy::{DateTime, DocId, Document, Index, Score};
 
 use crate::fast_field_reader::read_segment_fast_fields_to_batch;
@@ -222,7 +222,7 @@ impl SingleTableProvider {
         Self::from_opener_with_ff_schema(opener, ff_schema)
     }
 
-    fn from_opener_with_ff_schema(
+    pub(crate) fn from_opener_with_ff_schema(
         opener: Arc<dyn IndexOpener>,
         fast_field_schema: SchemaRef,
     ) -> Self {
@@ -662,6 +662,13 @@ impl DataSource for SingleTableDataSource {
             // Warmup runs once across all partitions (best-effort). The first
             // partition to reach this point initialises the OnceCell; others
             // wait briefly or get the cached result.
+            //
+            // Design note: individual warmup errors are logged but swallowed
+            // inside the closure, so the OnceCell always transitions to the
+            // initialised state. This is intentional — warmup is advisory and
+            // sync reads will still succeed (just slower). Retrying on every
+            // partition would be wasteful and unlikely to help with transient
+            // errors since the same index/segments are involved.
             {
                 let index_ref = index.clone();
                 let ff_schema_ref = ff_projected_schema.clone();
@@ -961,31 +968,33 @@ fn generate_single_table_batch_streaming(
                     (ids, Some(sc))
                 } else {
                     // Full scoring without topK.
+                    // Filter deleted docs inside the callback to avoid
+                    // collecting and then discarding them in a second pass.
+                    let alive_bitset = segment_reader.alive_bitset();
                     let mut ids = Vec::new();
                     let mut sc = Vec::new();
-                    weight
-                        .for_each(segment_reader, &mut |doc, score| {
-                            ids.push(doc);
-                            sc.push(score);
-                        })
-                        .map_err(|e| {
-                            DataFusionError::Internal(format!("query execution: {e}"))
-                        })?;
-
-                    // Filter deleted docs.
-                    if let Some(alive_bitset) = segment_reader.alive_bitset() {
-                        let mut filtered_ids = Vec::new();
-                        let mut filtered_sc = Vec::new();
-                        for (doc, score) in ids.into_iter().zip(sc) {
-                            if alive_bitset.is_alive(doc) {
-                                filtered_ids.push(doc);
-                                filtered_sc.push(score);
-                            }
-                        }
-                        (filtered_ids, Some(filtered_sc))
+                    if let Some(alive) = alive_bitset {
+                        weight
+                            .for_each(segment_reader, &mut |doc, score| {
+                                if alive.is_alive(doc) {
+                                    ids.push(doc);
+                                    sc.push(score);
+                                }
+                            })
+                            .map_err(|e| {
+                                DataFusionError::Internal(format!("query execution: {e}"))
+                            })?;
                     } else {
-                        (ids, Some(sc))
+                        weight
+                            .for_each(segment_reader, &mut |doc, score| {
+                                ids.push(doc);
+                                sc.push(score);
+                            })
+                            .map_err(|e| {
+                                DataFusionError::Internal(format!("query execution: {e}"))
+                            })?;
                     }
+                    (ids, Some(sc))
                 }
             } else {
                 // No scoring needed — boolean filter only.
@@ -993,17 +1002,26 @@ fn generate_single_table_batch_streaming(
                 let weight = query
                     .weight(EnableScoring::disabled_from_schema(&tantivy_schema))
                     .map_err(|e| DataFusionError::Internal(format!("create weight: {e}")))?;
+                // Filter deleted docs inside the callback to avoid a
+                // separate retain pass over the collected doc ids.
+                let alive_bitset = segment_reader.alive_bitset();
                 let mut matching_docs = Vec::new();
-                weight
-                    .for_each_no_score(segment_reader, &mut |docs| {
-                        matching_docs.extend_from_slice(docs);
-                    })
-                    .map_err(|e| {
-                        DataFusionError::Internal(format!("query execution: {e}"))
-                    })?;
-                // Filter deleted docs.
-                if let Some(alive_bitset) = segment_reader.alive_bitset() {
-                    matching_docs.retain(|&doc| alive_bitset.is_alive(doc));
+                if let Some(alive) = alive_bitset {
+                    weight
+                        .for_each_no_score(segment_reader, &mut |docs| {
+                            matching_docs.extend(docs.iter().filter(|&&d| alive.is_alive(d)));
+                        })
+                        .map_err(|e| {
+                            DataFusionError::Internal(format!("query execution: {e}"))
+                        })?;
+                } else {
+                    weight
+                        .for_each_no_score(segment_reader, &mut |docs| {
+                            matching_docs.extend_from_slice(docs);
+                        })
+                        .map_err(|e| {
+                            DataFusionError::Internal(format!("query execution: {e}"))
+                        })?;
                 }
                 (matching_docs, None)
             }
@@ -1194,10 +1212,23 @@ fn logical_expr_to_tantivy_query(
     let term = logical_scalar_to_term(field, field_entry.field_type(), &scalar)?;
 
     match op {
-        Operator::Eq => Some(Box::new(RangeQuery::new(
-            Bound::Included(term.clone()),
-            Bound::Included(term),
-        ))),
+        Operator::Eq => {
+            // For indexed non-text fields, use TermQuery (posting list lookup, O(matches)).
+            // For text fields or non-indexed fields, use RangeQuery (fast field scan).
+            // TermQuery on tokenized text fields would search for individual tokens,
+            // not the original value — causing silent false negatives.
+            if field_entry.is_indexed() && !matches!(field_entry.field_type(), FieldType::Str(_)) {
+                Some(Box::new(tantivy::query::TermQuery::new(
+                    term,
+                    IndexRecordOption::Basic,
+                )))
+            } else {
+                Some(Box::new(RangeQuery::new(
+                    Bound::Included(term.clone()),
+                    Bound::Included(term),
+                )))
+            }
+        }
         Operator::Gt => Some(Box::new(RangeQuery::new(
             Bound::Excluded(term),
             Bound::Unbounded,
@@ -1214,6 +1245,18 @@ fn logical_expr_to_tantivy_query(
             Bound::Unbounded,
             Bound::Included(term),
         ))),
+        Operator::NotEq => {
+            // NotEq as union of (< term) OR (> term)
+            let lt = Box::new(RangeQuery::new(
+                Bound::Unbounded,
+                Bound::Excluded(term.clone()),
+            ));
+            let gt = Box::new(RangeQuery::new(
+                Bound::Excluded(term),
+                Bound::Unbounded,
+            ));
+            Some(Box::new(tantivy::query::BooleanQuery::union(vec![lt, gt])))
+        }
         _ => None,
     }
 }
@@ -1222,6 +1265,7 @@ fn logical_expr_to_tantivy_query(
 fn logical_flip_operator(op: &Operator) -> Option<Operator> {
     match op {
         Operator::Eq => Some(Operator::Eq),
+        Operator::NotEq => Some(Operator::NotEq),
         Operator::Gt => Some(Operator::Lt),
         Operator::GtEq => Some(Operator::LtEq),
         Operator::Lt => Some(Operator::Gt),
@@ -1236,34 +1280,61 @@ fn logical_scalar_to_term(
     field_type: &FieldType,
     scalar: &ScalarValue,
 ) -> Option<Term> {
+    match field_type {
+        FieldType::I64(_) => {
+            let v = match scalar {
+                ScalarValue::Int64(Some(v)) => *v,
+                ScalarValue::Int32(Some(v)) => *v as i64,
+                ScalarValue::Int16(Some(v)) => *v as i64,
+                ScalarValue::Int8(Some(v)) => *v as i64,
+                ScalarValue::UInt64(Some(v)) => *v as i64,
+                ScalarValue::UInt32(Some(v)) => *v as i64,
+                ScalarValue::UInt16(Some(v)) => *v as i64,
+                ScalarValue::UInt8(Some(v)) => *v as i64,
+                ScalarValue::Float64(Some(v)) => *v as i64,
+                _ => return None,
+            };
+            return Some(Term::from_field_i64(field, v));
+        }
+        FieldType::U64(_) => {
+            let v = match scalar {
+                ScalarValue::UInt64(Some(v)) => *v,
+                ScalarValue::UInt32(Some(v)) => *v as u64,
+                ScalarValue::UInt16(Some(v)) => *v as u64,
+                ScalarValue::UInt8(Some(v)) => *v as u64,
+                ScalarValue::Int64(Some(v)) => *v as u64,
+                ScalarValue::Int32(Some(v)) => *v as u64,
+                ScalarValue::Int16(Some(v)) => *v as u64,
+                ScalarValue::Int8(Some(v)) => *v as u64,
+                ScalarValue::Float64(Some(v)) => *v as u64,
+                _ => return None,
+            };
+            return Some(Term::from_field_u64(field, v));
+        }
+        FieldType::F64(_) => {
+            let v = match scalar {
+                ScalarValue::Float64(Some(v)) => *v,
+                ScalarValue::Float32(Some(v)) => *v as f64,
+                ScalarValue::Int64(Some(v)) => *v as f64,
+                ScalarValue::Int32(Some(v)) => *v as f64,
+                ScalarValue::Int16(Some(v)) => *v as f64,
+                ScalarValue::Int8(Some(v)) => *v as f64,
+                ScalarValue::UInt64(Some(v)) => *v as f64,
+                ScalarValue::UInt32(Some(v)) => *v as f64,
+                ScalarValue::UInt16(Some(v)) => *v as u64 as f64,
+                ScalarValue::UInt8(Some(v)) => *v as f64,
+                _ => return None,
+            };
+            return Some(Term::from_field_f64(field, v));
+        }
+        _ => {}
+    }
     match (field_type, scalar) {
-        (FieldType::U64(_), ScalarValue::UInt64(Some(v))) => {
-            Some(Term::from_field_u64(field, *v))
-        }
-        (FieldType::I64(_), ScalarValue::Int64(Some(v))) => {
-            Some(Term::from_field_i64(field, *v))
-        }
-        (FieldType::F64(_), ScalarValue::Float64(Some(v))) => {
-            Some(Term::from_field_f64(field, *v))
-        }
         (FieldType::Bool(_), ScalarValue::Boolean(Some(v))) => {
             Some(Term::from_field_bool(field, *v))
         }
         (FieldType::Str(_), ScalarValue::Utf8(Some(s))) => {
             Some(Term::from_field_text(field, s))
-        }
-        // Numeric type coercions that DataFusion may apply.
-        (FieldType::F64(_), ScalarValue::Int64(Some(v))) => {
-            Some(Term::from_field_f64(field, *v as f64))
-        }
-        (FieldType::F64(_), ScalarValue::Float32(Some(v))) => {
-            Some(Term::from_field_f64(field, *v as f64))
-        }
-        (FieldType::I64(_), ScalarValue::Int32(Some(v))) => {
-            Some(Term::from_field_i64(field, *v as i64))
-        }
-        (FieldType::U64(_), ScalarValue::Int64(Some(v))) if *v >= 0 => {
-            Some(Term::from_field_u64(field, *v as u64))
         }
         // Date — tantivy DateTime stores nanoseconds internally.
         (FieldType::Date(_), ScalarValue::TimestampMicrosecond(Some(v), _)) => {

@@ -604,7 +604,11 @@ impl ExecutionPlan for LazyScanExec {
                 }
                 SINGLE_TABLE => {
                     use crate::unified::single_table_provider::SingleTableProvider;
-                    let provider = SingleTableProvider::from_opener(opener);
+                    let ff_schema = tantivy_schema_to_arrow_with_multi_valued(
+                        &opener.schema(),
+                        &opener.multi_valued_fields(),
+                    );
+                    let provider = SingleTableProvider::from_opener_with_ff_schema(opener, ff_schema);
                     // full_text UDF already registered above for SINGLE_TABLE
                     let st_exec = provider.scan(&state, projection.as_ref().map(|v| v as &Vec<usize>), &filters, None).await?;
                     // Re-apply topk if present

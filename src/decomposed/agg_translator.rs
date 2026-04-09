@@ -546,7 +546,7 @@ fn parse_offset_to_micros(offset: &str) -> Result<i64> {
 
 /// Range via CASE-based GROUP BY — single scan, optimal for pushdown.
 /// Produces a normal `AggregateExec(GROUP BY bucket)` that the pushdown
-/// optimizer rule can replace with `TantivyAggregateExec`.
+/// optimizer rule can replace with `AggDataSource`.
 fn translate_range_case(
     df: DataFrame,
     _name: &str,

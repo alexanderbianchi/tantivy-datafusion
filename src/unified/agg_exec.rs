@@ -1,18 +1,9 @@
-use std::any::Any;
-use std::fmt;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, SchemaRef};
-use datafusion::common::{Result, Statistics};
+use datafusion::common::Result;
 use datafusion::error::DataFusionError;
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
-};
-use datafusion_physical_expr::EquivalenceProperties;
-use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion_physical_plan::Partitioning;
-use futures::stream;
 use tantivy::aggregation::agg_req::{Aggregation, AggregationVariants, Aggregations};
 use tantivy::aggregation::agg_result::{
     AggregationResult, AggregationResults, BucketEntry, BucketResult, MetricResult,
@@ -24,158 +15,6 @@ use tantivy::aggregation::{AggContextParams, AggregationSegmentCollector, Key};
 use tantivy::collector::SegmentCollector;
 use tantivy::query::{EnableScoring, Query};
 use tantivy::Index;
-
-use crate::index_opener::IndexOpener;
-
-/// A custom leaf `ExecutionPlan` that calls tantivy's native
-/// `AggregationSegmentCollector` directly, bypassing DataFusion's
-/// hash-based `AggregateExec` for near-native aggregation performance.
-pub(crate) struct TantivyAggregateExec {
-    opener: Arc<dyn IndexOpener>,
-    aggregations: Arc<Aggregations>,
-    query: Option<Arc<dyn Query>>,
-    output_schema: SchemaRef,
-    properties: PlanProperties,
-}
-
-impl TantivyAggregateExec {
-    pub fn new(
-        opener: Arc<dyn IndexOpener>,
-        aggregations: Arc<Aggregations>,
-        query: Option<Arc<dyn Query>>,
-        output_schema: SchemaRef,
-    ) -> Self {
-        let properties = PlanProperties::new(
-            EquivalenceProperties::new(output_schema.clone()),
-            Partitioning::UnknownPartitioning(1),
-            datafusion::physical_plan::execution_plan::EmissionType::Final,
-            datafusion::physical_plan::execution_plan::Boundedness::Bounded,
-        );
-        Self {
-            opener,
-            aggregations,
-            query,
-            output_schema,
-            properties,
-        }
-    }
-}
-
-impl fmt::Debug for TantivyAggregateExec {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TantivyAggregateExec")
-            .field("output_schema", &self.output_schema)
-            .field("has_query", &self.query.is_some())
-            .finish()
-    }
-}
-
-impl DisplayAs for TantivyAggregateExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "TantivyAggregateExec(aggs={}, query={})",
-            self.aggregations.len(),
-            self.query.is_some(),
-        )
-    }
-}
-
-impl ExecutionPlan for TantivyAggregateExec {
-    fn name(&self) -> &str {
-        "TantivyAggregateExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.output_schema.clone()
-    }
-
-    fn properties(&self) -> &PlanProperties {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        if !children.is_empty() {
-            return Err(DataFusionError::Internal(
-                "TantivyAggregateExec has no children".into(),
-            ));
-        }
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        _context: Arc<datafusion::execution::TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Internal(format!(
-                "TantivyAggregateExec only supports partition 0, got {partition}"
-            )));
-        }
-
-        let opener = self.opener.clone();
-        let aggs = self.aggregations.clone();
-        let query = self.query.as_ref().map(|q| Arc::from(q.box_clone()));
-        let schema = self.output_schema.clone();
-
-        let stream = stream::once(async move {
-            let index = opener.open().await?;
-
-            // Warm fast fields for aggregation.
-            crate::warmup::warmup_fast_fields(&index).await?;
-            // Warm inverted index if a query filter is active.
-            // TantivyAggregateExec doesn't track which text fields the query references,
-            // so we warm all text fields. AggDataSource (the unified path) does selective
-            // warmup via raw_queries. This is only a performance concern, not correctness.
-            if query.is_some() {
-                let tantivy_schema = index.schema();
-                let text_fields: Vec<tantivy::schema::Field> = tantivy_schema
-                    .fields()
-                    .filter_map(|(f, entry)| {
-                        if matches!(entry.field_type(), tantivy::schema::FieldType::Str(_)) {
-                            Some(f)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if !text_fields.is_empty() {
-                    crate::warmup::warmup_inverted_index(&index, &text_fields).await?;
-                }
-            }
-
-            // Note: spawn_blocking tasks cannot be aborted. If the stream is dropped
-            // mid-computation, the blocking task runs to completion and the result is
-            // discarded. This is bounded to one aggregation computation per partition.
-            tokio::task::spawn_blocking(move || {
-                execute_tantivy_agg(&index, &aggs, query.as_ref(), &schema)
-            })
-            .await
-            .map_err(|e| DataFusionError::Internal(format!("spawn_blocking join error: {e}")))?
-        });
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            self.output_schema.clone(),
-            stream,
-        )))
-    }
-
-    fn statistics(&self) -> Result<Statistics> {
-        Ok(Statistics::new_unknown(&self.output_schema))
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Core tantivy aggregation execution
@@ -311,7 +150,7 @@ fn agg_results_to_batch(
     // The optimizer should only replace plans for a single top-level agg.
     if results.0.len() != 1 || aggs.len() != 1 {
         return Err(DataFusionError::NotImplemented(
-            "TantivyAggregateExec supports only a single top-level aggregation".into(),
+            "tantivy agg pushdown supports only a single top-level aggregation".into(),
         ));
     }
 

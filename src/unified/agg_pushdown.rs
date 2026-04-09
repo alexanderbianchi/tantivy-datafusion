@@ -14,7 +14,6 @@ use tantivy::aggregation::metric::{
 };
 
 use crate::unified::agg_data_source::AggDataSource;
-use crate::unified::agg_exec::TantivyAggregateExec;
 use crate::unified::plan_traversal::{
     find_fast_field_datasource, find_partial_aggregate, find_single_table_datasource,
 };
@@ -63,7 +62,7 @@ impl PhysicalOptimizerRule for AggPushdown {
     }
 }
 
-/// Attempt to replace an `AggregateExec` subtree with `TantivyAggregateExec`.
+/// Attempt to replace an `AggregateExec` subtree with a `DataSourceExec(AggDataSource)`.
 fn try_rewrite(
     plan: Arc<dyn ExecutionPlan>,
 ) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
@@ -108,24 +107,26 @@ fn try_rewrite_single(
     if let Some(ff_ds) = find_fast_field_datasource(input) {
         // Check stashed aggregations (backward compat)
         if let Some(tantivy_aggs) = ff_ds.aggregations() {
-            let new_exec = TantivyAggregateExec::new(
+            let agg_ds = AggDataSource::new(
                 ff_ds.opener().clone(),
                 tantivy_aggs.clone(),
-                ff_ds.query().map(|q| Arc::from(q.box_clone())),
                 agg.schema(),
+                vec![],  // decomposed path has no raw text queries
+                ff_ds.query().map(|q| Arc::from(q.box_clone())),
             );
-            return Ok(Transformed::yes(Arc::new(new_exec)));
+            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(agg_ds)))));
         }
 
         // Fallback: derive from AggregateExec expressions
         if let Some(tantivy_aggs) = derive_tantivy_aggregations(agg) {
-            let new_exec = TantivyAggregateExec::new(
+            let agg_ds = AggDataSource::new(
                 ff_ds.opener().clone(),
                 Arc::new(tantivy_aggs),
-                ff_ds.query().map(|q| Arc::from(q.box_clone())),
                 agg.schema(),
+                vec![],  // decomposed path has no raw text queries
+                ff_ds.query().map(|q| Arc::from(q.box_clone())),
             );
-            return Ok(Transformed::yes(Arc::new(new_exec)));
+            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(agg_ds)))));
         }
     }
 
@@ -173,24 +174,26 @@ fn try_rewrite_two_phase(
     if let Some(ff_ds) = find_fast_field_datasource(partial_input) {
         // Check stashed aggregations (backward compat)
         if let Some(tantivy_aggs) = ff_ds.aggregations() {
-            let new_exec = TantivyAggregateExec::new(
+            let agg_ds = AggDataSource::new(
                 ff_ds.opener().clone(),
                 tantivy_aggs.clone(),
-                ff_ds.query().map(|q| Arc::from(q.box_clone())),
                 final_agg.schema(),
+                vec![],  // decomposed path has no raw text queries
+                ff_ds.query().map(|q| Arc::from(q.box_clone())),
             );
-            return Ok(Transformed::yes(Arc::new(new_exec)));
+            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(agg_ds)))));
         }
 
         // Fallback: derive from the Final AggregateExec expressions
         if let Some(tantivy_aggs) = derive_tantivy_aggregations(final_agg) {
-            let new_exec = TantivyAggregateExec::new(
+            let agg_ds = AggDataSource::new(
                 ff_ds.opener().clone(),
                 Arc::new(tantivy_aggs),
-                ff_ds.query().map(|q| Arc::from(q.box_clone())),
                 final_agg.schema(),
+                vec![],  // decomposed path has no raw text queries
+                ff_ds.query().map(|q| Arc::from(q.box_clone())),
             );
-            return Ok(Transformed::yes(Arc::new(new_exec)));
+            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(agg_ds)))));
         }
     }
 
