@@ -11,4 +11,3 @@ pub mod agg_pushdown;
 pub mod ordinal_group_by;
 pub(crate) mod plan_traversal;
 pub mod single_table_provider;
-pub mod task_estimator;

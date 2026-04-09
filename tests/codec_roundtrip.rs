@@ -15,6 +15,7 @@ use tantivy_datafusion::{
     TantivyInvertedIndexProvider, TantivyTableProvider, DocumentDataSource, full_text_udf,
     SingleTableProvider,
 };
+use tantivy_datafusion::unified::agg_data_source::AggDataSource;
 use tantivy_datafusion::unified::single_table_provider::SingleTableDataSource;
 
 /// Create a simple in-memory tantivy index for testing.
@@ -565,51 +566,6 @@ async fn test_single_table_with_topk_roundtrip() {
     assert_eq!(decoded.schema(), exec_with_topk.schema());
 }
 
-#[tokio::test]
-async fn test_single_table_with_pushed_filters_roundtrip() {
-    let index = create_test_index();
-    let opener = Arc::new(DirectIndexOpener::new(index.clone()));
-    let provider = SingleTableProvider::from_opener(opener.clone());
-
-    let session = SessionContext::new();
-    let state = session.state();
-    let exec = provider.scan(&state, None, &[], None).await.unwrap();
-
-    // Manually push a filter: price > 3.0
-    let ds_exec = exec.as_any().downcast_ref::<DataSourceExec>().unwrap();
-    let st_ds = ds_exec
-        .data_source()
-        .as_any()
-        .downcast_ref::<SingleTableDataSource>()
-        .unwrap();
-    let price_idx = exec.schema().index_of("price").unwrap();
-    let filter: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
-        Arc::new(Column::new("price", price_idx)),
-        datafusion::logical_expr::Operator::Gt,
-        Arc::new(Literal::new(datafusion::common::ScalarValue::Float64(Some(
-            3.0,
-        )))),
-    ));
-    let updated_ds = st_ds.with_pushed_filters(vec![filter.clone()]);
-    let exec_with_filter = Arc::new(DataSourceExec::new(Arc::new(updated_ds)));
-
-    let codec = TantivyCodec;
-    let mut buf = Vec::new();
-    codec
-        .try_encode(exec_with_filter.clone(), &mut buf)
-        .unwrap();
-    assert!(!buf.is_empty());
-
-    let decode_session = session_with_opener(index);
-    let task_ctx = decode_session.state().task_ctx();
-    let decoded = codec.try_decode(&buf, &[], &task_ctx).unwrap();
-
-    assert_eq!(
-        decoded.schema(),
-        exec_with_filter.schema(),
-        "schema must match after filter roundtrip"
-    );
-}
 
 #[tokio::test]
 async fn test_double_roundtrip_single_table() {
@@ -635,4 +591,103 @@ async fn test_double_roundtrip_single_table() {
     let mut buf2 = Vec::new();
     codec.try_encode(decoded, &mut buf2).unwrap();
     assert_eq!(buf1, buf2, "double roundtrip must produce identical bytes");
+}
+
+// ── AggDataSource roundtrip ───────────────────────────────────────
+
+#[tokio::test]
+async fn test_agg_data_source_roundtrip() {
+    let index = create_test_index();
+    let opener = Arc::new(DirectIndexOpener::new(index.clone()));
+
+    // Build a simple terms aggregation on "body" field.
+    let aggs: tantivy::aggregation::agg_req::Aggregations =
+        serde_json::from_value(serde_json::json!({
+            "terms_body": { "terms": { "field": "body" } }
+        }))
+        .unwrap();
+
+    // Build an output schema matching what a terms agg would produce.
+    let output_schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("body", arrow::datatypes::DataType::Utf8, false),
+        arrow::datatypes::Field::new("doc_count", arrow::datatypes::DataType::Int64, false),
+    ]));
+
+    let agg_ds = AggDataSource::new(
+        opener,
+        Arc::new(aggs),
+        output_schema.clone(),
+        Vec::new(),
+        None,
+    );
+    let exec = Arc::new(DataSourceExec::new(Arc::new(agg_ds)));
+
+    // Encode
+    let codec = TantivyCodec;
+    let mut buf = Vec::new();
+    codec.try_encode(exec.clone(), &mut buf).unwrap();
+    assert!(!buf.is_empty(), "encoded bytes should be non-empty");
+
+    // Decode
+    let decode_session = session_with_opener(index);
+    let task_ctx = decode_session.state().task_ctx();
+    let decoded = codec.try_decode(&buf, &[], &task_ctx).unwrap();
+
+    assert_eq!(
+        decoded.schema(),
+        exec.schema(),
+        "decoded schema must match original"
+    );
+    assert_eq!(
+        decoded.properties().partitioning.partition_count(),
+        exec.properties().partitioning.partition_count(),
+        "partition count must match"
+    );
+}
+
+#[tokio::test]
+async fn test_agg_data_source_with_query_roundtrip() {
+    let index = create_test_index();
+    let opener = Arc::new(DirectIndexOpener::new(index.clone()));
+
+    // Build a terms aggregation with a FTS filter.
+    let aggs: tantivy::aggregation::agg_req::Aggregations =
+        serde_json::from_value(serde_json::json!({
+            "terms_body": { "terms": { "field": "body" } }
+        }))
+        .unwrap();
+
+    let output_schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("body", arrow::datatypes::DataType::Utf8, false),
+        arrow::datatypes::Field::new("doc_count", arrow::datatypes::DataType::Int64, false),
+    ]));
+
+    // raw_queries simulates a full_text(body, 'rust') filter.
+    let raw_queries = vec![("body".to_string(), "rust".to_string())];
+
+    let agg_ds = AggDataSource::new(
+        opener,
+        Arc::new(aggs),
+        output_schema.clone(),
+        raw_queries,
+        None,
+    );
+    let exec = Arc::new(DataSourceExec::new(Arc::new(agg_ds)));
+
+    // Encode
+    let codec = TantivyCodec;
+    let mut buf = Vec::new();
+    codec.try_encode(exec.clone(), &mut buf).unwrap();
+    assert!(!buf.is_empty(), "encoded bytes should be non-empty");
+
+    // Decode
+    let decode_session = session_with_opener(index);
+    let task_ctx = decode_session.state().task_ctx();
+    let decoded = codec.try_decode(&buf, &[], &task_ctx).unwrap();
+
+    assert_eq!(
+        decoded.schema(),
+        exec.schema(),
+        "decoded schema must match original after query roundtrip"
+    );
 }

@@ -536,6 +536,7 @@ fn generate_and_filter_batch(
         doc_id_range,
         limit,
         segment_ord,
+        None,
     )?;
 
     // Apply pushed-down filters (e.g. dynamic join filters).

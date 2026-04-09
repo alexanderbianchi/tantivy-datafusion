@@ -3,8 +3,7 @@ use std::fmt;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use arrow::array::{AsArray, Float32Array, RecordBatch, StringBuilder};
-use arrow::compute::filter_record_batch;
+use arrow::array::{Float32Array, RecordBatch, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
@@ -23,12 +22,11 @@ use datafusion_physical_plan::projection::ProjectionExprs;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{DisplayFormatType, Partitioning, SendableRecordBatchStream};
 use futures::stream::StreamExt;
-use tantivy::aggregation::agg_req::Aggregations;
 use tantivy::query::RangeQuery;
 use tantivy::schema::{FieldType, IndexRecordOption, Schema as TantivySchema, Term};
 use tantivy::{DateTime, Document, Index};
 
-use crate::fast_field_reader::read_segment_fast_fields_to_batch;
+use crate::fast_field_reader::{DictCache, read_segment_fast_fields_to_batch};
 use crate::full_text_udf::extract_full_text_call;
 use crate::index_opener::{DirectIndexOpener, IndexOpener};
 use crate::schema_mapping::{tantivy_schema_to_arrow, tantivy_schema_to_arrow_from_index};
@@ -201,7 +199,6 @@ pub struct SingleTableProvider {
     fast_field_schema: SchemaRef,
     score_column_idx: usize,
     document_column_idx: usize,
-    aggregations: Option<Arc<Aggregations>>,
 }
 
 impl SingleTableProvider {
@@ -237,14 +234,9 @@ impl SingleTableProvider {
             fast_field_schema,
             score_column_idx,
             document_column_idx,
-            aggregations: None,
         }
     }
 
-    /// Stash tantivy aggregations for the AggPushdown optimizer rule.
-    pub fn set_aggregations(&mut self, aggs: Arc<Aggregations>) {
-        self.aggregations = Some(aggs);
-    }
 }
 
 impl fmt::Debug for SingleTableProvider {
@@ -389,22 +381,20 @@ impl TableProvider for SingleTableProvider {
 
         let data_source = SingleTableDataSource {
             opener: self.opener.clone(),
-            unified_schema: self.unified_schema.clone(),
-            fast_field_schema: self.fast_field_schema.clone(),
-            projected_schema,
-            projection: projection.cloned(),
-            score_column_idx: self.score_column_idx,
-            document_column_idx: self.document_column_idx,
-            needs_score,
-            needs_document,
-            ff_projection: ff_indices,
-            ff_projected_schema,
+            schema: ScanSchema {
+                unified: self.unified_schema.clone(),
+                projected: projected_schema,
+                ff_projected: ff_projected_schema,
+                projection: projection.cloned(),
+                score_idx: self.score_column_idx,
+                document_idx: self.document_column_idx,
+                needs_score,
+                needs_document,
+            },
             raw_queries,
             pre_built_query,
             topk: None,
             num_segments,
-            pushed_filters: Vec::new(),
-            aggregations: self.aggregations.clone(),
             partition_stats,
             warmup_done: Arc::new(tokio::sync::OnceCell::new()),
             metrics: ExecutionPlanMetricsSet::new(),
@@ -418,28 +408,28 @@ impl TableProvider for SingleTableProvider {
 // DataSource implementation
 // ---------------------------------------------------------------------------
 
+/// Bundles the eight schema-related fields that travel together.
+#[derive(Debug, Clone)]
+struct ScanSchema {
+    unified: SchemaRef,
+    projected: SchemaRef,
+    ff_projected: SchemaRef,
+    projection: Option<Vec<usize>>,
+    score_idx: usize,
+    document_idx: usize,
+    needs_score: bool,
+    needs_document: bool,
+}
+
 #[derive(Debug)]
 pub struct SingleTableDataSource {
     opener: Arc<dyn IndexOpener>,
-    unified_schema: SchemaRef,
-    fast_field_schema: SchemaRef,
-    projected_schema: SchemaRef,
-    projection: Option<Vec<usize>>,
-    score_column_idx: usize,
-    document_column_idx: usize,
-    needs_score: bool,
-    needs_document: bool,
-    /// Indices into fast_field_schema that we need to read.
-    ff_projection: Vec<usize>,
-    /// The projected fast field schema (built from ff_projection).
-    ff_projected_schema: SchemaRef,
+    schema: ScanSchema,
     raw_queries: Vec<(String, String)>,
     /// Pre-built tantivy queries from fast field filters converted at scan time.
     pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
     pub(crate) topk: Option<usize>,
     num_segments: usize,
-    pushed_filters: Vec<Arc<dyn PhysicalExpr>>,
-    aggregations: Option<Arc<Aggregations>>,
     /// Per-partition (segment) statistics for partition pruning.
     /// Indexed by partition number. `None` means stats are unavailable for
     /// that partition (e.g. remote opener without metadata).
@@ -454,22 +444,11 @@ impl SingleTableDataSource {
     fn clone_with(&self, f: impl FnOnce(&mut Self)) -> Self {
         let mut new = SingleTableDataSource {
             opener: self.opener.clone(),
-            unified_schema: self.unified_schema.clone(),
-            fast_field_schema: self.fast_field_schema.clone(),
-            projected_schema: self.projected_schema.clone(),
-            projection: self.projection.clone(),
-            score_column_idx: self.score_column_idx,
-            document_column_idx: self.document_column_idx,
-            needs_score: self.needs_score,
-            needs_document: self.needs_document,
-            ff_projection: self.ff_projection.clone(),
-            ff_projected_schema: self.ff_projected_schema.clone(),
+            schema: self.schema.clone(),
             raw_queries: self.raw_queries.clone(),
             pre_built_query: self.pre_built_query.clone(),
             topk: self.topk,
             num_segments: self.num_segments,
-            pushed_filters: self.pushed_filters.clone(),
-            aggregations: self.aggregations.clone(),
             partition_stats: self.partition_stats.clone(),
             warmup_done: self.warmup_done.clone(),
             metrics: self.metrics.clone(),
@@ -508,24 +487,15 @@ impl SingleTableDataSource {
         self.clone_with(|s| s.topk = Some(topk))
     }
 
-    /// Access the pushed-down filters.
-    pub fn pushed_filters(&self) -> &[Arc<dyn PhysicalExpr>] {
-        &self.pushed_filters
-    }
-
-    /// Return a copy with the given pushed-down filters.
-    pub fn with_pushed_filters(&self, filters: Vec<Arc<dyn PhysicalExpr>>) -> Self {
-        self.clone_with(|s| s.pushed_filters = filters)
-    }
-
-    /// Access the stashed tantivy aggregations used by the AggPushdown optimizer rule.
-    pub(crate) fn aggregations(&self) -> Option<&Arc<Aggregations>> {
-        self.aggregations.as_ref()
-    }
-
     /// Access the pre-built tantivy query from fast field filters.
     pub fn pre_built_query(&self) -> Option<&Arc<dyn tantivy::query::Query>> {
         self.pre_built_query.as_ref()
+    }
+
+    /// SingleTableDataSource does not carry pre-set aggregations.
+    /// The `AggPushdown` optimizer derives them from the AggregateExec.
+    pub fn aggregations(&self) -> Option<&Arc<tantivy::aggregation::agg_req::Aggregations>> {
+        None
     }
 
     /// Aggregate per-partition statistics into overall table statistics.
@@ -545,7 +515,7 @@ impl SingleTableDataSource {
             .collect();
 
         if known.is_empty() {
-            return Ok(Statistics::new_unknown(&self.projected_schema));
+            return Ok(Statistics::new_unknown(&self.schema.projected));
         }
 
         let total_rows: usize = known.iter().map(|s| s.num_rows).sum();
@@ -557,7 +527,8 @@ impl SingleTableDataSource {
         };
 
         let column_statistics: Vec<ColumnStatistics> = self
-            .projected_schema
+            .schema
+            .projected
             .fields()
             .iter()
             .map(|field| {
@@ -606,17 +577,17 @@ impl SingleTableDataSource {
 
     /// Access the projection indices.
     pub fn projection(&self) -> Option<&Vec<usize>> {
-        self.projection.as_ref()
+        self.schema.projection.as_ref()
     }
 
     /// Whether _score is needed.
     pub fn needs_score(&self) -> bool {
-        self.needs_score
+        self.schema.needs_score
     }
 
     /// Whether _document is needed.
     pub fn needs_document(&self) -> bool {
-        self.needs_document
+        self.schema.needs_document
     }
 }
 
@@ -631,23 +602,22 @@ impl DataSource for SingleTableDataSource {
         let opener = self.opener.clone();
         let segment_idx = partition;
         let raw_queries = self.raw_queries.clone();
-        let ff_projected_schema = self.ff_projected_schema.clone();
-        let unified_schema = self.unified_schema.clone();
-        let projected_schema = self.projected_schema.clone();
-        let projection = self.projection.clone();
-        let needs_score = self.needs_score;
-        let needs_document = self.needs_document;
-        let score_column_idx = self.score_column_idx;
-        let document_column_idx = self.document_column_idx;
+        let ff_projected_schema = self.schema.ff_projected.clone();
+        let unified_schema = self.schema.unified.clone();
+        let projected_schema = self.schema.projected.clone();
+        let projection = self.schema.projection.clone();
+        let needs_score = self.schema.needs_score;
+        let needs_document = self.schema.needs_document;
+        let score_column_idx = self.schema.score_idx;
+        let document_column_idx = self.schema.document_idx;
         let topk = self.topk;
-        let pushed_filters = self.pushed_filters.clone();
         let pre_built_query = self
             .pre_built_query
             .as_ref()
             .map(|q| Arc::from(q.box_clone()));
         let warmup_done = self.warmup_done.clone();
 
-        let schema = self.projected_schema.clone();
+        let schema = self.schema.projected.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(2);
 
         let handle = tokio::spawn(async move {
@@ -714,7 +684,6 @@ impl DataSource for SingleTableDataSource {
                     needs_score,
                     needs_document,
                     topk,
-                    pushed_filters,
                     query,
                 };
                 generate_single_table_batch_streaming(
@@ -757,18 +726,18 @@ impl DataSource for SingleTableDataSource {
             "SingleTableDataSource(segments={}, query={}, score={}, document={}, topk={:?})",
             self.num_segments,
             self.has_query(),
-            self.needs_score,
-            self.needs_document,
+            self.schema.needs_score,
+            self.schema.needs_document,
             self.topk,
         )
     }
 
     fn output_partitioning(&self) -> Partitioning {
-        segment_hash_partitioning(&self.projected_schema, self.num_segments)
+        segment_hash_partitioning(&self.schema.projected, self.num_segments)
     }
 
     fn eq_properties(&self) -> EquivalenceProperties {
-        EquivalenceProperties::new(self.projected_schema.clone())
+        EquivalenceProperties::new(self.schema.projected.clone())
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
@@ -785,7 +754,7 @@ impl DataSource for SingleTableDataSource {
 
         let stat = match self.partition_stats.get(partition) {
             Some(Some(s)) => s,
-            _ => return Ok(Statistics::new_unknown(&self.projected_schema)),
+            _ => return Ok(Statistics::new_unknown(&self.schema.projected)),
         };
 
         let num_rows = if stat.has_deletes {
@@ -795,7 +764,8 @@ impl DataSource for SingleTableDataSource {
         };
 
         let column_statistics: Vec<ColumnStatistics> = self
-            .projected_schema
+            .schema
+            .projected
             .fields()
             .iter()
             .map(|field| {
@@ -833,7 +803,7 @@ impl DataSource for SingleTableDataSource {
 
     fn with_fetch(&self, fetch: Option<usize>) -> Option<Arc<dyn DataSource>> {
         let topk = fetch?;
-        if !self.needs_score {
+        if !self.schema.needs_score {
             return None; // Only for scored queries (Block-WAND)
         }
         Some(Arc::new(self.clone_with(|ds| {
@@ -895,6 +865,7 @@ struct ChunkBuilder<'a> {
     segment_ord: u32,
     tantivy_schema: tantivy::schema::Schema,
     store_reader: Option<tantivy::store::StoreReader>,
+    dict_cache: DictCache,
 }
 
 impl<'a> ChunkBuilder<'a> {
@@ -914,6 +885,7 @@ impl<'a> ChunkBuilder<'a> {
             None,
             None,
             self.segment_ord,
+            Some(&self.dict_cache),
         )?;
 
         let chunk_rows = ff_batch.num_rows();
@@ -980,38 +952,6 @@ impl<'a> ChunkBuilder<'a> {
     }
 }
 
-/// Apply a sequence of pushed-down filter expressions to a `RecordBatch`,
-/// returning the filtered batch. Short-circuits on empty batches and
-/// constant-false filters.
-fn apply_pushed_filters(
-    mut batch: RecordBatch,
-    filters: &[Arc<dyn PhysicalExpr>],
-) -> Result<RecordBatch> {
-    for filter in filters {
-        if batch.num_rows() == 0 {
-            break;
-        }
-        let result = filter.evaluate(&batch)?;
-        let mask = match result {
-            datafusion::physical_plan::ColumnarValue::Scalar(
-                ScalarValue::Boolean(Some(true)),
-            ) => continue,
-            datafusion::physical_plan::ColumnarValue::Scalar(
-                ScalarValue::Boolean(Some(false)),
-            ) => {
-                return Ok(batch.slice(0, 0));
-            }
-            datafusion::physical_plan::ColumnarValue::Array(arr) => arr.as_boolean().clone(),
-            other => {
-                let arr = other.into_array(batch.num_rows())?;
-                arr.as_boolean().clone()
-            }
-        };
-        batch = filter_record_batch(&batch, &mask)?;
-    }
-    Ok(batch)
-}
-
 /// Generate batches for a single segment, streaming each batch through the
 /// `emit` callback as it is produced. Returns `Ok(())` when all batches have
 /// been emitted. If `emit` returns `false` (receiver dropped), production
@@ -1032,13 +972,11 @@ struct ScanConfig {
     needs_score: bool,
     needs_document: bool,
     topk: Option<usize>,
-    pushed_filters: Vec<Arc<dyn PhysicalExpr>>,
     query: Option<Arc<dyn tantivy::query::Query>>,
 }
 
 /// Thin orchestrator: query execution is delegated to
-/// [`collect_matching_docs`], batch assembly to [`ChunkBuilder::build`],
-/// and filter application to [`apply_pushed_filters`].
+/// [`collect_matching_docs`] and batch assembly to [`ChunkBuilder::build`].
 fn generate_single_table_batch_streaming(
     cfg: &ScanConfig,
     mut emit: impl FnMut(RecordBatch) -> bool,
@@ -1088,6 +1026,8 @@ fn generate_single_table_batch_streaming(
         None => (0..cfg.unified_schema.fields().len()).collect(),
     };
 
+    let dict_cache = DictCache::build(segment_reader, &cfg.ff_projected_schema)?;
+
     let builder = ChunkBuilder {
         segment_reader,
         ff_projected_schema: &cfg.ff_projected_schema,
@@ -1101,6 +1041,7 @@ fn generate_single_table_batch_streaming(
         segment_ord: segment_idx as u32,
         tantivy_schema: index.schema(),
         store_reader,
+        dict_cache,
     };
 
     // Process doc_ids in batch_size chunks.
@@ -1113,9 +1054,8 @@ fn generate_single_table_batch_streaming(
         let chunk_scores = scores.as_ref().map(|s| &s[offset..end]);
 
         let batch = builder.build(chunk_ids, chunk_scores)?;
-        let filtered = apply_pushed_filters(batch, &cfg.pushed_filters)?;
 
-        if filtered.num_rows() > 0 && !emit(filtered) {
+        if batch.num_rows() > 0 && !emit(batch) {
             return Ok(()); // receiver dropped, stop producing
         }
 

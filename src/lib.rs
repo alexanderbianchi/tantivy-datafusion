@@ -31,7 +31,6 @@ pub use schema_mapping::{tantivy_schema_to_arrow, tantivy_schema_to_arrow_from_i
 pub use unified::agg_pushdown::AggPushdown;
 pub use unified::ordinal_group_by::OrdinalGroupByOptimization;
 pub use unified::single_table_provider::SingleTableProvider;
-pub use unified::task_estimator::estimate_task_count;
 
 // Re-exports: decomposed
 pub use decomposed::agg_translator::{create_session_with_pushdown, execute_aggregations, translate_aggregations};

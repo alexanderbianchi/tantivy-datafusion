@@ -132,14 +132,10 @@ fn try_rewrite_single(
 
     // Try SingleTableDataSource: create a dedicated AggDataSource
     if let Some(st_ds) = find_single_table_datasource(input) {
-        let tantivy_aggs = st_ds
-            .aggregations()
-            .cloned()
-            .or_else(|| derive_tantivy_aggregations(agg).map(Arc::new));
-        if let Some(aggs) = tantivy_aggs {
+        if let Some(tantivy_aggs) = derive_tantivy_aggregations(agg).map(Arc::new) {
             let agg_ds = AggDataSource::new(
                 st_ds.opener().clone(),
-                aggs,
+                tantivy_aggs,
                 agg.schema(),
                 st_ds.raw_queries().to_vec(),
                 st_ds.pre_built_query().cloned(),
@@ -199,14 +195,10 @@ fn try_rewrite_two_phase(
 
     // Try SingleTableDataSource: create a dedicated AggDataSource
     if let Some(st_ds) = find_single_table_datasource(partial_input) {
-        let tantivy_aggs = st_ds
-            .aggregations()
-            .cloned()
-            .or_else(|| derive_tantivy_aggregations(final_agg).map(Arc::new));
-        if let Some(aggs) = tantivy_aggs {
+        if let Some(tantivy_aggs) = derive_tantivy_aggregations(final_agg).map(Arc::new) {
             let agg_ds = AggDataSource::new(
                 st_ds.opener().clone(),
-                aggs,
+                tantivy_aggs,
                 final_agg.schema(),
                 st_ds.raw_queries().to_vec(),
                 st_ds.pre_built_query().cloned(),

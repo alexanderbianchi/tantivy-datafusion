@@ -503,6 +503,13 @@ fn cast_key_column(values: &[Option<String>], data_type: &DataType) -> ArrayRef 
                 .collect();
             Arc::new(UInt64Array::from(nums))
         }
+        DataType::Boolean => {
+            let bools: Vec<Option<bool>> = values
+                .iter()
+                .map(|v| v.as_ref().map(|s| s == "true" || s == "1"))
+                .collect();
+            Arc::new(arrow::array::BooleanArray::from(bools))
+        }
         // Fallback: produce string
         _ => string_arr,
     }

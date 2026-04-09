@@ -274,12 +274,11 @@ impl PhysicalExtensionCodec for TantivyCodec {
                     Some(k) => (k as u32, true),
                     None => (0, false),
                 };
-                let pushed_filters = serialize_pushed_filters(st.pushed_filters(), self)?;
                 return TantivyScanProto {
                     identifier: id, tantivy_schema_json: schema_json, segment_sizes: seg,
                     projection: proj, has_projection: has_proj, output_partitions,
                     provider_type: SINGLE_TABLE, raw_queries_json: rq_json, topk, has_topk,
-                    pushed_filters,
+                    pushed_filters: Vec::new(),
                     footer_start, footer_end, multi_valued_fields: mv,
                     aggregations_json: String::new(), output_schema_bytes: Vec::new(),
                 }.encode(buf).map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
@@ -694,19 +693,6 @@ impl ExecutionPlan for LazyScanExec {
                                 &TantivyCodec,
                             )?;
                             let updated = doc_ds.with_pushed_filters(deserialized);
-                            Arc::new(DataSourceExec::new(Arc::new(updated)))
-                        } else if let Some(st_ds) = ds_exec
-                            .data_source()
-                            .as_any()
-                            .downcast_ref::<SingleTableDataSource>()
-                        {
-                            let deserialized = deserialize_pushed_filters(
-                                &pushed_filter_bytes,
-                                &context,
-                                ds_schema.as_ref(),
-                                &TantivyCodec,
-                            )?;
-                            let updated = st_ds.with_pushed_filters(deserialized);
                             Arc::new(DataSourceExec::new(Arc::new(updated)))
                         } else {
                             exec

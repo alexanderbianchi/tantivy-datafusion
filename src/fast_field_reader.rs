@@ -1,15 +1,70 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
     ArrayRef, BinaryBuilder, BooleanBuilder, DictionaryArray, Float64Builder, Int32Builder,
-    Int64Builder, ListBuilder, StringBuilder, TimestampMicrosecondBuilder, UInt32Array,
-    UInt64Builder,
+    Int64Builder, ListBuilder, StringBuilder, StringArray, TimestampMicrosecondBuilder,
+    UInt32Array, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Int32Type, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use datafusion::common::Result;
 use datafusion::error::DataFusionError;
 use tantivy::index::SegmentReader;
+
+/// Pre-built Arrow dictionary values for string fast fields.
+///
+/// Built once per segment, shared (via `Arc`) across all chunks.  The
+/// dictionary is streamed in ordinal order so tantivy ordinals map directly
+/// to Arrow dictionary indices.
+pub struct DictCache {
+    entries: HashMap<String, Arc<StringArray>>,
+}
+
+impl DictCache {
+    /// Build the cache for every `Dictionary`-typed field in `projected_schema`.
+    pub fn build(
+        segment_reader: &SegmentReader,
+        projected_schema: &SchemaRef,
+    ) -> Result<Self> {
+        let fast_fields = segment_reader.fast_fields();
+        let mut entries = HashMap::new();
+
+        for field in projected_schema.fields() {
+            if !matches!(field.data_type(), DataType::Dictionary(_, _)) {
+                continue;
+            }
+            let name = field.name();
+            let str_col = match fast_fields.str(name) {
+                Ok(Some(col)) => col,
+                _ => continue, // missing field — null padding handles it
+            };
+
+            let num_terms = str_col.num_terms();
+            let mut builder = StringBuilder::with_capacity(num_terms, num_terms * 16);
+            let mut streamer = str_col
+                .dictionary()
+                .stream()
+                .map_err(|e| {
+                    DataFusionError::Internal(format!("stream dict '{name}': {e}"))
+                })?;
+            while streamer.advance() {
+                let s = std::str::from_utf8(streamer.key()).map_err(|e| {
+                    DataFusionError::Internal(format!("dict utf8 '{name}': {e}"))
+                })?;
+                builder.append_value(s);
+            }
+            entries.insert(name.to_string(), Arc::new(builder.finish()));
+        }
+
+        Ok(Self { entries })
+    }
+
+    /// Get the pre-built dictionary values for a field.
+    pub fn get(&self, name: &str) -> Option<&Arc<StringArray>> {
+        self.entries.get(name)
+    }
+}
 
 /// Reads fast fields from a single segment and produces an Arrow RecordBatch.
 ///
@@ -25,6 +80,7 @@ pub fn read_segment_fast_fields_to_batch(
     doc_id_range: Option<std::ops::Range<u32>>,
     limit: Option<usize>,
     segment_ord: u32,
+    dict_cache: Option<&DictCache>,
 ) -> Result<RecordBatch> {
     let fast_fields = segment_reader.fast_fields();
 
@@ -144,55 +200,34 @@ pub fn read_segment_fast_fields_to_batch(
                     }
                 };
 
-                // Collect only the ordinals actually referenced by docs in this
-                // batch, then build a compact dictionary. This avoids materializing
-                // the entire term dictionary for high-cardinality columns when only
-                // a small subset of terms appear in the current doc set.
-                let mut raw_ords: Vec<Option<u64>> = Vec::with_capacity(num_docs);
-                let mut seen_ords: Vec<u64> = Vec::new();
-                for &doc_id in &docs {
-                    let mut ord_iter = str_col.term_ords(doc_id);
-                    match ord_iter.next() {
-                        Some(ord) => {
-                            raw_ords.push(Some(ord));
-                            // Track unique ordinals (sorted insert for dedup)
-                            if let Err(pos) = seen_ords.binary_search(&ord) {
-                                seen_ords.insert(pos, ord);
-                            }
+                // Fast path: pre-built segment-wide dictionary shared across chunks.
+                // Ordinals from the streamer are 0-based sequential so they map
+                // directly to Arrow dictionary indices.
+                if let Some(values) = dict_cache.and_then(|c| c.get(name)) {
+                    let ords_col = str_col.ords();
+                    let mut ord_buf: Vec<Option<u64>> = vec![None; num_docs];
+                    ords_col.first_vals(&docs, &mut ord_buf);
+
+                    let mut keys_builder = Int32Builder::with_capacity(num_docs);
+                    for ord in &ord_buf {
+                        match ord {
+                            Some(o) => keys_builder.append_value(*o as i32),
+                            None => keys_builder.append_null(),
                         }
-                        None => raw_ords.push(None),
                     }
-                }
 
-                // Build compact dictionary values from only the referenced terms
-                let mut dict_builder =
-                    StringBuilder::with_capacity(seen_ords.len(), seen_ords.len() * 16);
-                let mut buf = String::new();
-                for &ord in &seen_ords {
-                    buf.clear();
-                    str_col
-                        .ord_to_str(ord, &mut buf)
-                        .map_err(|e| DataFusionError::Internal(format!("dict build '{name}': {e}")))?;
-                    dict_builder.append_value(&buf);
-                }
-                let dict_values: ArrayRef = Arc::new(dict_builder.finish());
-
-                // Remap original ordinals to compact indices
-                let mut keys_builder = Int32Builder::with_capacity(num_docs);
-                for raw in &raw_ords {
-                    match raw {
-                        Some(ord) => {
-                            let compact_idx = seen_ords.binary_search(ord).unwrap();
-                            keys_builder.append_value(compact_idx as i32);
-                        }
-                        None => keys_builder.append_null(),
-                    }
-                }
-
-                Arc::new(
-                    DictionaryArray::<Int32Type>::try_new(keys_builder.finish(), dict_values)
+                    let dict_values: ArrayRef = Arc::clone(values) as ArrayRef;
+                    Arc::new(
+                        DictionaryArray::<Int32Type>::try_new(
+                            keys_builder.finish(),
+                            dict_values,
+                        )
                         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
-                )
+                    )
+                } else {
+                    // Fallback: per-chunk compact dictionary (no cache provided).
+                    build_compact_dict_array(&str_col, &docs, num_docs, name)?
+                }
             }
             DataType::Utf8 => {
                 // IpAddr formatted as string (not dictionary-encoded)
@@ -396,4 +431,56 @@ fn build_list_array(
             "Unsupported inner type for List fast field '{name}': {other:?}"
         ))),
     }
+}
+
+/// Build a compact `DictionaryArray` from only the ordinals referenced in
+/// `docs`.  This is the original per-chunk path, used when no `DictCache` is
+/// available.
+fn build_compact_dict_array(
+    str_col: &tantivy::columnar::StrColumn,
+    docs: &[u32],
+    num_docs: usize,
+    name: &str,
+) -> Result<ArrayRef> {
+    let mut raw_ords: Vec<Option<u64>> = Vec::with_capacity(num_docs);
+    let mut seen_ords: Vec<u64> = Vec::new();
+    for &doc_id in docs {
+        match str_col.term_ords(doc_id).next() {
+            Some(ord) => {
+                raw_ords.push(Some(ord));
+                if let Err(pos) = seen_ords.binary_search(&ord) {
+                    seen_ords.insert(pos, ord);
+                }
+            }
+            None => raw_ords.push(None),
+        }
+    }
+
+    let mut dict_builder =
+        StringBuilder::with_capacity(seen_ords.len(), seen_ords.len() * 16);
+    let mut buf = String::new();
+    for &ord in &seen_ords {
+        buf.clear();
+        str_col
+            .ord_to_str(ord, &mut buf)
+            .map_err(|e| DataFusionError::Internal(format!("dict build '{name}': {e}")))?;
+        dict_builder.append_value(&buf);
+    }
+    let dict_values: ArrayRef = Arc::new(dict_builder.finish());
+
+    let mut keys_builder = Int32Builder::with_capacity(num_docs);
+    for raw in &raw_ords {
+        match raw {
+            Some(ord) => {
+                let compact_idx = seen_ords.binary_search(ord).unwrap();
+                keys_builder.append_value(compact_idx as i32);
+            }
+            None => keys_builder.append_null(),
+        }
+    }
+
+    Ok(Arc::new(
+        DictionaryArray::<Int32Type>::try_new(keys_builder.finish(), dict_values)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
+    ))
 }
