@@ -14,12 +14,12 @@ use datafusion::error::DataFusionError;
 use datafusion_datasource::source::DataSource;
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
-use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion_physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 use datafusion_physical_plan::projection::ProjectionExprs;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{DisplayFormatType, Partitioning, SendableRecordBatchStream};
 use datafusion_physical_expr::PhysicalExpr;
-use futures::stream;
+use futures::stream::{self, StreamExt};
 use tantivy::aggregation::agg_req::Aggregations;
 
 use crate::index_opener::IndexOpener;
@@ -36,6 +36,8 @@ pub struct AggDataSource {
     raw_queries: Vec<(String, String)>,
     /// Pre-built tantivy queries from fast field filter conversion.
     pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
+    /// Shared metrics set for all partitions.
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl AggDataSource {
@@ -52,6 +54,7 @@ impl AggDataSource {
             output_schema,
             raw_queries,
             pre_built_query,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 }
@@ -62,6 +65,7 @@ impl DataSource for AggDataSource {
         partition: usize,
         _context: Arc<datafusion::execution::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let opener = self.opener.clone();
         let raw_queries = self.raw_queries.clone();
         let pre_built_query = self
@@ -103,6 +107,12 @@ impl DataSource for AggDataSource {
             })
             .await
             .map_err(|e| DataFusionError::Internal(format!("spawn_blocking join error: {e}")))?
+        })
+        .map(move |result| {
+            if let Ok(ref batch) = result {
+                baseline_metrics.record_output(batch.num_rows());
+            }
+            result
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -145,7 +155,7 @@ impl DataSource for AggDataSource {
     }
 
     fn metrics(&self) -> ExecutionPlanMetricsSet {
-        ExecutionPlanMetricsSet::new()
+        self.metrics.clone()
     }
 
     fn try_swapping_with_projection(

@@ -18,11 +18,11 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion_datasource::source::{DataSource, DataSourceExec};
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion_physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
-use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion_physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 use datafusion_physical_plan::projection::ProjectionExprs;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{DisplayFormatType, Partitioning, SendableRecordBatchStream};
-use futures::stream::{self, StreamExt};
+use futures::stream::StreamExt;
 use tantivy::aggregation::agg_req::Aggregations;
 use tantivy::collector::TopNComputer;
 use tantivy::query::EnableScoring;
@@ -385,6 +385,7 @@ impl TableProvider for SingleTableProvider {
             pushed_filters: Vec::new(),
             aggregations: self.aggregations.clone(),
             partition_stats,
+            metrics: ExecutionPlanMetricsSet::new(),
         };
 
         Ok(Arc::new(DataSourceExec::new(Arc::new(data_source))))
@@ -421,6 +422,8 @@ pub struct SingleTableDataSource {
     /// Indexed by partition number. `None` means stats are unavailable for
     /// that partition (e.g. remote opener without metadata).
     partition_stats: Vec<Option<PartitionStat>>,
+    /// Shared metrics set for all partitions.
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl SingleTableDataSource {
@@ -444,6 +447,7 @@ impl SingleTableDataSource {
             pushed_filters: self.pushed_filters.clone(),
             aggregations: self.aggregations.clone(),
             partition_stats: self.partition_stats.clone(),
+            metrics: self.metrics.clone(),
         };
         f(&mut new);
         new
@@ -593,6 +597,7 @@ impl DataSource for SingleTableDataSource {
         partition: usize,
         context: Arc<datafusion::execution::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let batch_size = context.session_config().batch_size();
         let opener = self.opener.clone();
         let segment_idx = partition;
@@ -613,13 +618,14 @@ impl DataSource for SingleTableDataSource {
             .map(|q| Arc::from(q.box_clone()));
 
         let schema = self.projected_schema.clone();
-        let stream = stream::once(async move {
-            let index = opener.open().await?;
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(2);
 
-            // Note: warmup and query execution create separate IndexReaders.
-            // For immutable indexes (Quickwit splits), this is safe. For indexes
-            // being actively written to, warmup may warm different segments than
-            // the query sees. This is benign — warmup is best-effort.
+        tokio::spawn(async move {
+            // Async setup: open index + warmup
+            let index = match opener.open().await {
+                Ok(i) => i,
+                Err(e) => { let _ = tx.send(Err(e)).await; return; }
+            };
 
             // Warm up fast fields.
             let ff_names: Vec<&str> = ff_projected_schema
@@ -627,7 +633,10 @@ impl DataSource for SingleTableDataSource {
                 .iter()
                 .map(|f| f.name().as_str())
                 .collect();
-            crate::warmup::warmup_fast_fields_by_name(&index, &ff_names).await?;
+            if let Err(e) = crate::warmup::warmup_fast_fields_by_name(&index, &ff_names).await {
+                let _ = tx.send(Err(e)).await;
+                return;
+            }
 
             // Warm up inverted index for queried text fields.
             let queried_fields: Vec<tantivy::schema::Field> = raw_queries
@@ -635,14 +644,18 @@ impl DataSource for SingleTableDataSource {
                 .filter_map(|(field_name, _)| index.schema().get_field(field_name).ok())
                 .collect();
             if !queried_fields.is_empty() {
-                crate::warmup::warmup_inverted_index(&index, &queried_fields).await?;
+                if let Err(e) = crate::warmup::warmup_inverted_index(&index, &queried_fields).await {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
             }
 
-            // Move sync work (including query building) to blocking thread.
-            tokio::task::spawn_blocking(move || {
+            // Blocking batch generation — send batches as they're produced.
+            let tx_blocking = tx.clone();
+            let result = tokio::task::spawn_blocking(move || {
                 let query =
                     build_combined_query(&index, pre_built_query.as_ref(), &raw_queries)?;
-                generate_single_table_batch(
+                generate_single_table_batch_streaming(
                     &index,
                     segment_idx,
                     query.as_ref(),
@@ -657,19 +670,29 @@ impl DataSource for SingleTableDataSource {
                     topk,
                     &pushed_filters,
                     batch_size,
+                    |batch| tx_blocking.blocking_send(Ok(batch)).is_ok(),
                 )
-            })
-            .await
-            .map_err(|e| {
-                DataFusionError::Internal(format!("spawn_blocking join error: {e}"))
-            })?
-        })
-        .flat_map(|result: Result<Vec<RecordBatch>>| match result {
-            Ok(batches) => stream::iter(batches.into_iter().map(Ok)).left_stream(),
-            Err(e) => stream::once(async move { Err(e) }).right_stream(),
+            }).await;
+
+            match result {
+                Ok(Err(e)) => { let _ = tx.send(Err(e)).await; }
+                Err(e) => { let _ = tx.send(Err(DataFusionError::Internal(format!("spawn_blocking: {e}")))).await; }
+                Ok(Ok(())) => {} // tx drops naturally, closing the channel
+            }
         });
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+        // Convert receiver to stream with metrics tracking.
+        let stream = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|batch| (batch, rx))
+        });
+        let tracked = stream.map(move |result| {
+            if let Ok(ref batch) = result {
+                baseline_metrics.record_output(batch.num_rows());
+            }
+            result
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, tracked)))
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -758,7 +781,7 @@ impl DataSource for SingleTableDataSource {
     }
 
     fn metrics(&self) -> ExecutionPlanMetricsSet {
-        ExecutionPlanMetricsSet::new()
+        self.metrics.clone()
     }
 
     fn try_swapping_with_projection(
@@ -788,10 +811,12 @@ impl DataSource for SingleTableDataSource {
 // Core batch generation
 // ---------------------------------------------------------------------------
 
-/// Generate batches for a single segment, handling FTS queries, fast fields,
-/// scoring, document retrieval, and filter application in one pass.
+/// Generate batches for a single segment, streaming each batch through the
+/// `emit` callback as it is produced. Returns `Ok(())` when all batches have
+/// been emitted. If `emit` returns `false` (receiver dropped), production
+/// stops early.
 #[allow(clippy::too_many_arguments)]
-fn generate_single_table_batch(
+fn generate_single_table_batch_streaming(
     index: &Index,
     segment_idx: usize,
     query: Option<&Arc<dyn tantivy::query::Query>>,
@@ -806,14 +831,15 @@ fn generate_single_table_batch(
     topk: Option<usize>,
     pushed_filters: &[Arc<dyn PhysicalExpr>],
     batch_size: usize,
-) -> Result<Vec<RecordBatch>> {
+    mut emit: impl FnMut(RecordBatch) -> bool,
+) -> Result<()> {
     let reader = index
         .reader()
         .map_err(|e| DataFusionError::Internal(format!("open reader: {e}")))?;
     let searcher = reader.searcher();
     let segment_readers = searcher.segment_readers();
     if segment_idx >= segment_readers.len() {
-        return Ok(vec![RecordBatch::new_empty(projected_schema.clone())]);
+        return Ok(());
     }
     let segment_reader = &segment_readers[segment_idx];
 
@@ -934,7 +960,7 @@ fn generate_single_table_batch(
     };
 
     if doc_ids.is_empty() {
-        return Ok(vec![RecordBatch::new_empty(projected_schema.clone())]);
+        return Ok(());
     }
 
     // Step 2: Process doc_ids in batch_size chunks so that fast-field reads,
@@ -956,7 +982,6 @@ fn generate_single_table_batch(
         None => (0..unified_schema.fields().len()).collect(),
     };
 
-    let mut batches = Vec::new();
     let total = doc_ids.len();
     let mut offset = 0;
 
@@ -1061,17 +1086,15 @@ fn generate_single_table_batch(
         }
 
         if output_batch.num_rows() > 0 {
-            batches.push(output_batch);
+            if !emit(output_batch) {
+                return Ok(()); // receiver dropped, stop producing
+            }
         }
 
         offset = end;
     }
 
-    if batches.is_empty() {
-        batches.push(RecordBatch::new_empty(projected_schema.clone()));
-    }
-
-    Ok(batches)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

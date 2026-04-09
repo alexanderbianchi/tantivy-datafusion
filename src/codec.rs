@@ -480,7 +480,7 @@ impl ExecutionPlan for LazyScanExec {
             });
 
             let target_partitions = output_partitions.max(1);
-            let config = datafusion::prelude::SessionConfig::new()
+            let config = context.session_config().clone()
                 .with_target_partitions(target_partitions);
             let session = datafusion::prelude::SessionContext::new_with_config(config);
 
