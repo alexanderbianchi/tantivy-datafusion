@@ -20,7 +20,7 @@ use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{DisplayFormatType, Partitioning, SendableRecordBatchStream};
 use datafusion_physical_expr::PhysicalExpr;
 use futures::stream::{self, StreamExt};
-use tantivy::aggregation::agg_req::Aggregations;
+use tantivy::aggregation::agg_req::{Aggregation, AggregationVariants, Aggregations};
 
 use datafusion::logical_expr::Expr;
 
@@ -137,8 +137,12 @@ impl DataSource for AggDataSource {
                 crate::warmup::warmup_inverted_index(&index, &queried_fields).await?;
             }
 
-            // Warm fast fields for aggregation (sum, avg, min, max read columnar data)
-            crate::warmup::warmup_fast_fields(&index).await?;
+            // Warm only the fast fields referenced by the aggregation
+            let agg_fields = extract_agg_field_names(&aggs);
+            let agg_field_refs: Vec<&str> = agg_fields.iter().map(|s| s.as_str()).collect();
+            if !agg_field_refs.is_empty() {
+                crate::warmup::warmup_fast_fields_by_name(&index, &agg_field_refs).await?;
+            }
 
             // Move sync work (including query building) to blocking thread.
             tokio::task::spawn_blocking(move || {
@@ -218,5 +222,39 @@ impl DataSource for AggDataSource {
         // No filter pushdown support — aggregation runs on the full query result.
         let results: Vec<PushedDown> = filters.iter().map(|_| PushedDown::No).collect();
         Ok(FilterPushdownPropagation::with_parent_pushdown_result(results))
+    }
+}
+
+/// Extract all field names referenced by an `Aggregations` tree.
+fn extract_agg_field_names(aggs: &Aggregations) -> Vec<String> {
+    let mut fields = Vec::new();
+    for (_name, agg) in aggs.iter() {
+        collect_fields_from_agg(agg, &mut fields);
+    }
+    fields.sort();
+    fields.dedup();
+    fields
+}
+
+fn collect_fields_from_agg(agg: &Aggregation, fields: &mut Vec<String>) {
+    match &agg.agg {
+        AggregationVariants::Terms(t) => fields.push(t.field.clone()),
+        AggregationVariants::Histogram(h) => fields.push(h.field.clone()),
+        AggregationVariants::DateHistogram(dh) => fields.push(dh.field.clone()),
+        AggregationVariants::Range(r) => fields.push(r.field.clone()),
+        AggregationVariants::Average(a) => fields.push(a.field.clone()),
+        AggregationVariants::Sum(a) => fields.push(a.field.clone()),
+        AggregationVariants::Min(a) => fields.push(a.field.clone()),
+        AggregationVariants::Max(a) => fields.push(a.field.clone()),
+        AggregationVariants::Count(a) => fields.push(a.field.clone()),
+        AggregationVariants::Stats(a) => fields.push(a.field.clone()),
+        AggregationVariants::ExtendedStats(a) => fields.push(a.field.clone()),
+        AggregationVariants::Percentiles(a) => fields.push(a.field.clone()),
+        AggregationVariants::Cardinality(a) => fields.push(a.field.clone()),
+        AggregationVariants::Filter(_) | AggregationVariants::TopHits(_) => {}
+    }
+    // Recurse into sub-aggregations
+    for (_sub_name, sub_agg) in agg.sub_aggregation.iter() {
+        collect_fields_from_agg(sub_agg, fields);
     }
 }
