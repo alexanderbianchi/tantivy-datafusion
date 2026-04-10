@@ -347,6 +347,20 @@ async fn test_single_table_with_topk_roundtrip() {
 }
 
 #[tokio::test]
+async fn test_single_table_with_row_limit_roundtrip() {
+    let index = create_test_index();
+    let provider = SingleTableProvider::new(index.clone());
+    let session = SessionContext::new();
+    let state = session.state();
+
+    let exec = provider.scan(&state, None, &[], Some(7)).await.unwrap();
+    assert_eq!(single_table_ds(&exec).row_limit(), Some(7));
+
+    let decoded = roundtrip_exec(exec, index);
+    assert_eq!(single_table_ds(&decoded).row_limit(), Some(7));
+}
+
+#[tokio::test]
 async fn test_multi_split_single_table_roundtrip() {
     let left = create_int_score_index(0);
     let right = create_float_score_index(100);

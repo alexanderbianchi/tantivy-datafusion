@@ -136,6 +136,11 @@ struct TantivyScanProto {
     /// 0 = final aggregate rows, 1 = partial aggregate state rows.
     #[prost(uint32, tag = "21")]
     agg_output_mode: u32,
+    /// Optional planner-supplied per-partition row limit for SINGLE_TABLE scans.
+    #[prost(uint32, tag = "22")]
+    row_limit: u32,
+    #[prost(bool, tag = "23")]
+    has_row_limit: bool,
 }
 
 const FAST_FIELD: u32 = 0;
@@ -336,6 +341,10 @@ impl PhysicalExtensionCodec for TantivyCodec {
                 let ff_filters_json = serialize_fast_field_filters(st.fast_field_filter_exprs())?;
                 let canonical_ff_schema_bytes =
                     encode_schema_bytes(st.canonical_fast_field_schema().as_ref())?;
+                let (row_limit, has_row_limit) = match st.row_limit() {
+                    Some(limit) => (limit as u32, true),
+                    None => (0, false),
+                };
                 return TantivyScanProto {
                     identifier: String::new(),
                     tantivy_schema_json: String::new(),
@@ -357,6 +366,8 @@ impl PhysicalExtensionCodec for TantivyCodec {
                     split_openers,
                     canonical_ff_schema_bytes,
                     agg_output_mode: AGG_OUTPUT_FINAL_MERGED,
+                    row_limit,
+                    has_row_limit,
                 }
                 .encode(buf)
                 .map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
@@ -425,6 +436,8 @@ impl PhysicalExtensionCodec for TantivyCodec {
                     split_openers,
                     canonical_ff_schema_bytes: Vec::new(),
                     agg_output_mode,
+                    row_limit: 0,
+                    has_row_limit: false,
                 }
                 .encode(buf)
                 .map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
@@ -513,6 +526,11 @@ fn decode_single_table(
     } else {
         None
     };
+    let row_limit = if proto.has_row_limit {
+        Some(proto.row_limit as usize)
+    } else {
+        None
+    };
 
     let split_openers = if proto.split_openers.is_empty() {
         let tantivy_schema: tantivy::schema::Schema =
@@ -581,6 +599,7 @@ fn decode_single_table(
         raw_queries,
         fast_field_filter_exprs,
         topk,
+        row_limit,
         partition_map,
     );
     Ok(Arc::new(DataSourceExec::new(Arc::new(ds))))

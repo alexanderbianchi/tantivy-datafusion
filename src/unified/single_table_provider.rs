@@ -1,6 +1,7 @@
 use std::any::Any;
 use std::fmt;
 use std::ops::Bound;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use arrow::array::{Float32Array, RecordBatch, StringBuilder};
@@ -40,7 +41,9 @@ use crate::type_coercion::{
     apply_fast_field_projection, infer_canonical_fast_field_schema, plan_fast_field_projection,
     FastFieldProjectionPlan,
 };
-use crate::util::{build_combined_query, collect_topk_docs, for_each_matching_doc_chunks};
+use crate::util::{
+    build_combined_query, collect_topk_docs, for_each_matching_doc_chunks, MatchingDocChunksConfig,
+};
 
 /// Guard that calls `BaselineMetrics::done()` on drop so elapsed time is
 /// recorded even when the stream is cancelled.
@@ -52,11 +55,15 @@ impl Drop for MetricsGuard {
 }
 
 /// Guard that aborts a spawned task when dropped.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+struct AbortOnDrop {
+    handle: tokio::task::JoinHandle<()>,
+    cancelled: Arc<AtomicBool>,
+}
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        self.0.abort();
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.handle.abort();
     }
 }
 
@@ -523,7 +530,7 @@ impl TableProvider for SingleTableProvider {
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // 1. Extract full_text() calls and fast field filters from pushed-down filters.
         let mut raw_queries: Vec<(String, String)> = Vec::new();
@@ -640,9 +647,14 @@ impl TableProvider for SingleTableProvider {
             pre_built_query: cached_pre_built_query,
             fast_field_filter_exprs,
             topk: None,
+            row_limit: limit,
             partition_map,
             partition_stats,
-            warmup_done: Arc::new(tokio::sync::OnceCell::new()),
+            warmup_done: self
+                .splits
+                .iter()
+                .map(|_| Arc::new(tokio::sync::OnceCell::new()))
+                .collect(),
             metrics: ExecutionPlanMetricsSet::new(),
         };
 
@@ -679,13 +691,14 @@ pub struct SingleTableDataSource {
     /// reconstruction at execution time.
     fast_field_filter_exprs: Vec<Expr>,
     pub(crate) topk: Option<usize>,
+    row_limit: Option<usize>,
     partition_map: Vec<PartitionSpec>,
     /// Per-partition (segment) statistics for partition pruning.
     /// Indexed by partition number. `None` means stats are unavailable for
     /// that partition (e.g. remote opener without metadata).
     partition_stats: Vec<Option<PartitionStat>>,
-    /// Ensures warmup runs at most once across all partitions.
-    warmup_done: Arc<tokio::sync::OnceCell<()>>,
+    /// Ensures warmup runs at most once per split.
+    warmup_done: Vec<Arc<tokio::sync::OnceCell<()>>>,
     /// Shared metrics set for all partitions.
     metrics: ExecutionPlanMetricsSet,
 }
@@ -700,8 +713,13 @@ impl SingleTableDataSource {
         raw_queries: Vec<(String, String)>,
         fast_field_filter_exprs: Vec<Expr>,
         topk: Option<usize>,
+        row_limit: Option<usize>,
         partition_map: Vec<PartitionSpec>,
     ) -> Self {
+        let warmup_done = splits
+            .iter()
+            .map(|_| Arc::new(tokio::sync::OnceCell::new()))
+            .collect();
         Self {
             pre_built_query: if splits.len() == 1 {
                 build_split_fast_field_query(&fast_field_filter_exprs, &splits[0].opener.schema())
@@ -715,9 +733,10 @@ impl SingleTableDataSource {
             raw_queries,
             fast_field_filter_exprs,
             topk,
+            row_limit,
             partition_stats: vec![None; partition_map.len()],
             partition_map,
-            warmup_done: Arc::new(tokio::sync::OnceCell::new()),
+            warmup_done,
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -730,6 +749,7 @@ impl SingleTableDataSource {
             pre_built_query: self.pre_built_query.clone(),
             fast_field_filter_exprs: self.fast_field_filter_exprs.clone(),
             topk: self.topk,
+            row_limit: self.row_limit,
             partition_map: self.partition_map.clone(),
             partition_stats: self.partition_stats.clone(),
             warmup_done: self.warmup_done.clone(),
@@ -768,6 +788,11 @@ impl SingleTableDataSource {
     /// Access the topk limit.
     pub fn topk(&self) -> Option<usize> {
         self.topk
+    }
+
+    /// Access the per-partition scan row limit derived from planner hints.
+    pub fn row_limit(&self) -> Option<usize> {
+        self.row_limit
     }
 
     /// Whether this data source has an active query.
@@ -967,12 +992,19 @@ impl DataSource for SingleTableDataSource {
             None
         };
         let fast_field_filter_exprs = self.fast_field_filter_exprs.clone();
-        let warmup_done = self.warmup_done.clone();
+        let warmup_done = Arc::clone(
+            self.warmup_done
+                .get(partition_spec.split_idx)
+                .ok_or_else(|| DataFusionError::Internal("invalid warmup split index".into()))?,
+        );
         let needs_warmup = opener.needs_warmup();
+        let row_limit = self.row_limit;
+        let cancelled = Arc::new(AtomicBool::new(false));
 
         let schema = self.schema.projected.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(2);
 
+        let cancelled_task = Arc::clone(&cancelled);
         let handle = tokio::spawn(async move {
             // Async setup: open index + warmup
             let index = match opener.open().await {
@@ -985,56 +1017,55 @@ impl DataSource for SingleTableDataSource {
 
             // Skip warmup for local/mmap openers — data already accessible.
             if needs_warmup {
-                // Warmup runs once across all partitions (best-effort). The first
-                // partition to reach this point initialises the OnceCell; others
-                // wait briefly or get the cached result.
-                //
-                // Design note: individual warmup errors are logged but swallowed
-                // inside the closure, so the OnceCell always transitions to the
-                // initialised state. This is intentional — warmup is advisory and
-                // sync reads will still succeed (just slower). Retrying on every
-                // partition would be wasteful and unlikely to help with transient
-                // errors since the same index/segments are involved.
+                let index_ref = index.clone();
+                let ff_schema_ref = ff_projected_schema.clone();
+                let rq_ref = raw_queries.clone();
+                let needs_document_ref = needs_document;
+                if let Err(err) = warmup_done
+                    .get_or_try_init(|| async move {
+                        let ff_names: Vec<&str> = ff_schema_ref
+                            .fields()
+                            .iter()
+                            .filter_map(|field| {
+                                index_ref
+                                    .schema()
+                                    .get_field(field.name())
+                                    .ok()
+                                    .map(|_| field.name().as_str())
+                            })
+                            .collect();
+                        if !ff_names.is_empty() {
+                            crate::warmup::warmup_fast_fields_by_name(&index_ref, &ff_names)
+                                .await?;
+                        }
+
+                        let queried_fields: Vec<tantivy::schema::Field> = rq_ref
+                            .iter()
+                            .filter_map(|(field_name, _)| {
+                                index_ref.schema().get_field(field_name).ok()
+                            })
+                            .collect();
+                        if !queried_fields.is_empty() {
+                            crate::warmup::warmup_inverted_index(&index_ref, &queried_fields)
+                                .await?;
+                        }
+
+                        if needs_document_ref {
+                            crate::warmup::warmup_document_store(&index_ref).await?;
+                        }
+
+                        Ok::<(), DataFusionError>(())
+                    })
+                    .await
                 {
-                    let index_ref = index.clone();
-                    let ff_schema_ref = ff_projected_schema.clone();
-                    let rq_ref = raw_queries.clone();
-                    warmup_done
-                        .get_or_init(|| async move {
-                            let ff_names: Vec<&str> = ff_schema_ref
-                                .fields()
-                                .iter()
-                                .map(|f| f.name().as_str())
-                                .collect();
-                            let _ =
-                                crate::warmup::warmup_fast_fields_by_name(&index_ref, &ff_names)
-                                    .await;
-
-                            let queried_fields: Vec<tantivy::schema::Field> = rq_ref
-                                .iter()
-                                .filter_map(|(field_name, _)| {
-                                    index_ref.schema().get_field(field_name).ok()
-                                })
-                                .collect();
-                            if !queried_fields.is_empty() {
-                                let _ = crate::warmup::warmup_inverted_index(
-                                    &index_ref,
-                                    &queried_fields,
-                                )
-                                .await;
-                            }
-                        })
-                        .await;
-                }
-
-                // Warm up the document store separately when needed.
-                if needs_document {
-                    crate::warmup::warmup_document_store(&index).await.ok();
+                    let _ = tx.send(Err(err)).await;
+                    return;
                 }
             } // end if needs_warmup
 
             // Blocking batch generation — send batches as they're produced.
             let tx_blocking = tx.clone();
+            let cancelled_blocking = Arc::clone(&cancelled_task);
             let result = tokio::task::spawn_blocking(move || {
                 let split_fast_field_query = match pre_built_query {
                     Some(query) => Some(query),
@@ -1058,7 +1089,9 @@ impl DataSource for SingleTableDataSource {
                     needs_score,
                     needs_document,
                     topk,
+                    row_limit,
                     query,
+                    cancelled: cancelled_blocking,
                 };
                 generate_single_table_batch_streaming(&cfg, |batch| {
                     tx_blocking.blocking_send(Ok(batch)).is_ok()
@@ -1080,7 +1113,7 @@ impl DataSource for SingleTableDataSource {
                 Ok(Ok(())) => {} // tx drops naturally, closing the channel
             }
         });
-        let guard = AbortOnDrop(handle);
+        let guard = AbortOnDrop { handle, cancelled };
 
         // Convert receiver to stream with metrics tracking.
         // The guard is owned by the stream — when the stream is dropped, the
@@ -1359,7 +1392,9 @@ struct ScanConfig {
     needs_score: bool,
     needs_document: bool,
     topk: Option<usize>,
+    row_limit: Option<usize>,
     query: Option<Arc<dyn tantivy::query::Query>>,
+    cancelled: Arc<AtomicBool>,
 }
 
 /// Thin orchestrator: query execution is delegated to the streaming helpers in
@@ -1417,40 +1452,65 @@ fn generate_single_table_batch_streaming(
         store_reader,
         dict_cache,
     };
+    let mut remaining = cfg.row_limit.unwrap_or(usize::MAX);
 
     if let Some(topk) = cfg.topk {
-        let (doc_ids, scores) =
-            collect_topk_docs(segment_reader, &searcher, cfg.query.as_ref(), topk)?;
+        let effective_topk = remaining.min(topk);
+        if effective_topk == 0 {
+            return Ok(());
+        }
+        let (doc_ids, scores) = collect_topk_docs(
+            segment_reader,
+            &searcher,
+            cfg.query.as_ref(),
+            effective_topk,
+        )?;
         if doc_ids.is_empty() {
             return Ok(());
         }
 
         let total = doc_ids.len();
         let mut offset = 0;
-        while offset < total {
-            let end = (offset + batch_size).min(total);
+        while offset < total && remaining > 0 {
+            if cfg.cancelled.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let end = (offset + batch_size).min(total).min(offset + remaining);
             let batch = builder.build(&doc_ids[offset..end], Some(&scores[offset..end]))?;
             if batch.num_rows() > 0 && !emit(batch) {
                 return Ok(());
             }
+            remaining -= end - offset;
             offset = end;
         }
         return Ok(());
     }
 
     for_each_matching_doc_chunks(
-        segment_reader,
-        &searcher,
-        cfg.query.as_ref(),
-        &index.schema(),
-        needs_score,
-        batch_size,
+        MatchingDocChunksConfig {
+            segment_reader,
+            searcher: &searcher,
+            query: cfg.query.as_ref(),
+            index_schema: &index.schema(),
+            needs_score,
+            batch_size,
+            cancelled: cfg.cancelled.as_ref(),
+        },
         |chunk_ids, chunk_scores| {
-            let batch = builder.build(chunk_ids, chunk_scores)?;
+            if remaining == 0 || cfg.cancelled.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
+
+            let take = remaining.min(chunk_ids.len());
+            let batch = builder.build(
+                &chunk_ids[..take],
+                chunk_scores.map(|scores| &scores[..take]),
+            )?;
+            remaining -= take;
             if batch.num_rows() > 0 && !emit(batch) {
                 return Ok(false);
             }
-            Ok(true)
+            Ok(remaining > 0)
         },
     )
 }

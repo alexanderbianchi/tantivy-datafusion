@@ -71,9 +71,11 @@ pub async fn warmup_fast_fields_by_name(index: &Index, field_names: &[&str]) -> 
                 Err(_) => continue, // field not present or not fast
             };
             for handle in handles {
-                if let Err(e) = handle.file_slice().read_bytes_async().await {
-                    eprintln!("warmup: failed to pre-load fast field '{name}': {e}");
-                }
+                handle.file_slice().read_bytes_async().await.map_err(|e| {
+                    DataFusionError::Internal(format!(
+                        "warmup: failed to pre-load fast field '{name}': {e}"
+                    ))
+                })?;
             }
         }
     }
@@ -103,12 +105,12 @@ pub async fn warmup_fast_fields(index: &Index) -> Result<()> {
                 Err(_) => continue, // field not present in this segment
             };
             for handle in handles {
-                if let Err(e) = handle.file_slice().read_bytes_async().await {
-                    eprintln!(
+                handle.file_slice().read_bytes_async().await.map_err(|e| {
+                    DataFusionError::Internal(format!(
                         "warmup: failed to pre-load fast field '{}': {e}",
                         entry.name()
-                    );
-                }
+                    ))
+                })?;
             }
         }
     }
@@ -139,12 +141,17 @@ pub async fn warmup_document_store(index: &Index) -> Result<()> {
 
         for segment_reader in searcher.segment_readers() {
             // Opening the store reader reads the footer/index into cache.
-            if let Ok(store_reader) = segment_reader.get_store_reader(100) {
-                // Reading doc 0 triggers loading the first block, which
-                // warms the file handle.
-                if segment_reader.max_doc() > 0 {
-                    let _ = store_reader.get::<tantivy::TantivyDocument>(0);
-                }
+            let store_reader = segment_reader
+                .get_store_reader(100)
+                .map_err(|e| DataFusionError::Internal(format!("warmup doc store reader: {e}")))?;
+            // Reading doc 0 triggers loading the first block, which warms the
+            // file handle.
+            if segment_reader.max_doc() > 0 {
+                store_reader
+                    .get::<tantivy::TantivyDocument>(0)
+                    .map_err(|e| {
+                        DataFusionError::Internal(format!("warmup doc store read: {e}"))
+                    })?;
             }
         }
 
