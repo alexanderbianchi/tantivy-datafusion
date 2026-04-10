@@ -19,12 +19,15 @@ use datafusion_physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet
 use datafusion_physical_plan::projection::ProjectionExprs;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{DisplayFormatType, Partitioning, SendableRecordBatchStream};
+use futures::future::try_join_all;
 use futures::stream::{self, StreamExt};
 use tantivy::aggregation::agg_req::Aggregations;
+use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
 
 use datafusion::logical_expr::Expr;
 
 use crate::index_opener::IndexOpener;
+use crate::unified::single_table_provider::build_split_fast_field_query;
 use crate::util::build_combined_query;
 
 /// Guard that calls `BaselineMetrics::done()` on drop so elapsed time is
@@ -38,7 +41,7 @@ impl Drop for MetricsGuard {
 
 #[derive(Debug)]
 pub struct AggDataSource {
-    opener: Arc<dyn IndexOpener>,
+    split_openers: Vec<Arc<dyn IndexOpener>>,
     /// Tantivy aggregation specification (terms + metric sub-aggs).
     aggregations: Arc<Aggregations>,
     /// Output schema matching the AggregateExec this replaces.
@@ -50,8 +53,17 @@ pub struct AggDataSource {
     /// Source logical `Expr`s that produced `pre_built_query`. Stored for
     /// codec serialization so workers can re-derive the tantivy query.
     fast_field_filter_exprs: Vec<Expr>,
+    /// Whether this source emits final aggregate rows or partial aggregate
+    /// state rows for a downstream `AggregateExec(Final*)`.
+    output_mode: AggOutputMode,
     /// Shared metrics set for all partitions.
     metrics: ExecutionPlanMetricsSet,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggOutputMode {
+    FinalMerged,
+    PartialStates,
 }
 
 impl AggDataSource {
@@ -63,20 +75,73 @@ impl AggDataSource {
         pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
         fast_field_filter_exprs: Vec<Expr>,
     ) -> Self {
-        Self {
-            opener,
+        Self::from_split_openers(
+            vec![opener],
             aggregations,
             output_schema,
             raw_queries,
             pre_built_query,
             fast_field_filter_exprs,
+        )
+    }
+
+    pub fn from_split_openers(
+        split_openers: Vec<Arc<dyn IndexOpener>>,
+        aggregations: Arc<Aggregations>,
+        output_schema: SchemaRef,
+        raw_queries: Vec<(String, String)>,
+        pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
+        fast_field_filter_exprs: Vec<Expr>,
+    ) -> Self {
+        Self {
+            split_openers,
+            aggregations,
+            output_schema,
+            raw_queries,
+            pre_built_query,
+            fast_field_filter_exprs,
+            output_mode: AggOutputMode::FinalMerged,
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 
-    /// Access the index opener.
+    pub fn from_split_openers_partial_states(
+        split_openers: Vec<Arc<dyn IndexOpener>>,
+        aggregations: Arc<Aggregations>,
+        output_schema: SchemaRef,
+        raw_queries: Vec<(String, String)>,
+        pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
+        fast_field_filter_exprs: Vec<Expr>,
+    ) -> Self {
+        Self {
+            split_openers,
+            aggregations,
+            output_schema,
+            raw_queries,
+            pre_built_query,
+            fast_field_filter_exprs,
+            output_mode: AggOutputMode::PartialStates,
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+
+    /// Access the sole index opener.
     pub fn opener(&self) -> &Arc<dyn IndexOpener> {
-        &self.opener
+        self.single_split_opener()
+            .expect("AggDataSource spans multiple splits; use split_openers() instead")
+    }
+
+    /// Access all split openers.
+    pub fn split_openers(&self) -> &[Arc<dyn IndexOpener>] {
+        &self.split_openers
+    }
+
+    /// Access the sole opener when this aggregation spans a single split.
+    pub fn single_split_opener(&self) -> Option<&Arc<dyn IndexOpener>> {
+        match self.split_openers.as_slice() {
+            [opener] => Some(opener),
+            _ => None,
+        }
     }
 
     /// Access the tantivy aggregation specification.
@@ -99,6 +164,15 @@ impl AggDataSource {
     pub fn fast_field_filter_exprs(&self) -> &[Expr] {
         &self.fast_field_filter_exprs
     }
+
+    /// Access the pre-built tantivy query reconstructed from fast field filters.
+    pub fn pre_built_query(&self) -> Option<&Arc<dyn tantivy::query::Query>> {
+        self.pre_built_query.as_ref()
+    }
+
+    pub fn output_mode(&self) -> AggOutputMode {
+        self.output_mode
+    }
 }
 
 impl DataSource for AggDataSource {
@@ -108,62 +182,97 @@ impl DataSource for AggDataSource {
         _context: Arc<datafusion::execution::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let metrics_guard = MetricsGuard(BaselineMetrics::new(&self.metrics, partition));
-        let opener = self.opener.clone();
+        let split_openers = self.split_openers.clone();
         let raw_queries = self.raw_queries.clone();
-        let pre_built_query = self
-            .pre_built_query
-            .as_ref()
-            .map(|q| Arc::from(q.box_clone()));
+        let pre_built_query = if self.split_openers.len() == 1 {
+            self.pre_built_query
+                .as_ref()
+                .map(|q| Arc::from(q.box_clone()))
+        } else {
+            None
+        };
+        let fast_field_filter_exprs = self.fast_field_filter_exprs.clone();
         let aggs = self.aggregations.clone();
         let schema = self.output_schema.clone();
 
-        // Only partition 0 runs the aggregation (single output partition)
-        if partition != 0 {
-            return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                schema,
-                stream::empty(),
-            )));
-        }
-
-        let stream = stream::once(async move {
-            let index = opener.open().await?;
-
-            // Warmup only for storage-backed openers (S3/GCS).
-            // For local/mmap openers, data is already accessible — warmup
-            // would just create unnecessary IndexReader instances.
-            if opener.needs_warmup() {
-                let queried_fields: Vec<tantivy::schema::Field> = raw_queries
-                    .iter()
-                    .filter_map(|(field_name, _)| index.schema().get_field(field_name).ok())
-                    .collect();
-                if !queried_fields.is_empty() {
-                    crate::warmup::warmup_inverted_index(&index, &queried_fields).await?;
+        let stream = match self.output_mode {
+            AggOutputMode::FinalMerged => {
+                if partition != 0 {
+                    return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                        schema,
+                        stream::empty(),
+                    )));
                 }
-                let agg_fields = extract_agg_field_names(&aggs);
-                let agg_field_refs: Vec<&str> = agg_fields.iter().map(|s| s.as_str()).collect();
-                if !agg_field_refs.is_empty() {
-                    crate::warmup::warmup_fast_fields_by_name(&index, &agg_field_refs).await?;
-                }
+
+                stream::once(async move {
+                    if split_openers.len() == 1 {
+                        return execute_single_split_agg_batch(
+                            split_openers.into_iter().next().unwrap(),
+                            aggs,
+                            schema,
+                            raw_queries,
+                            pre_built_query,
+                            fast_field_filter_exprs,
+                        )
+                        .await;
+                    }
+
+                    let partials = try_join_all(split_openers.into_iter().map(|opener| {
+                        let raw_queries = raw_queries.clone();
+                        let pre_built_query = pre_built_query.clone();
+                        let fast_field_filter_exprs = fast_field_filter_exprs.clone();
+                        let aggs = aggs.clone();
+                        async move {
+                            execute_split_intermediate_agg(
+                                opener,
+                                aggs,
+                                raw_queries,
+                                pre_built_query,
+                                fast_field_filter_exprs,
+                            )
+                            .await
+                        }
+                    }))
+                    .await?;
+
+                    tokio::task::spawn_blocking(move || {
+                        let results = crate::unified::agg_exec::merge_intermediate_agg_results(
+                            partials, &aggs,
+                        )?;
+                        crate::unified::agg_exec::agg_results_to_output_batch(
+                            &results, &aggs, &schema,
+                        )
+                    })
+                    .await
+                    .map_err(|e| {
+                        DataFusionError::Internal(format!("spawn_blocking join error: {e}"))
+                    })?
+                })
+                .boxed()
             }
+            AggOutputMode::PartialStates => {
+                if partition >= split_openers.len() {
+                    return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                        schema,
+                        stream::empty(),
+                    )));
+                }
 
-            // Move sync work (including reader construction and query building)
-            // to a blocking thread so we never block the async executor.
-            tokio::task::spawn_blocking(move || {
-                let reader = index
-                    .reader()
-                    .map_err(|e| DataFusionError::Internal(format!("open reader: {e}")))?;
-                let query = build_combined_query(&index, pre_built_query.as_ref(), &raw_queries)?;
-                crate::unified::agg_exec::execute_tantivy_agg_with_reader(
-                    &index,
-                    &aggs,
-                    query.as_ref(),
-                    &schema,
-                    Some(&reader),
-                )
-            })
-            .await
-            .map_err(|e| DataFusionError::Internal(format!("spawn_blocking join error: {e}")))?
-        })
+                let opener = Arc::clone(&split_openers[partition]);
+                stream::once(async move {
+                    execute_single_split_partial_state_batch(
+                        opener,
+                        aggs,
+                        schema,
+                        raw_queries,
+                        pre_built_query,
+                        fast_field_filter_exprs,
+                    )
+                    .await
+                })
+                .boxed()
+            }
+        }
         .map(move |result| {
             if let Ok(ref batch) = result {
                 metrics_guard.0.record_output(batch.num_rows());
@@ -184,14 +293,22 @@ impl DataSource for AggDataSource {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "AggDataSource(aggs={}, query={})",
+            "AggDataSource(mode={:?}, aggs={}, splits={}, query={})",
+            self.output_mode,
             self.aggregations.len(),
-            !self.raw_queries.is_empty() || self.pre_built_query.is_some(),
+            self.split_openers.len(),
+            !self.raw_queries.is_empty()
+                || self.pre_built_query.is_some()
+                || !self.fast_field_filter_exprs.is_empty(),
         )
     }
 
     fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(1)
+        let partitions = match self.output_mode {
+            AggOutputMode::FinalMerged => 1,
+            AggOutputMode::PartialStates => self.split_openers.len().max(1),
+        };
+        Partitioning::UnknownPartitioning(partitions)
     }
 
     fn eq_properties(&self) -> EquivalenceProperties {
@@ -232,6 +349,154 @@ impl DataSource for AggDataSource {
             results,
         ))
     }
+}
+
+async fn execute_split_intermediate_agg(
+    opener: Arc<dyn IndexOpener>,
+    aggs: Arc<Aggregations>,
+    raw_queries: Vec<(String, String)>,
+    pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
+    fast_field_filter_exprs: Vec<Expr>,
+) -> Result<IntermediateAggregationResults> {
+    let index = opener.open().await?;
+
+    if opener.needs_warmup() {
+        let queried_fields: Vec<tantivy::schema::Field> = raw_queries
+            .iter()
+            .filter_map(|(field_name, _)| index.schema().get_field(field_name).ok())
+            .collect();
+        if !queried_fields.is_empty() {
+            crate::warmup::warmup_inverted_index(&index, &queried_fields).await?;
+        }
+        let agg_fields = extract_agg_field_names(&aggs);
+        let agg_field_refs: Vec<&str> = agg_fields
+            .iter()
+            .filter(|field_name| index.schema().get_field(field_name).is_ok())
+            .map(|field_name| field_name.as_str())
+            .collect();
+        if !agg_field_refs.is_empty() {
+            crate::warmup::warmup_fast_fields_by_name(&index, &agg_field_refs).await?;
+        }
+    }
+
+    tokio::task::spawn_blocking(move || {
+        let reader = index
+            .reader()
+            .map_err(|e| DataFusionError::Internal(format!("open reader: {e}")))?;
+        let split_fast_field_query = match pre_built_query {
+            Some(query) => Some(query),
+            None => build_split_fast_field_query(&fast_field_filter_exprs, &index.schema())?,
+        };
+        let query = build_combined_query(&index, split_fast_field_query.as_ref(), &raw_queries)?;
+        crate::unified::agg_exec::execute_tantivy_intermediate_agg_with_reader(
+            &index,
+            &aggs,
+            query.as_ref(),
+            Some(&reader),
+        )
+    })
+    .await
+    .map_err(|e| DataFusionError::Internal(format!("spawn_blocking join error: {e}")))?
+}
+
+async fn execute_single_split_agg_batch(
+    opener: Arc<dyn IndexOpener>,
+    aggs: Arc<Aggregations>,
+    schema: SchemaRef,
+    raw_queries: Vec<(String, String)>,
+    pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
+    fast_field_filter_exprs: Vec<Expr>,
+) -> Result<arrow::record_batch::RecordBatch> {
+    let index = opener.open().await?;
+
+    if opener.needs_warmup() {
+        let queried_fields: Vec<tantivy::schema::Field> = raw_queries
+            .iter()
+            .filter_map(|(field_name, _)| index.schema().get_field(field_name).ok())
+            .collect();
+        if !queried_fields.is_empty() {
+            crate::warmup::warmup_inverted_index(&index, &queried_fields).await?;
+        }
+        let agg_fields = extract_agg_field_names(&aggs);
+        let agg_field_refs: Vec<&str> = agg_fields
+            .iter()
+            .filter(|field_name| index.schema().get_field(field_name).is_ok())
+            .map(|field_name| field_name.as_str())
+            .collect();
+        if !agg_field_refs.is_empty() {
+            crate::warmup::warmup_fast_fields_by_name(&index, &agg_field_refs).await?;
+        }
+    }
+
+    tokio::task::spawn_blocking(move || {
+        let reader = index
+            .reader()
+            .map_err(|e| DataFusionError::Internal(format!("open reader: {e}")))?;
+        let split_fast_field_query = match pre_built_query {
+            Some(query) => Some(query),
+            None => build_split_fast_field_query(&fast_field_filter_exprs, &index.schema())?,
+        };
+        let query = build_combined_query(&index, split_fast_field_query.as_ref(), &raw_queries)?;
+        crate::unified::agg_exec::execute_tantivy_agg_with_reader(
+            &index,
+            &aggs,
+            query.as_ref(),
+            &schema,
+            Some(&reader),
+        )
+    })
+    .await
+    .map_err(|e| DataFusionError::Internal(format!("spawn_blocking join error: {e}")))?
+}
+
+async fn execute_single_split_partial_state_batch(
+    opener: Arc<dyn IndexOpener>,
+    aggs: Arc<Aggregations>,
+    schema: SchemaRef,
+    raw_queries: Vec<(String, String)>,
+    pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
+    fast_field_filter_exprs: Vec<Expr>,
+) -> Result<arrow::record_batch::RecordBatch> {
+    let index = opener.open().await?;
+
+    if opener.needs_warmup() {
+        let queried_fields: Vec<tantivy::schema::Field> = raw_queries
+            .iter()
+            .filter_map(|(field_name, _)| index.schema().get_field(field_name).ok())
+            .collect();
+        if !queried_fields.is_empty() {
+            crate::warmup::warmup_inverted_index(&index, &queried_fields).await?;
+        }
+        let agg_fields = extract_agg_field_names(&aggs);
+        let agg_field_refs: Vec<&str> = agg_fields
+            .iter()
+            .filter(|field_name| index.schema().get_field(field_name).is_ok())
+            .map(|field_name| field_name.as_str())
+            .collect();
+        if !agg_field_refs.is_empty() {
+            crate::warmup::warmup_fast_fields_by_name(&index, &agg_field_refs).await?;
+        }
+    }
+
+    tokio::task::spawn_blocking(move || {
+        let reader = index
+            .reader()
+            .map_err(|e| DataFusionError::Internal(format!("open reader: {e}")))?;
+        let split_fast_field_query = match pre_built_query {
+            Some(query) => Some(query),
+            None => build_split_fast_field_query(&fast_field_filter_exprs, &index.schema())?,
+        };
+        let query = build_combined_query(&index, split_fast_field_query.as_ref(), &raw_queries)?;
+        let results = crate::unified::agg_exec::execute_tantivy_agg_results_with_reader(
+            &index,
+            &aggs,
+            query.as_ref(),
+            Some(&reader),
+        )?;
+        crate::unified::agg_exec::agg_results_to_partial_state_batch(&results, &aggs, &schema)
+    })
+    .await
+    .map_err(|e| DataFusionError::Internal(format!("spawn_blocking join error: {e}")))?
 }
 
 /// Extract all field names referenced by an `Aggregations` tree.

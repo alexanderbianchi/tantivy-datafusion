@@ -135,6 +135,48 @@ fn setup_ctx(index: Index) -> SessionContext {
     ctx
 }
 
+fn setup_multi_split_ctx(indices: Vec<Index>) -> SessionContext {
+    let provider = SingleTableProvider::from_splits(
+        indices
+            .into_iter()
+            .map(|index| {
+                Arc::new(tantivy_datafusion::DirectIndexOpener::new(index))
+                    as Arc<dyn tantivy_datafusion::IndexOpener>
+            })
+            .collect(),
+    )
+    .unwrap();
+    let config = SessionConfig::new().with_target_partitions(4);
+    let state = SessionStateBuilder::new()
+        .with_config(config)
+        .with_default_features()
+        .with_physical_optimizer_rule(Arc::new(AggPushdown::new()))
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+    ctx.register_udf(full_text_udf());
+    ctx.register_table("t", Arc::new(provider)).unwrap();
+    ctx
+}
+
+fn create_test_index_without_category() -> Index {
+    let mut builder = SchemaBuilder::new();
+    let id_field = builder.add_u64_field("id", FAST | STORED);
+    let price_field = builder.add_f64_field("price", FAST);
+    let schema = builder.build();
+
+    let index = Index::create_in_ram(schema);
+    let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
+
+    for (id, price) in [(10u64, 1.0f64), (11, 2.0)] {
+        let mut doc = TantivyDocument::default();
+        doc.add_u64(id_field, id);
+        doc.add_f64(price_field, price);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().unwrap();
+    index
+}
+
 // =========================================================================
 // Aggregation pushdown tests
 // =========================================================================
@@ -280,6 +322,161 @@ async fn test_agg_pushdown_with_fts_filter() {
     assert_eq!(batch.num_rows(), 1, "Expected 1 category group");
     let results = collect_category_counts(&batch);
     assert_eq!(results[0], ("electronics".to_string(), 2));
+}
+
+#[tokio::test]
+async fn test_multi_split_agg_pushdown_group_by_count() {
+    let ctx = setup_multi_split_ctx(vec![create_test_index(), create_test_index()]);
+
+    let df = ctx
+        .sql("SELECT category, COUNT(*) as cnt FROM t GROUP BY category")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let batch = collect_batches(&batches);
+
+    assert_eq!(batch.num_rows(), 3, "Expected 3 category groups");
+    let results = collect_category_counts(&batch);
+    assert_eq!(results[0], ("books".to_string(), 4));
+    assert_eq!(results[1], ("clothing".to_string(), 2));
+    assert_eq!(results[2], ("electronics".to_string(), 4));
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT category, COUNT(*) as cnt FROM t GROUP BY category")
+        .await
+        .unwrap();
+    let explain_batches = explain.collect().await.unwrap();
+    let plan = plan_to_string(&explain_batches);
+    assert!(
+        plan.contains("AggDataSource"),
+        "Multi-split group by count should push down to AggDataSource.\n\nPlan:\n{plan}"
+    );
+    assert!(
+        plan.contains("AggregateExec"),
+        "Multi-split agg pushdown should preserve a downstream AggregateExec for re-aggregation.\n\nPlan:\n{plan}"
+    );
+}
+
+#[tokio::test]
+async fn test_multi_split_agg_pushdown_group_by_sum_avg() {
+    let ctx = setup_multi_split_ctx(vec![create_test_index(), create_test_index()]);
+
+    let df = ctx
+        .sql("SELECT category, SUM(price) as s, AVG(price) as a FROM t GROUP BY category")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let batch = collect_batches(&batches);
+
+    assert_eq!(batch.num_rows(), 3, "Expected 3 category groups");
+
+    let cat_col = batch.column(0);
+    let sum_col = batch.column(1).as_primitive::<Float64Type>();
+    let avg_col = batch.column(2).as_primitive::<Float64Type>();
+
+    let mut results: Vec<(String, f64, f64)> = (0..batch.num_rows())
+        .map(|i| {
+            let cat = if let Some(dict) = cat_col
+                .as_any()
+                .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::Int32Type>>()
+            {
+                let values = dict.values().as_string::<i32>();
+                values.value(dict.keys().value(i) as usize).to_string()
+            } else {
+                cat_col.as_string::<i32>().value(i).to_string()
+            };
+            (cat, sum_col.value(i), avg_col.value(i))
+        })
+        .collect();
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let eps = 1e-10;
+    assert_eq!(results[0].0, "books");
+    assert!(
+        (results[0].1 - 14.0).abs() < eps,
+        "books SUM: {}",
+        results[0].1
+    );
+    assert!(
+        (results[0].2 - 3.5).abs() < eps,
+        "books AVG: {}",
+        results[0].2
+    );
+
+    assert_eq!(results[1].0, "clothing");
+    assert!(
+        (results[1].1 - 11.0).abs() < eps,
+        "clothing SUM: {}",
+        results[1].1
+    );
+    assert!(
+        (results[1].2 - 5.5).abs() < eps,
+        "clothing AVG: {}",
+        results[1].2
+    );
+
+    assert_eq!(results[2].0, "electronics");
+    assert!(
+        (results[2].1 - 10.0).abs() < eps,
+        "electronics SUM: {}",
+        results[2].1
+    );
+    assert!(
+        (results[2].2 - 2.5).abs() < eps,
+        "electronics AVG: {}",
+        results[2].2
+    );
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT category, SUM(price) as s, AVG(price) as a FROM t GROUP BY category")
+        .await
+        .unwrap();
+    let explain_batches = explain.collect().await.unwrap();
+    let plan = plan_to_string(&explain_batches);
+    assert!(
+        plan.contains("AggDataSource"),
+        "Multi-split sum/avg should push down partial states to AggDataSource.\n\nPlan:\n{plan}"
+    );
+    assert!(
+        plan.contains("AggregateExec"),
+        "Multi-split sum/avg should preserve a downstream AggregateExec.\n\nPlan:\n{plan}"
+    );
+}
+
+#[tokio::test]
+async fn test_multi_split_agg_pushdown_skips_missing_group_field() {
+    let ctx = setup_multi_split_ctx(vec![
+        create_test_index(),
+        create_test_index_without_category(),
+    ]);
+
+    let df = ctx
+        .sql("SELECT category, COUNT(*) as cnt FROM t GROUP BY category")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let batch = collect_batches(&batches);
+
+    assert_eq!(
+        batch.num_rows(),
+        4,
+        "Expected null group plus 3 category groups"
+    );
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT category, COUNT(*) as cnt FROM t GROUP BY category")
+        .await
+        .unwrap();
+    let explain_batches = explain.collect().await.unwrap();
+    let plan = plan_to_string(&explain_batches);
+    assert!(
+        !plan.contains("AggDataSource"),
+        "Schema-drifted group field must not be pushed down.\n\nPlan:\n{plan}"
+    );
+    assert!(
+        plan.contains("AggregateExec"),
+        "Schema-drifted group field should stay on AggregateExec.\n\nPlan:\n{plan}"
+    );
 }
 
 // =========================================================================
@@ -492,5 +689,83 @@ async fn test_plan_uses_agg_data_source_for_group_by_count() {
     assert!(
         !plan.contains("AggregateExec"),
         "Plan should not leave DataFusion AggregateExec nodes after pushdown.\n\nPlan:\n{plan}"
+    );
+}
+
+#[tokio::test]
+async fn test_agg_pushdown_skips_filter_aggregates() {
+    let ctx = setup_ctx(create_test_index());
+
+    let df = ctx
+        .sql(
+            "SELECT category, COUNT(*) FILTER (WHERE active = true) AS cnt \
+             FROM t GROUP BY category",
+        )
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let batch = collect_batches(&batches);
+    let results = collect_category_counts(&batch);
+
+    assert_eq!(results[0], ("books".to_string(), 0));
+    assert_eq!(results[1], ("clothing".to_string(), 1));
+    assert_eq!(results[2], ("electronics".to_string(), 2));
+
+    let explain = ctx
+        .sql(
+            "EXPLAIN SELECT category, COUNT(*) FILTER (WHERE active = true) AS cnt \
+             FROM t GROUP BY category",
+        )
+        .await
+        .unwrap();
+    let explain_batches = explain.collect().await.unwrap();
+    let plan = plan_to_string(&explain_batches);
+
+    assert!(
+        !plan.contains("AggDataSource"),
+        "FILTER aggregates must not be pushed down.\n\nPlan:\n{plan}"
+    );
+    assert!(
+        plan.contains("AggregateExec"),
+        "FILTER aggregates should stay on DataFusion AggregateExec.\n\nPlan:\n{plan}"
+    );
+}
+
+#[tokio::test]
+async fn test_agg_pushdown_skips_distinct_aggregates() {
+    let ctx = setup_ctx(create_test_index());
+
+    let df = ctx
+        .sql(
+            "SELECT category, COUNT(DISTINCT active) AS cnt \
+             FROM t GROUP BY category",
+        )
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let batch = collect_batches(&batches);
+    let results = collect_category_counts(&batch);
+
+    assert_eq!(results[0], ("books".to_string(), 1));
+    assert_eq!(results[1], ("clothing".to_string(), 1));
+    assert_eq!(results[2], ("electronics".to_string(), 1));
+
+    let explain = ctx
+        .sql(
+            "EXPLAIN SELECT category, COUNT(DISTINCT active) AS cnt \
+             FROM t GROUP BY category",
+        )
+        .await
+        .unwrap();
+    let explain_batches = explain.collect().await.unwrap();
+    let plan = plan_to_string(&explain_batches);
+
+    assert!(
+        !plan.contains("AggDataSource"),
+        "DISTINCT aggregates must not be pushed down.\n\nPlan:\n{plan}"
+    );
+    assert!(
+        plan.contains("AggregateExec"),
+        "DISTINCT aggregates should stay on DataFusion AggregateExec.\n\nPlan:\n{plan}"
     );
 }

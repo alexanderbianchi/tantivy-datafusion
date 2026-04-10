@@ -78,8 +78,8 @@ pub fn read_segment_fast_fields_to_batch(
 ) -> Result<RecordBatch> {
     let fast_fields = segment_reader.fast_fields();
 
-    let docs: Vec<u32> = match doc_ids {
-        Some(ids) => ids.to_vec(),
+    let docs_storage: Option<Vec<u32>> = match doc_ids {
+        Some(_) => None,
         None => {
             let alive_bitset = segment_reader.alive_bitset();
             let (start, end) = match doc_id_range {
@@ -88,11 +88,15 @@ pub fn read_segment_fast_fields_to_batch(
             };
             let iter = (start..end)
                 .filter(|&doc_id| alive_bitset.map(|bs| bs.is_alive(doc_id)).unwrap_or(true));
-            match limit {
+            Some(match limit {
                 Some(lim) => iter.take(lim).collect(),
                 None => iter.collect(),
-            }
+            })
         }
+    };
+    let docs: &[u32] = match &docs_storage {
+        Some(docs) => docs.as_slice(),
+        None => doc_ids.unwrap_or_default(),
     };
 
     let num_docs = docs.len();
@@ -117,7 +121,7 @@ pub fn read_segment_fast_fields_to_batch(
             DataType::UInt64 => match fast_fields.u64(name) {
                 Ok(col) => {
                     let mut builder = UInt64Builder::with_capacity(num_docs);
-                    for &doc_id in &docs {
+                    for &doc_id in docs {
                         match col.first(doc_id) {
                             Some(v) => builder.append_value(v),
                             None => builder.append_null(),
@@ -130,7 +134,7 @@ pub fn read_segment_fast_fields_to_batch(
             DataType::Int64 => match fast_fields.i64(name) {
                 Ok(col) => {
                     let mut builder = Int64Builder::with_capacity(num_docs);
-                    for &doc_id in &docs {
+                    for &doc_id in docs {
                         match col.first(doc_id) {
                             Some(v) => builder.append_value(v),
                             None => builder.append_null(),
@@ -143,7 +147,7 @@ pub fn read_segment_fast_fields_to_batch(
             DataType::Float64 => match fast_fields.f64(name) {
                 Ok(col) => {
                     let mut builder = Float64Builder::with_capacity(num_docs);
-                    for &doc_id in &docs {
+                    for &doc_id in docs {
                         match col.first(doc_id) {
                             Some(v) => builder.append_value(v),
                             None => builder.append_null(),
@@ -156,7 +160,7 @@ pub fn read_segment_fast_fields_to_batch(
             DataType::Boolean => match fast_fields.bool(name) {
                 Ok(col) => {
                     let mut builder = BooleanBuilder::with_capacity(num_docs);
-                    for &doc_id in &docs {
+                    for &doc_id in docs {
                         match col.first(doc_id) {
                             Some(v) => builder.append_value(v),
                             None => builder.append_null(),
@@ -169,7 +173,7 @@ pub fn read_segment_fast_fields_to_batch(
             DataType::Timestamp(TimeUnit::Microsecond, None) => match fast_fields.date(name) {
                 Ok(col) => {
                     let mut builder = TimestampMicrosecondBuilder::with_capacity(num_docs);
-                    for &doc_id in &docs {
+                    for &doc_id in docs {
                         match col.first(doc_id) {
                             Some(dt) => builder.append_value(dt.into_timestamp_micros()),
                             None => builder.append_null(),
@@ -196,7 +200,7 @@ pub fn read_segment_fast_fields_to_batch(
                 if let Some(values) = dict_cache.and_then(|c| c.get(name)) {
                     let ords_col = str_col.ords();
                     let mut ord_buf: Vec<Option<u64>> = vec![None; num_docs];
-                    ords_col.first_vals(&docs, &mut ord_buf);
+                    ords_col.first_vals(docs, &mut ord_buf);
 
                     let mut keys_builder = Int32Builder::with_capacity(num_docs);
                     for ord in &ord_buf {
@@ -213,14 +217,14 @@ pub fn read_segment_fast_fields_to_batch(
                     )
                 } else {
                     // Fallback: per-chunk compact dictionary (no cache provided).
-                    build_compact_dict_array(&str_col, &docs, num_docs, name)?
+                    build_compact_dict_array(&str_col, docs, num_docs, name)?
                 }
             }
             DataType::Utf8 => {
                 // IpAddr formatted as string (not dictionary-encoded)
                 if let Ok(col) = fast_fields.ip_addr(name) {
                     let mut builder = StringBuilder::with_capacity(num_docs, num_docs * 40);
-                    for &doc_id in &docs {
+                    for &doc_id in docs {
                         match col.first(doc_id) {
                             Some(ip) => {
                                 if let Some(v4) = ip.to_ipv4_mapped() {
@@ -249,7 +253,7 @@ pub fn read_segment_fast_fields_to_batch(
                 };
                 let mut builder = BinaryBuilder::with_capacity(num_docs, num_docs * 64);
                 let mut buf = Vec::new();
-                for &doc_id in &docs {
+                for &doc_id in docs {
                     let mut ord_iter = bytes_col.term_ords(doc_id);
                     if let Some(ord) = ord_iter.next() {
                         buf.clear();
@@ -265,7 +269,7 @@ pub fn read_segment_fast_fields_to_batch(
             }
             // --- List<T> branches for multi-valued fields ---
             dt @ DataType::List(inner) => {
-                build_list_array(inner, dt, name, fast_fields, &docs, num_docs)?
+                build_list_array(inner, dt, name, fast_fields, docs, num_docs)?
             }
             other => {
                 return Err(DataFusionError::Internal(format!(

@@ -6,6 +6,7 @@ pub mod fast_field_reader;
 pub mod full_text_udf;
 pub mod index_opener;
 pub mod schema_mapping;
+pub(crate) mod type_coercion;
 pub(crate) mod util;
 pub mod warmup;
 

@@ -4,6 +4,12 @@
 //! document retrieval, and aggregations internally — no joins needed.
 //!
 //! Start reviewing here: [`SingleTableProvider`] is the entry point.
+//!
+//! ## Rule Ordering
+//!
+//! Register [`agg_pushdown::AggPushdown`] before distributed physical
+//! optimizer rules. Tantivy aggregation pushdown must see the local
+//! `AggregateExec` subtree before network boundaries are inserted.
 
 pub mod agg_data_source;
 pub(crate) mod agg_exec;

@@ -9,7 +9,9 @@ use tantivy::aggregation::agg_result::{
     AggregationResult, AggregationResults, BucketEntry, BucketResult, MetricResult,
     RangeBucketEntry,
 };
+use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
 use tantivy::aggregation::metric::{PercentilesMetricResult, SingleMetricResult};
+use tantivy::aggregation::DistributedAggregationCollector;
 use tantivy::aggregation::Key;
 use tantivy::query::Query;
 use tantivy::Index;
@@ -25,6 +27,16 @@ pub(crate) fn execute_tantivy_agg_with_reader(
     output_schema: &SchemaRef,
     existing_reader: Option<&tantivy::IndexReader>,
 ) -> Result<RecordBatch> {
+    let agg_results = execute_tantivy_agg_results_with_reader(index, aggs, query, existing_reader)?;
+    agg_results_to_batch(&agg_results, aggs, output_schema)
+}
+
+pub(crate) fn execute_tantivy_agg_results_with_reader(
+    index: &Index,
+    aggs: &Aggregations,
+    query: Option<&Arc<dyn Query>>,
+    existing_reader: Option<&tantivy::IndexReader>,
+) -> Result<AggregationResults> {
     let owned_reader;
     let reader = match existing_reader {
         Some(r) => r,
@@ -52,7 +64,93 @@ pub(crate) fn execute_tantivy_agg_with_reader(
         .search(effective_query.as_ref(), &collector)
         .map_err(|e| DataFusionError::Internal(format!("aggregation search: {e}")))?;
 
-    agg_results_to_batch(&agg_results, aggs, output_schema)
+    Ok(agg_results)
+}
+
+pub(crate) fn execute_tantivy_intermediate_agg_with_reader(
+    index: &Index,
+    aggs: &Aggregations,
+    query: Option<&Arc<dyn Query>>,
+    existing_reader: Option<&tantivy::IndexReader>,
+) -> Result<IntermediateAggregationResults> {
+    let owned_reader;
+    let reader = match existing_reader {
+        Some(r) => r,
+        None => {
+            owned_reader = index
+                .reader()
+                .map_err(|e| DataFusionError::Internal(format!("open reader: {e}")))?;
+            &owned_reader
+        }
+    };
+    let searcher = reader.searcher();
+    let collector = DistributedAggregationCollector::from_aggs(aggs.clone(), Default::default());
+
+    let effective_query: Box<dyn Query> = match query {
+        Some(q) => q.box_clone(),
+        None => Box::new(tantivy::query::AllQuery),
+    };
+
+    searcher
+        .search(effective_query.as_ref(), &collector)
+        .map_err(|e| DataFusionError::Internal(format!("distributed aggregation search: {e}")))
+}
+
+pub(crate) fn merge_intermediate_agg_results(
+    mut partials: Vec<IntermediateAggregationResults>,
+    aggs: &Aggregations,
+) -> Result<AggregationResults> {
+    let mut merged = partials.pop().unwrap_or_default();
+    for partial in partials {
+        merged
+            .merge_fruits(partial)
+            .map_err(|e| DataFusionError::Internal(format!("merge aggregation results: {e}")))?;
+    }
+
+    merged
+        .into_final_result(aggs.clone(), Default::default())
+        .map_err(|e| DataFusionError::Internal(format!("finalize aggregation results: {e}")))
+}
+
+pub(crate) fn agg_results_to_output_batch(
+    results: &AggregationResults,
+    aggs: &Aggregations,
+    schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    agg_results_to_batch(results, aggs, schema)
+}
+
+pub(crate) fn agg_results_to_partial_state_batch(
+    results: &AggregationResults,
+    aggs: &Aggregations,
+    schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    if results.0.len() != 1 || aggs.len() != 1 {
+        return Err(DataFusionError::NotImplemented(
+            "tantivy partial agg pushdown supports only a single top-level aggregation".into(),
+        ));
+    }
+
+    let (agg_name, agg_def) = aggs
+        .iter()
+        .next()
+        .ok_or_else(|| DataFusionError::Internal("empty aggregations".into()))?;
+
+    let agg_result = results
+        .0
+        .get(agg_name)
+        .ok_or_else(|| DataFusionError::Internal(format!("missing result for '{agg_name}'")))?;
+
+    match agg_result {
+        AggregationResult::BucketResult(BucketResult::Terms {
+            buckets,
+            sum_other_doc_count: _,
+            ..
+        }) => terms_bucket_to_partial_state_batch(buckets, agg_def, schema),
+        _ => Err(DataFusionError::Internal(
+            "partial agg pushdown supports only terms bucket aggregations".into(),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +369,48 @@ fn terms_bucket_to_batch(
 
     RecordBatch::try_new(schema.clone(), columns)
         .map_err(|e| DataFusionError::Internal(format!("build terms batch: {e}")))
+}
+
+fn terms_bucket_to_partial_state_batch(
+    buckets: &[BucketEntry],
+    agg_def: &Aggregation,
+    schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    if schema.fields().is_empty() {
+        return Err(DataFusionError::Internal(
+            "partial state schema must contain at least the group key".into(),
+        ));
+    }
+
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    let key_values: Vec<Option<String>> = buckets
+        .iter()
+        .map(|bucket| Some(key_to_string(&bucket.key)))
+        .collect();
+    columns.push(cast_key_column(&key_values, schema.fields()[0].data_type()));
+
+    for field in schema.fields().iter().skip(1) {
+        let col_name = field.name().as_str();
+        if is_doc_count_column(col_name, &agg_def.sub_aggregation) {
+            let values: Vec<Option<f64>> = buckets
+                .iter()
+                .map(|bucket| Some(bucket.doc_count as f64))
+                .collect();
+            columns.push(typed_f64_column(&values, field.data_type()));
+            continue;
+        }
+
+        let values: Vec<Option<f64>> = buckets
+            .iter()
+            .map(|bucket| {
+                extract_sub_agg_value(&bucket.sub_aggregation, col_name, &agg_def.sub_aggregation)
+            })
+            .collect();
+        columns.push(typed_f64_column(&values, field.data_type()));
+    }
+
+    RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| DataFusionError::Internal(format!("build partial terms batch: {e}")))
 }
 
 fn histogram_bucket_to_batch(

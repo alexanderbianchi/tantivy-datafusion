@@ -18,6 +18,7 @@
 
 use std::sync::Arc;
 
+use arrow::datatypes::SchemaRef;
 use datafusion::common::Result;
 use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
@@ -29,9 +30,12 @@ use prost::Message;
 
 use crate::index_opener::{IndexOpener, OpenerMetadata};
 use crate::schema_mapping::tantivy_schema_to_arrow_with_multi_valued;
-use crate::unified::agg_data_source::AggDataSource;
+use crate::type_coercion::plan_fast_field_projection;
+use crate::unified::agg_data_source::{AggDataSource, AggOutputMode};
 use crate::unified::single_table_provider::{
-    deserialize_fast_field_filters, serialize_fast_field_filters, ScanSchema, SingleTableDataSource,
+    deserialize_fast_field_filter_exprs, deserialize_fast_field_filters,
+    serialize_fast_field_filters, PartitionSpec, ScanSchema, SingleTableDataSource,
+    SplitExecutionPlan,
 };
 
 // ── Opener factory as session extension ─────────────────────────────
@@ -62,6 +66,22 @@ impl OpenerFactoryExt for SessionConfig {
 }
 
 // ── Proto ───────────────────────────────────────────────────────────
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct SplitOpenerProto {
+    #[prost(string, tag = "1")]
+    identifier: String,
+    #[prost(string, tag = "2")]
+    tantivy_schema_json: String,
+    #[prost(uint32, repeated, tag = "3")]
+    segment_sizes: Vec<u32>,
+    #[prost(uint64, tag = "4")]
+    footer_start: u64,
+    #[prost(uint64, tag = "5")]
+    footer_end: u64,
+    #[prost(string, repeated, tag = "6")]
+    multi_valued_fields: Vec<String>,
+}
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct TantivyScanProto {
@@ -107,6 +127,15 @@ struct TantivyScanProto {
     /// Workers re-derive `pre_built_query` from these on execution.
     #[prost(string, tag = "18")]
     fast_field_filters_json: String,
+    /// Split descriptors for SINGLE_TABLE scans spanning multiple split openers.
+    #[prost(message, repeated, tag = "19")]
+    split_openers: Vec<SplitOpenerProto>,
+    /// Protobuf-encoded canonical fast field schema for SINGLE_TABLE scans.
+    #[prost(bytes = "vec", tag = "20")]
+    canonical_ff_schema_bytes: Vec<u8>,
+    /// 0 = final aggregate rows, 1 = partial aggregate state rows.
+    #[prost(uint32, tag = "21")]
+    agg_output_mode: u32,
 }
 
 const FAST_FIELD: u32 = 0;
@@ -114,6 +143,8 @@ const INVERTED_INDEX: u32 = 1;
 const DOCUMENT: u32 = 2;
 const SINGLE_TABLE: u32 = 3;
 const AGG_DATA_SOURCE: u32 = 4;
+const AGG_OUTPUT_FINAL_MERGED: u32 = 0;
+const AGG_OUTPUT_PARTIAL_STATES: u32 = 1;
 
 struct OpenerProtoMetadata {
     identifier: String,
@@ -159,23 +190,19 @@ fn reconstruct_pre_built_query(
     }
 }
 
-/// Build a [`ScanSchema`] for `SingleTableDataSource` from the opener's
-/// tantivy schema, multi-valued field names, and projection indices.
+/// Build a [`ScanSchema`] for `SingleTableDataSource` from the canonical fast
+/// field schema and projection indices.
 ///
 /// This mirrors the logic in `SingleTableProvider::scan` but avoids
 /// constructing a full `SessionContext` and `TableProvider`.
 fn build_single_table_scan_schema(
-    opener: &Arc<dyn IndexOpener>,
-    multi_valued_fields: &[String],
+    canonical_ff_schema: &SchemaRef,
     projection: &Option<Vec<usize>>,
 ) -> ScanSchema {
     use arrow::datatypes::{DataType, Field, Schema};
 
-    let ff_schema =
-        tantivy_schema_to_arrow_with_multi_valued(&opener.schema(), multi_valued_fields);
-
     // Build unified schema: fast fields + _score + _document.
-    let mut unified_fields: Vec<Arc<Field>> = ff_schema.fields().to_vec();
+    let mut unified_fields: Vec<Arc<Field>> = canonical_ff_schema.fields().to_vec();
     let score_idx = unified_fields.len();
     unified_fields.push(Arc::new(Field::new("_score", DataType::Float32, true)));
     let document_idx = unified_fields.len();
@@ -203,24 +230,16 @@ fn build_single_table_scan_schema(
         }
     }
 
-    // Ensure _doc_id and _segment_ord are included (needed internally).
-    if let Ok(doc_id_idx) = ff_schema.index_of("_doc_id") {
-        if !ff_indices.contains(&doc_id_idx) {
-            ff_indices.push(doc_id_idx);
-        }
-    }
-    if let Ok(seg_ord_idx) = ff_schema.index_of("_segment_ord") {
-        if !ff_indices.contains(&seg_ord_idx) {
-            ff_indices.push(seg_ord_idx);
-        }
-    }
     ff_indices.sort();
     ff_indices.dedup();
+    if ff_indices.is_empty() {
+        ff_indices.push(canonical_ff_schema.index_of("_doc_id").unwrap());
+    }
 
     let ff_projected = {
         let fields: Vec<Field> = ff_indices
             .iter()
-            .map(|&i| ff_schema.field(i).clone())
+            .map(|&i| canonical_ff_schema.field(i).clone())
             .collect();
         Arc::new(Schema::new(fields))
     };
@@ -261,6 +280,36 @@ fn opener_to_proto(opener: &Arc<dyn IndexOpener>) -> Result<OpenerProtoMetadata>
     })
 }
 
+fn split_opener_to_proto(opener: &Arc<dyn IndexOpener>) -> Result<SplitOpenerProto> {
+    let meta = opener_to_proto(opener)?;
+    Ok(SplitOpenerProto {
+        identifier: meta.identifier,
+        tantivy_schema_json: meta.tantivy_schema_json,
+        segment_sizes: meta.segment_sizes,
+        footer_start: meta.footer_start,
+        footer_end: meta.footer_end,
+        multi_valued_fields: meta.multi_valued_fields,
+    })
+}
+
+fn encode_schema_bytes(schema: &arrow::datatypes::Schema) -> Result<Vec<u8>> {
+    let proto_schema = datafusion_proto::protobuf::Schema::try_from(schema)
+        .map_err(|e| DataFusionError::Internal(format!("encode schema: {e}")))?;
+    let mut schema_buf = Vec::new();
+    prost::Message::encode(&proto_schema, &mut schema_buf)
+        .map_err(|e| DataFusionError::Internal(format!("encode schema bytes: {e}")))?;
+    Ok(schema_buf)
+}
+
+fn decode_schema_bytes(bytes: &[u8]) -> Result<Arc<arrow::datatypes::Schema>> {
+    let proto_schema = datafusion_proto::protobuf::Schema::decode(bytes)
+        .map_err(|e| DataFusionError::Internal(format!("decode schema: {e}")))?;
+    Ok(Arc::new(
+        arrow::datatypes::Schema::try_from(&proto_schema)
+            .map_err(|e| DataFusionError::Internal(format!("convert schema: {e}")))?,
+    ))
+}
+
 impl PhysicalExtensionCodec for TantivyCodec {
     fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> Result<()> {
         if let Some(ds_exec) = node.as_any().downcast_ref::<DataSourceExec>() {
@@ -268,7 +317,11 @@ impl PhysicalExtensionCodec for TantivyCodec {
             let output_partitions = ds_exec.properties().partitioning.partition_count() as u32;
 
             if let Some(st) = ds.as_any().downcast_ref::<SingleTableDataSource>() {
-                let opener_meta = opener_to_proto(st.opener())?;
+                let split_openers: Vec<SplitOpenerProto> = st
+                    .split_openers()
+                    .iter()
+                    .map(split_opener_to_proto)
+                    .collect::<Result<_>>()?;
                 let (proj, has_proj) = match st.projection() {
                     Some(p) => (p.iter().map(|&i| i as u32).collect(), true),
                     None => (Vec::new(), false),
@@ -281,10 +334,12 @@ impl PhysicalExtensionCodec for TantivyCodec {
                     None => (0, false),
                 };
                 let ff_filters_json = serialize_fast_field_filters(st.fast_field_filter_exprs())?;
+                let canonical_ff_schema_bytes =
+                    encode_schema_bytes(st.canonical_fast_field_schema().as_ref())?;
                 return TantivyScanProto {
-                    identifier: opener_meta.identifier,
-                    tantivy_schema_json: opener_meta.tantivy_schema_json,
-                    segment_sizes: opener_meta.segment_sizes,
+                    identifier: String::new(),
+                    tantivy_schema_json: String::new(),
+                    segment_sizes: Vec::new(),
                     projection: proj,
                     has_projection: has_proj,
                     output_partitions,
@@ -293,19 +348,30 @@ impl PhysicalExtensionCodec for TantivyCodec {
                     topk,
                     has_topk,
                     pushed_filters: Vec::new(),
-                    footer_start: opener_meta.footer_start,
-                    footer_end: opener_meta.footer_end,
-                    multi_valued_fields: opener_meta.multi_valued_fields,
+                    footer_start: 0,
+                    footer_end: 0,
+                    multi_valued_fields: Vec::new(),
                     aggregations_json: String::new(),
                     output_schema_bytes: Vec::new(),
                     fast_field_filters_json: ff_filters_json,
+                    split_openers,
+                    canonical_ff_schema_bytes,
+                    agg_output_mode: AGG_OUTPUT_FINAL_MERGED,
                 }
                 .encode(buf)
                 .map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
             }
 
             if let Some(agg_ds) = ds.as_any().downcast_ref::<AggDataSource>() {
-                let opener_meta = opener_to_proto(agg_ds.opener())?;
+                let opener_meta = agg_ds
+                    .single_split_opener()
+                    .map(opener_to_proto)
+                    .transpose()?;
+                let split_openers: Vec<SplitOpenerProto> = agg_ds
+                    .split_openers()
+                    .iter()
+                    .map(split_opener_to_proto)
+                    .collect::<Result<_>>()?;
                 let agg_json =
                     serde_json::to_string(agg_ds.aggregations().as_ref()).map_err(|e| {
                         DataFusionError::Internal(format!("serialize aggregations: {e}"))
@@ -313,23 +379,26 @@ impl PhysicalExtensionCodec for TantivyCodec {
                 let rq_json = serde_json::to_string(agg_ds.raw_queries()).map_err(|e| {
                     DataFusionError::Internal(format!("serialize raw_queries: {e}"))
                 })?;
-                let output_schema_bytes = {
-                    let proto_schema = datafusion_proto::protobuf::Schema::try_from(
-                        agg_ds.output_schema().as_ref(),
-                    )
-                    .map_err(|e| DataFusionError::Internal(format!("encode schema: {e}")))?;
-                    let mut schema_buf = Vec::new();
-                    prost::Message::encode(&proto_schema, &mut schema_buf).map_err(|e| {
-                        DataFusionError::Internal(format!("encode schema bytes: {e}"))
-                    })?;
-                    schema_buf
-                };
+                let output_schema_bytes = encode_schema_bytes(agg_ds.output_schema().as_ref())?;
                 let ff_filters_json =
                     serialize_fast_field_filters(agg_ds.fast_field_filter_exprs())?;
+                let agg_output_mode = match agg_ds.output_mode() {
+                    AggOutputMode::FinalMerged => AGG_OUTPUT_FINAL_MERGED,
+                    AggOutputMode::PartialStates => AGG_OUTPUT_PARTIAL_STATES,
+                };
                 return TantivyScanProto {
-                    identifier: opener_meta.identifier,
-                    tantivy_schema_json: opener_meta.tantivy_schema_json,
-                    segment_sizes: opener_meta.segment_sizes,
+                    identifier: opener_meta
+                        .as_ref()
+                        .map(|meta| meta.identifier.clone())
+                        .unwrap_or_default(),
+                    tantivy_schema_json: opener_meta
+                        .as_ref()
+                        .map(|meta| meta.tantivy_schema_json.clone())
+                        .unwrap_or_default(),
+                    segment_sizes: opener_meta
+                        .as_ref()
+                        .map(|meta| meta.segment_sizes.clone())
+                        .unwrap_or_default(),
                     projection: Vec::new(),
                     has_projection: false,
                     output_partitions,
@@ -338,12 +407,24 @@ impl PhysicalExtensionCodec for TantivyCodec {
                     topk: 0,
                     has_topk: false,
                     pushed_filters: Vec::new(),
-                    footer_start: opener_meta.footer_start,
-                    footer_end: opener_meta.footer_end,
-                    multi_valued_fields: opener_meta.multi_valued_fields,
+                    footer_start: opener_meta
+                        .as_ref()
+                        .map(|meta| meta.footer_start)
+                        .unwrap_or(0),
+                    footer_end: opener_meta
+                        .as_ref()
+                        .map(|meta| meta.footer_end)
+                        .unwrap_or(0),
+                    multi_valued_fields: opener_meta
+                        .as_ref()
+                        .map(|meta| meta.multi_valued_fields.clone())
+                        .unwrap_or_default(),
                     aggregations_json: agg_json,
                     output_schema_bytes,
                     fast_field_filters_json: ff_filters_json,
+                    split_openers,
+                    canonical_ff_schema_bytes: Vec::new(),
+                    agg_output_mode,
                 }
                 .encode(buf)
                 .map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
@@ -374,19 +455,6 @@ impl PhysicalExtensionCodec for TantivyCodec {
             )
         })?;
 
-        let tantivy_schema: tantivy::schema::Schema =
-            serde_json::from_str(&proto.tantivy_schema_json)
-                .map_err(|e| DataFusionError::Internal(format!("parse tantivy schema: {e}")))?;
-
-        let opener = opener_factory(OpenerMetadata {
-            identifier: proto.identifier.clone(),
-            tantivy_schema,
-            segment_sizes: proto.segment_sizes.clone(),
-            footer_start: proto.footer_start,
-            footer_end: proto.footer_end,
-            multi_valued_fields: proto.multi_valued_fields.clone(),
-        });
-
         let projection = if proto.has_projection {
             Some(
                 proto
@@ -405,8 +473,8 @@ impl PhysicalExtensionCodec for TantivyCodec {
                      use SINGLE_TABLE or AGG_DATA_SOURCE",
                 proto.provider_type
             ))),
-            SINGLE_TABLE => decode_single_table(opener, projection, &proto),
-            AGG_DATA_SOURCE => decode_agg(opener, &proto),
+            SINGLE_TABLE => decode_single_table(opener_factory, projection, &proto),
+            AGG_DATA_SOURCE => decode_agg(opener_factory, &proto),
             other => Err(DataFusionError::Internal(format!(
                 "unknown provider type: {other}"
             ))),
@@ -416,12 +484,19 @@ impl PhysicalExtensionCodec for TantivyCodec {
 
 /// Decode a `SINGLE_TABLE` proto into a [`DataSourceExec`].
 fn decode_single_table(
-    opener: Arc<dyn IndexOpener>,
+    opener_factory: OpenerFactory,
     projection: Option<Vec<usize>>,
     proto: &TantivyScanProto,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let mv_fields = opener.multi_valued_fields();
-    let scan_schema = build_single_table_scan_schema(&opener, &mv_fields, &projection);
+    let canonical_ff_schema = if proto.canonical_ff_schema_bytes.is_empty() {
+        let tantivy_schema: tantivy::schema::Schema =
+            serde_json::from_str(&proto.tantivy_schema_json)
+                .map_err(|e| DataFusionError::Internal(format!("parse tantivy schema: {e}")))?;
+        tantivy_schema_to_arrow_with_multi_valued(&tantivy_schema, &proto.multi_valued_fields)
+    } else {
+        decode_schema_bytes(&proto.canonical_ff_schema_bytes)?
+    };
+    let scan_schema = build_single_table_scan_schema(&canonical_ff_schema, &projection);
 
     let raw_queries: Vec<(String, String)> = if proto.raw_queries_json.is_empty() {
         Vec::new()
@@ -430,30 +505,90 @@ fn decode_single_table(
             .map_err(|e| DataFusionError::Internal(format!("parse raw_queries: {e}")))?
     };
 
-    let pre_built_query =
-        reconstruct_pre_built_query(&proto.fast_field_filters_json, &opener.schema())?;
+    let fast_field_filter_exprs =
+        deserialize_fast_field_filter_exprs(&proto.fast_field_filters_json)?;
 
     let topk = if proto.has_topk {
         Some(proto.topk as usize)
     } else {
         None
     };
-    let num_segments = (proto.output_partitions as usize).max(1);
+
+    let split_openers = if proto.split_openers.is_empty() {
+        let tantivy_schema: tantivy::schema::Schema =
+            serde_json::from_str(&proto.tantivy_schema_json)
+                .map_err(|e| DataFusionError::Internal(format!("parse tantivy schema: {e}")))?;
+        vec![opener_factory(OpenerMetadata {
+            identifier: proto.identifier.clone(),
+            tantivy_schema,
+            segment_sizes: proto.segment_sizes.clone(),
+            footer_start: proto.footer_start,
+            footer_end: proto.footer_end,
+            multi_valued_fields: proto.multi_valued_fields.clone(),
+        })]
+    } else {
+        proto
+            .split_openers
+            .iter()
+            .map(|split| {
+                let tantivy_schema: tantivy::schema::Schema =
+                    serde_json::from_str(&split.tantivy_schema_json).map_err(|e| {
+                        DataFusionError::Internal(format!("parse tantivy schema: {e}"))
+                    })?;
+                Ok(opener_factory(OpenerMetadata {
+                    identifier: split.identifier.clone(),
+                    tantivy_schema,
+                    segment_sizes: split.segment_sizes.clone(),
+                    footer_start: split.footer_start,
+                    footer_end: split.footer_end,
+                    multi_valued_fields: split.multi_valued_fields.clone(),
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    let splits: Vec<SplitExecutionPlan> = split_openers
+        .iter()
+        .map(|opener| {
+            let split_ff_schema = tantivy_schema_to_arrow_with_multi_valued(
+                &opener.schema(),
+                &opener.multi_valued_fields(),
+            );
+            Ok(SplitExecutionPlan {
+                opener: Arc::clone(opener),
+                fast_field_projection: plan_fast_field_projection(
+                    &split_ff_schema,
+                    &scan_schema.ff_projected,
+                )?,
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    let mut partition_map = Vec::new();
+    for (split_idx, opener) in split_openers.iter().enumerate() {
+        let num_segments = opener.segment_sizes().len().max(1);
+        for segment_idx in 0..num_segments {
+            partition_map.push(PartitionSpec {
+                split_idx,
+                segment_idx,
+            });
+        }
+    }
 
     let ds = SingleTableDataSource::new_from_codec(
-        opener,
+        splits,
         scan_schema,
         raw_queries,
-        pre_built_query,
+        fast_field_filter_exprs,
         topk,
-        num_segments,
+        partition_map,
     );
     Ok(Arc::new(DataSourceExec::new(Arc::new(ds))))
 }
 
 /// Decode an `AGG_DATA_SOURCE` proto into a [`DataSourceExec`].
 fn decode_agg(
-    opener: Arc<dyn IndexOpener>,
+    opener_factory: OpenerFactory,
     proto: &TantivyScanProto,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let aggs: tantivy::aggregation::agg_req::Aggregations =
@@ -482,16 +617,65 @@ fn decode_agg(
         )
     };
 
-    let pre_built_query =
-        reconstruct_pre_built_query(&proto.fast_field_filters_json, &opener.schema())?;
+    let split_openers = if proto.split_openers.is_empty() {
+        let tantivy_schema: tantivy::schema::Schema =
+            serde_json::from_str(&proto.tantivy_schema_json)
+                .map_err(|e| DataFusionError::Internal(format!("parse tantivy schema: {e}")))?;
+        vec![opener_factory(OpenerMetadata {
+            identifier: proto.identifier.clone(),
+            tantivy_schema,
+            segment_sizes: proto.segment_sizes.clone(),
+            footer_start: proto.footer_start,
+            footer_end: proto.footer_end,
+            multi_valued_fields: proto.multi_valued_fields.clone(),
+        })]
+    } else {
+        proto
+            .split_openers
+            .iter()
+            .map(|split| {
+                let tantivy_schema: tantivy::schema::Schema =
+                    serde_json::from_str(&split.tantivy_schema_json).map_err(|e| {
+                        DataFusionError::Internal(format!("parse tantivy schema: {e}"))
+                    })?;
+                Ok(opener_factory(OpenerMetadata {
+                    identifier: split.identifier.clone(),
+                    tantivy_schema,
+                    segment_sizes: split.segment_sizes.clone(),
+                    footer_start: split.footer_start,
+                    footer_end: split.footer_end,
+                    multi_valued_fields: split.multi_valued_fields.clone(),
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
 
-    let ds = AggDataSource::new(
-        opener,
-        Arc::new(aggs),
-        output_schema,
-        raw_queries,
-        pre_built_query,
-        Vec::new(), // exprs not needed on worker — query already reconstructed
-    );
+    let pre_built_query = if split_openers.len() == 1 {
+        reconstruct_pre_built_query(&proto.fast_field_filters_json, &split_openers[0].schema())?
+    } else {
+        None
+    };
+    let fast_field_filter_exprs =
+        deserialize_fast_field_filter_exprs(&proto.fast_field_filters_json)?;
+
+    let aggregations = Arc::new(aggs);
+    let ds = match proto.agg_output_mode {
+        AGG_OUTPUT_PARTIAL_STATES => AggDataSource::from_split_openers_partial_states(
+            split_openers,
+            aggregations,
+            output_schema,
+            raw_queries,
+            pre_built_query,
+            fast_field_filter_exprs,
+        ),
+        _ => AggDataSource::from_split_openers(
+            split_openers,
+            aggregations,
+            output_schema,
+            raw_queries,
+            pre_built_query,
+            fast_field_filter_exprs,
+        ),
+    };
     Ok(Arc::new(DataSourceExec::new(Arc::new(ds))))
 }

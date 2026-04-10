@@ -14,8 +14,9 @@ use datafusion::logical_expr::{Expr, ScalarFunctionArgs, ScalarUDF, Signature, V
 /// that DataFusion's optimizer recognizes it as a filter on that column and
 /// pushes it down to the table provider.
 ///
-/// If the filter is not pushed down (e.g. used outside a TantivyTableProvider),
-/// it returns `true` for every row as a safe fallback.
+/// If the filter is not pushed down (e.g. used outside a Tantivy-backed
+/// table), evaluation fails at runtime because this UDF is only a pushdown
+/// marker and has no row-by-row implementation.
 ///
 /// Register with:
 /// ```ignore

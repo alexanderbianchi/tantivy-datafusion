@@ -10,17 +10,26 @@ use std::collections::HashSet;
 use datafusion::common::Result;
 use datafusion::error::DataFusionError;
 use tantivy::schema::{Field, FieldType};
-use tantivy::{Index, ReloadPolicy};
+use tantivy::{Index, IndexReader, ReloadPolicy};
+
+async fn open_reader_for_warmup(index: &Index) -> Result<IndexReader> {
+    let index = index.clone();
+    tokio::task::spawn_blocking(move || {
+        index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .map_err(|e| DataFusionError::Internal(format!("open reader for warmup: {e}")))
+    })
+    .await
+    .map_err(|e| DataFusionError::Internal(format!("warmup reader spawn: {e}")))?
+}
 
 /// Warm up the inverted index data needed for full-text queries.
 ///
 /// Pre-loads term dictionaries and posting lists for the given fields.
 pub async fn warmup_inverted_index(index: &Index, query_fields: &[Field]) -> Result<()> {
-    let reader = index
-        .reader_builder()
-        .reload_policy(ReloadPolicy::Manual)
-        .try_into()
-        .map_err(|e| DataFusionError::Internal(format!("open reader for warmup: {e}")))?;
+    let reader = open_reader_for_warmup(index).await?;
     let searcher = reader.searcher();
 
     let fields: HashSet<Field> = query_fields.iter().copied().collect();
@@ -51,11 +60,7 @@ pub async fn warmup_inverted_index(index: &Index, query_fields: &[Field]) -> Res
 ///
 /// Only pre-loads the fields that will actually be read.
 pub async fn warmup_fast_fields_by_name(index: &Index, field_names: &[&str]) -> Result<()> {
-    let reader = index
-        .reader_builder()
-        .reload_policy(ReloadPolicy::Manual)
-        .try_into()
-        .map_err(|e| DataFusionError::Internal(format!("open reader for warmup: {e}")))?;
+    let reader = open_reader_for_warmup(index).await?;
     let searcher = reader.searcher();
 
     for segment_reader in searcher.segment_readers() {
@@ -81,11 +86,7 @@ pub async fn warmup_fast_fields_by_name(index: &Index, field_names: &[&str]) -> 
 /// Pre-loads the fast field file slices so tantivy can read them
 /// synchronously.
 pub async fn warmup_fast_fields(index: &Index) -> Result<()> {
-    let reader = index
-        .reader_builder()
-        .reload_policy(ReloadPolicy::Manual)
-        .try_into()
-        .map_err(|e| DataFusionError::Internal(format!("open reader for warmup: {e}")))?;
+    let reader = open_reader_for_warmup(index).await?;
     let searcher = reader.searcher();
     let schema = index.schema();
 

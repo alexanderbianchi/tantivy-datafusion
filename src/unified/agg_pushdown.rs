@@ -1,3 +1,15 @@
+//! Physical aggregation pushdown from DataFusion `AggregateExec` to tantivy.
+//!
+//! ## Rule Ordering
+//!
+//! Register [`AggPushdown`] before any distributed physical optimizer rule.
+//! For two-phase aggregates, this rule rewrites only the partial side into a
+//! partitioned tantivy-native aggregation source and leaves DataFusion's final
+//! aggregate in place, which lets distributed planners keep exchange /
+//! re-aggregation boundaries above the pushdown. If a distributed optimizer
+//! inserts network boundaries first, this rule can no longer see through the
+//! aggregate subtree and pushdown will not fire.
+
 use std::sync::Arc;
 
 use datafusion::common::config::ConfigOptions;
@@ -33,6 +45,12 @@ use datafusion_datasource::source::DataSourceExec;
 /// The rule only fires when `FastFieldDataSource.aggregations` is `Some`,
 /// which is set by `execute_aggregations`. Regular SQL queries (without
 /// `execute_aggregations`) are unaffected.
+///
+/// Register this rule before distributed physical optimizer rules. Two-phase
+/// pushdown preserves DataFusion's final aggregate so distributed execution can
+/// still repartition and merge across node boundaries, but the rule still
+/// needs to see the original partial-aggregate subtree before network nodes are
+/// inserted.
 #[derive(Debug)]
 pub struct AggPushdown;
 
@@ -98,13 +116,19 @@ fn try_rewrite_single(
     if !has_group_by(agg) {
         return Ok(Transformed::no(plan.clone()));
     }
+    if agg.filter_expr().iter().any(|expr| expr.is_some()) {
+        return Ok(Transformed::no(plan.clone()));
+    }
 
     let input = agg.input();
 
     if let Some(st_ds) = find_single_table_datasource(input) {
+        if !agg_fields_exist_on_all_splits(agg, st_ds) {
+            return Ok(Transformed::no(plan.clone()));
+        }
         if let Some(tantivy_aggs) = derive_tantivy_aggregations(agg).map(Arc::new) {
-            let agg_ds = AggDataSource::new(
-                st_ds.opener().clone(),
+            let agg_ds = AggDataSource::from_split_openers(
+                st_ds.split_openers(),
                 tantivy_aggs,
                 agg.schema(),
                 st_ds.raw_queries().to_vec(),
@@ -120,7 +144,9 @@ fn try_rewrite_single(
     Ok(Transformed::no(plan.clone()))
 }
 
-/// Rewrite two-phase: AggregateExec(Final) → ... → AggregateExec(Partial) → [safe ops] → DataSourceExec.
+/// Rewrite two-phase: keep `AggregateExec(Final*)` and replace the partial side
+/// with a partitioned `AggDataSource` that emits DataFusion-compatible partial
+/// aggregate state rows.
 fn try_rewrite_two_phase(
     _final_agg: &AggregateExec,
     plan: &Arc<dyn ExecutionPlan>,
@@ -130,32 +156,95 @@ fn try_rewrite_two_phase(
     if !has_group_by(final_agg) {
         return Ok(Transformed::no(plan.clone()));
     }
+    if final_agg.filter_expr().iter().any(|expr| expr.is_some()) {
+        return Ok(Transformed::no(plan.clone()));
+    }
 
     // Walk through safe operators between Final and Partial
     let partial_agg = find_partial_aggregate(final_agg.input())?;
     let Some(partial_agg) = partial_agg else {
         return Ok(Transformed::no(plan.clone()));
     };
+    if partial_agg.filter_expr().iter().any(|expr| expr.is_some()) {
+        return Ok(Transformed::no(plan.clone()));
+    }
 
     let partial_input = partial_agg.input();
 
     if let Some(st_ds) = find_single_table_datasource(partial_input) {
-        if let Some(tantivy_aggs) = derive_tantivy_aggregations(final_agg).map(Arc::new) {
-            let agg_ds = AggDataSource::new(
-                st_ds.opener().clone(),
+        if !agg_fields_exist_on_all_splits(final_agg, st_ds) {
+            return Ok(Transformed::no(plan.clone()));
+        }
+        if let Some(tantivy_aggs) = derive_tantivy_partial_aggregations(partial_agg).map(Arc::new) {
+            let agg_ds = AggDataSource::from_split_openers_partial_states(
+                st_ds.split_openers(),
                 tantivy_aggs,
-                final_agg.schema(),
+                partial_agg.schema(),
                 st_ds.raw_queries().to_vec(),
                 st_ds.pre_built_query().cloned(),
                 st_ds.fast_field_filter_exprs().to_vec(),
             );
-            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(
-                agg_ds,
-            )))));
+            let replacement: Arc<dyn ExecutionPlan> =
+                Arc::new(DataSourceExec::new(Arc::new(agg_ds)));
+            let rewritten_input =
+                replace_partial_aggregate(Arc::clone(final_agg.input()), replacement)?;
+            return Ok(Transformed::yes(
+                plan.clone().with_new_children(vec![rewritten_input])?,
+            ));
         }
     }
 
     Ok(Transformed::no(plan.clone()))
+}
+
+fn replace_partial_aggregate(
+    plan: Arc<dyn ExecutionPlan>,
+    replacement: Arc<dyn ExecutionPlan>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    plan.transform_down(|node| {
+        let Some(agg) = node.as_any().downcast_ref::<AggregateExec>() else {
+            return Ok(Transformed::no(node));
+        };
+        if matches!(agg.mode(), AggregateMode::Partial) {
+            return Ok(Transformed::yes(Arc::clone(&replacement)));
+        }
+        Ok(Transformed::no(node))
+    })
+    .map(|transformed| transformed.data)
+}
+
+fn agg_fields_exist_on_all_splits(
+    agg: &AggregateExec,
+    data_source: &crate::unified::single_table_provider::SingleTableDataSource,
+) -> bool {
+    let referenced_fields = referenced_agg_fields(agg);
+    data_source.split_openers().into_iter().all(|opener| {
+        referenced_fields
+            .iter()
+            .all(|field| opener.schema().get_field(field).is_ok())
+    })
+}
+
+fn referenced_agg_fields(agg: &AggregateExec) -> Vec<String> {
+    let mut fields = Vec::new();
+
+    for (expr, _) in agg.group_expr().expr() {
+        if let Some(column) = expr.as_any().downcast_ref::<Column>() {
+            fields.push(column.name().to_string());
+        }
+    }
+
+    for agg_fn in agg.aggr_expr() {
+        for expr in agg_fn.expressions() {
+            if let Some(column) = expr.as_any().downcast_ref::<Column>() {
+                fields.push(column.name().to_string());
+            }
+        }
+    }
+
+    fields.sort();
+    fields.dedup();
+    fields
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +278,10 @@ fn derive_tantivy_aggregations(agg: &AggregateExec) -> Option<Aggregations> {
     // Build sub-aggregations from the aggregate expressions
     let mut sub_aggs = Aggregations::default();
     for agg_fn in agg.aggr_expr() {
+        if agg_fn.is_distinct() {
+            return None;
+        }
+
         let func_name = agg_fn.fun().name();
         let args = agg_fn.expressions();
 
@@ -245,4 +338,113 @@ fn derive_tantivy_aggregations(agg: &AggregateExec) -> Option<Aggregations> {
     );
 
     Some(aggs)
+}
+
+fn derive_tantivy_partial_aggregations(agg: &AggregateExec) -> Option<Aggregations> {
+    let group_exprs = agg.group_expr();
+    if group_exprs.is_empty() || group_exprs.expr().len() != 1 {
+        return None;
+    }
+
+    let (group_expr, _alias) = &group_exprs.expr()[0];
+    let group_col = group_expr.as_any().downcast_ref::<Column>()?;
+    let group_field = group_col.name().to_string();
+
+    let mut sub_aggs = Aggregations::default();
+    for agg_fn in agg.aggr_expr() {
+        if agg_fn.is_distinct() {
+            return None;
+        }
+
+        let func_name = agg_fn.fun().name();
+        let args = agg_fn.expressions();
+        let state_fields = agg_fn.state_fields().ok()?;
+        let column_arg = args
+            .first()
+            .and_then(|expr| expr.as_any().downcast_ref::<Column>());
+
+        match func_name {
+            "count" => {
+                if let Some(col) = column_arg {
+                    insert_state_sub_agg(
+                        &mut sub_aggs,
+                        state_fields.first()?.name().to_string(),
+                        AggregationVariants::Count(CountAggregation::from_field_name(
+                            col.name().to_string(),
+                        )),
+                    );
+                }
+            }
+            "sum" => insert_state_sub_agg(
+                &mut sub_aggs,
+                state_fields.first()?.name().to_string(),
+                AggregationVariants::Sum(SumAggregation::from_field_name(
+                    column_arg?.name().to_string(),
+                )),
+            ),
+            "min" => insert_state_sub_agg(
+                &mut sub_aggs,
+                state_fields.first()?.name().to_string(),
+                AggregationVariants::Min(MinAggregation::from_field_name(
+                    column_arg?.name().to_string(),
+                )),
+            ),
+            "max" => insert_state_sub_agg(
+                &mut sub_aggs,
+                state_fields.first()?.name().to_string(),
+                AggregationVariants::Max(MaxAggregation::from_field_name(
+                    column_arg?.name().to_string(),
+                )),
+            ),
+            "avg" => {
+                let col = column_arg?;
+                let [count_field, sum_field] = state_fields.as_slice() else {
+                    return None;
+                };
+                insert_state_sub_agg(
+                    &mut sub_aggs,
+                    count_field.name().to_string(),
+                    AggregationVariants::Count(CountAggregation::from_field_name(
+                        col.name().to_string(),
+                    )),
+                );
+                insert_state_sub_agg(
+                    &mut sub_aggs,
+                    sum_field.name().to_string(),
+                    AggregationVariants::Sum(SumAggregation::from_field_name(
+                        col.name().to_string(),
+                    )),
+                );
+            }
+            _ => return None,
+        }
+    }
+
+    let max_buckets = u32::MAX / 10;
+    let terms = TermsAggregation {
+        field: group_field,
+        size: Some(max_buckets),
+        segment_size: Some(max_buckets),
+        ..Default::default()
+    };
+
+    let mut aggs = Aggregations::default();
+    aggs.insert(
+        "group".to_string(),
+        Aggregation {
+            agg: AggregationVariants::Terms(terms),
+            sub_aggregation: sub_aggs,
+        },
+    );
+    Some(aggs)
+}
+
+fn insert_state_sub_agg(sub_aggs: &mut Aggregations, name: String, variant: AggregationVariants) {
+    sub_aggs.insert(
+        name,
+        Aggregation {
+            agg: variant,
+            sub_aggregation: Default::default(),
+        },
+    );
 }
