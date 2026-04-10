@@ -7,13 +7,12 @@ use datafusion_datasource::source::DataSourceExec;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use tantivy::schema::{SchemaBuilder, FAST, STORED, TEXT};
 use tantivy::{Index, IndexWriter, TantivyDocument};
-use tantivy_datafusion::{
-    DirectIndexOpener, IndexOpener, full_text_udf,
-    OpenerFactoryExt, OpenerMetadata, TantivyCodec,
-    SingleTableProvider,
-};
 use tantivy_datafusion::unified::agg_data_source::AggDataSource;
 use tantivy_datafusion::unified::single_table_provider::SingleTableDataSource;
+use tantivy_datafusion::{
+    full_text_udf, DirectIndexOpener, IndexOpener, OpenerFactoryExt, OpenerMetadata,
+    SingleTableProvider, TantivyCodec,
+};
 
 /// Create a simple in-memory tantivy index for testing.
 fn create_test_index() -> Index {
@@ -32,7 +31,10 @@ fn create_test_index() -> Index {
     for i in 0..5u64 {
         let mut doc = TantivyDocument::default();
         doc.add_u64(id_field, i);
-        doc.add_text(body_field, format!("document number {i} about rust programming"));
+        doc.add_text(
+            body_field,
+            format!("document number {i} about rust programming"),
+        );
         doc.add_f64(price_field, (i as f64) * 1.5 + 1.0);
         writer.add_document(doc).unwrap();
     }
@@ -45,9 +47,11 @@ fn create_test_index() -> Index {
 fn session_with_opener(index: Index) -> SessionContext {
     let mut config = SessionConfig::new();
     let test_index = index.clone();
-    config.set_opener_factory(Arc::new(move |_meta: OpenerMetadata| -> Arc<dyn IndexOpener> {
-        Arc::new(DirectIndexOpener::new(test_index.clone()))
-    }));
+    config.set_opener_factory(Arc::new(
+        move |_meta: OpenerMetadata| -> Arc<dyn IndexOpener> {
+            Arc::new(DirectIndexOpener::new(test_index.clone()))
+        },
+    ));
     SessionContext::new_with_config(config)
 }
 
@@ -132,10 +136,7 @@ async fn test_single_table_with_query_roundtrip() {
         Arc::new(full_text_udf()),
         vec![col("body"), lit("rust")],
     ));
-    let exec = provider
-        .scan(&state, None, &[filter], None)
-        .await
-        .unwrap();
+    let exec = provider.scan(&state, None, &[filter], None).await.unwrap();
 
     let codec = TantivyCodec;
     let mut buf = Vec::new();
@@ -162,10 +163,7 @@ async fn test_single_table_with_topk_roundtrip() {
         Arc::new(full_text_udf()),
         vec![col("body"), lit("rust")],
     ));
-    let exec = provider
-        .scan(&state, None, &[filter], None)
-        .await
-        .unwrap();
+    let exec = provider.scan(&state, None, &[filter], None).await.unwrap();
 
     // Manually set topk on the SingleTableDataSource.
     let ds_exec = exec.as_any().downcast_ref::<DataSourceExec>().unwrap();
@@ -188,7 +186,6 @@ async fn test_single_table_with_topk_roundtrip() {
 
     assert_eq!(decoded.schema(), exec_with_topk.schema());
 }
-
 
 #[tokio::test]
 async fn test_double_roundtrip_single_table() {

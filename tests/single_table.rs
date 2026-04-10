@@ -59,8 +59,16 @@ fn add_test_documents(
     writer: &IndexWriter,
     fields: (Field, Field, Field, Field, Field, Field, Field, Field),
 ) {
-    let (u64_field, i64_field, f64_field, bool_field, text_field, date_field, ip_field, bytes_field) =
-        fields;
+    let (
+        u64_field,
+        i64_field,
+        f64_field,
+        bool_field,
+        text_field,
+        date_field,
+        ip_field,
+        bytes_field,
+    ) = fields;
 
     let timestamps = [1_000_000i64, 2_000_000, 3_000_000, 4_000_000, 5_000_000];
     let ips: [Ipv4Addr; 5] = [
@@ -93,8 +101,7 @@ fn add_test_documents(
 }
 
 fn create_test_index() -> Index {
-    let (schema, u64_f, i64_f, f64_f, bool_f, text_f, date_f, ip_f, bytes_f) =
-        build_test_schema();
+    let (schema, u64_f, i64_f, f64_f, bool_f, text_f, date_f, ip_f, bytes_f) = build_test_schema();
 
     let index = Index::create_in_ram(schema);
     let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();

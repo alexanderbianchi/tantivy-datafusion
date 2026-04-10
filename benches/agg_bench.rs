@@ -48,7 +48,15 @@ fn build_bench_index(num_docs: usize) -> Index {
 
     let index = Index::create_from_tempdir(schema_builder.build()).unwrap();
 
-    let status_labels = ["INFO", "ERROR", "WARN", "DEBUG", "OK", "CRITICAL", "EMERGENCY"];
+    let status_labels = [
+        "INFO",
+        "ERROR",
+        "WARN",
+        "DEBUG",
+        "OK",
+        "CRITICAL",
+        "EMERGENCY",
+    ];
     let status_weights = [8000u32, 300, 1200, 500, 500, 20, 1];
     let status_dist =
         rand::distr::weighted::WeightedIndex::new(status_weights.iter().copied()).unwrap();
@@ -120,13 +128,48 @@ fn agg_cases() -> Vec<AggCase> {
 // Runners
 // ---------------------------------------------------------------------------
 
-/// Tantivy native: AggregationCollector directly.
-fn run_native(index: &Index, agg_req: &serde_json::Value) {
-    let aggs: Aggregations = serde_json::from_value(agg_req.clone()).unwrap();
-    let collector = AggregationCollector::from_aggs(aggs, Default::default());
-    let reader = index.reader().unwrap();
-    let searcher = reader.searcher();
-    black_box(searcher.search(&AllQuery, &collector).unwrap());
+/// Tantivy native steady-state: reuse the IndexReader/Searcher across runs.
+struct NativeCtx {
+    reader: tantivy::IndexReader,
+    aggs: Aggregations,
+}
+
+impl NativeCtx {
+    fn new(index: &Index, agg_req: &serde_json::Value) -> Self {
+        Self {
+            reader: index.reader().unwrap(),
+            aggs: serde_json::from_value(agg_req.clone()).unwrap(),
+        }
+    }
+
+    fn run(&self) {
+        let collector = AggregationCollector::from_aggs(self.aggs.clone(), Default::default());
+        let searcher = self.reader.searcher();
+        black_box(searcher.search(&AllQuery, &collector).unwrap());
+    }
+}
+
+/// Tantivy native with a fresh reader every run. This quantifies the cost of
+/// reader construction separately from the steady-state baseline.
+struct NativeFreshReaderCtx {
+    index: Index,
+    aggs: Aggregations,
+}
+
+impl NativeFreshReaderCtx {
+    fn new(index: &Index, agg_req: &serde_json::Value) -> Self {
+        Self {
+            index: index.clone(),
+            aggs: serde_json::from_value(agg_req.clone()).unwrap(),
+        }
+    }
+
+    fn run(&self) {
+        let collector = AggregationCollector::from_aggs(self.aggs.clone(), Default::default());
+        let reader = self.index.reader().unwrap();
+        let searcher = reader.searcher();
+        black_box(searcher.search(&AllQuery, &collector).unwrap());
+    }
 }
 
 /// Unified path with AggPushdown: SQL through SingleTableProvider.
@@ -154,7 +197,12 @@ impl UnifiedPushdownCtx {
         ctx.register_table("t", Arc::new(SingleTableProvider::new(index.clone())))
             .unwrap();
         let plan = rt.block_on(async {
-            ctx.sql(sql).await.unwrap().create_physical_plan().await.unwrap()
+            ctx.sql(sql)
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap()
         });
         Self { rt, plan, ctx }
     }
@@ -162,8 +210,9 @@ impl UnifiedPushdownCtx {
     fn run(&self) {
         self.rt.block_on(async {
             let task_ctx = self.ctx.task_ctx();
-            let batches =
-                datafusion::physical_plan::collect(self.plan.clone(), task_ctx).await.unwrap();
+            let batches = datafusion::physical_plan::collect(self.plan.clone(), task_ctx)
+                .await
+                .unwrap();
             black_box(batches);
         });
     }
@@ -188,7 +237,12 @@ impl UnifiedSqlCtx {
         ctx.register_table("t", Arc::new(SingleTableProvider::new(index.clone())))
             .unwrap();
         let plan = rt.block_on(async {
-            ctx.sql(sql).await.unwrap().create_physical_plan().await.unwrap()
+            ctx.sql(sql)
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap()
         });
         Self { rt, plan, ctx }
     }
@@ -196,8 +250,9 @@ impl UnifiedSqlCtx {
     fn run(&self) {
         self.rt.block_on(async {
             let task_ctx = self.ctx.task_ctx();
-            let batches =
-                datafusion::physical_plan::collect(self.plan.clone(), task_ctx).await.unwrap();
+            let batches = datafusion::physical_plan::collect(self.plan.clone(), task_ctx)
+                .await
+                .unwrap();
             black_box(batches);
         });
     }
@@ -222,45 +277,86 @@ fn main() {
         }
     }
 
-    let inputs: Vec<(&str, Index)> = vec![
-        ("1M_docs", index_1m.clone()),
-        ("10M_docs", index_10m.clone()),
-    ];
-
     // Pre-build contexts for each index size × case
-    let pushdown_1m: Vec<Arc<UnifiedPushdownCtx>> = cases.iter()
-        .map(|c| Arc::new(UnifiedPushdownCtx::new(&index_1m, c.sql))).collect();
-    let pushdown_10m: Vec<Arc<UnifiedPushdownCtx>> = cases.iter()
-        .map(|c| Arc::new(UnifiedPushdownCtx::new(&index_10m, c.sql))).collect();
+    let native_1m: Vec<Arc<NativeCtx>> = cases
+        .iter()
+        .map(|c| Arc::new(NativeCtx::new(&index_1m, &c.json)))
+        .collect();
+    let native_10m: Vec<Arc<NativeCtx>> = cases
+        .iter()
+        .map(|c| Arc::new(NativeCtx::new(&index_10m, &c.json)))
+        .collect();
+    let native_fresh_1m: Vec<Arc<NativeFreshReaderCtx>> = cases
+        .iter()
+        .map(|c| Arc::new(NativeFreshReaderCtx::new(&index_1m, &c.json)))
+        .collect();
+    let native_fresh_10m: Vec<Arc<NativeFreshReaderCtx>> = cases
+        .iter()
+        .map(|c| Arc::new(NativeFreshReaderCtx::new(&index_10m, &c.json)))
+        .collect();
+    let pushdown_1m: Vec<Arc<UnifiedPushdownCtx>> = cases
+        .iter()
+        .map(|c| Arc::new(UnifiedPushdownCtx::new(&index_1m, c.sql)))
+        .collect();
+    let pushdown_10m: Vec<Arc<UnifiedPushdownCtx>> = cases
+        .iter()
+        .map(|c| Arc::new(UnifiedPushdownCtx::new(&index_10m, c.sql)))
+        .collect();
+    let unified_sql_1m: Vec<Arc<UnifiedSqlCtx>> = cases
+        .iter()
+        .map(|c| Arc::new(UnifiedSqlCtx::new(&index_1m, c.sql)))
+        .collect();
+    let unified_sql_10m: Vec<Arc<UnifiedSqlCtx>> = cases
+        .iter()
+        .map(|c| Arc::new(UnifiedSqlCtx::new(&index_10m, c.sql)))
+        .collect();
 
     // Run each case × each index size separately to avoid per-iteration index detection
     for (i, case) in cases.iter().enumerate() {
         // 1M benchmark
         {
+            let native = native_1m[i].clone();
+            let native_fresh = native_fresh_1m[i].clone();
             let pd = pushdown_1m[i].clone();
+            let sql = unified_sql_1m[i].clone();
             let mut group = InputGroup::new_with_inputs(vec![("1M_docs", index_1m.clone())]);
-            let json = case.json.clone();
-            group.register(&format!("native/{}", case.name), move |index| {
-                run_native(index, &json);
+            group.register(&format!("native_cached/{}", case.name), move |_| {
+                native.run();
+            });
+            group.register(&format!("native_fresh_reader/{}", case.name), move |_| {
+                native_fresh.run();
             });
             let pd_clone = pd.clone();
             group.register(&format!("unified_pushdown/{}", case.name), move |_| {
                 pd_clone.run();
+            });
+            let sql_clone = sql.clone();
+            group.register(&format!("unified_sql/{}", case.name), move |_| {
+                sql_clone.run();
             });
             group.run();
         }
 
         // 10M benchmark
         {
+            let native = native_10m[i].clone();
+            let native_fresh = native_fresh_10m[i].clone();
             let pd = pushdown_10m[i].clone();
+            let sql = unified_sql_10m[i].clone();
             let mut group = InputGroup::new_with_inputs(vec![("10M_docs", index_10m.clone())]);
-            let json = case.json.clone();
-            group.register(&format!("native/{}", case.name), move |index| {
-                run_native(index, &json);
+            group.register(&format!("native_cached/{}", case.name), move |_| {
+                native.run();
+            });
+            group.register(&format!("native_fresh_reader/{}", case.name), move |_| {
+                native_fresh.run();
             });
             let pd_clone = pd.clone();
             group.register(&format!("unified_pushdown/{}", case.name), move |_| {
                 pd_clone.run();
+            });
+            let sql_clone = sql.clone();
+            group.register(&format!("unified_sql/{}", case.name), move |_| {
+                sql_clone.run();
             });
             group.run();
         }

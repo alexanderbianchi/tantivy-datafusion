@@ -58,8 +58,16 @@ fn add_test_documents(
     writer: &IndexWriter,
     fields: (Field, Field, Field, Field, Field, Field, Field, Field),
 ) {
-    let (u64_field, i64_field, f64_field, bool_field, text_field, date_field, ip_field, bytes_field) =
-        fields;
+    let (
+        u64_field,
+        i64_field,
+        f64_field,
+        bool_field,
+        text_field,
+        date_field,
+        ip_field,
+        bytes_field,
+    ) = fields;
 
     let timestamps = [1_000_000i64, 2_000_000, 3_000_000, 4_000_000, 5_000_000];
     let ips: [Ipv4Addr; 5] = [
@@ -92,8 +100,7 @@ fn add_test_documents(
 }
 
 fn create_test_index() -> Index {
-    let (schema, u64_f, i64_f, f64_f, bool_f, text_f, date_f, ip_f, bytes_f) =
-        build_test_schema();
+    let (schema, u64_f, i64_f, f64_f, bool_f, text_f, date_f, ip_f, bytes_f) = build_test_schema();
 
     let index = Index::create_in_ram(schema);
     let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
@@ -128,10 +135,7 @@ fn setup_ctx(index: Index) -> SessionContext {
 
 /// Read a string value from a column that may be StringArray or DictionaryArray.
 fn string_val(col: &dyn arrow::array::Array, idx: usize) -> String {
-    if let Some(s) = col
-        .as_any()
-        .downcast_ref::<arrow::array::StringArray>()
-    {
+    if let Some(s) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
         return s.value(idx).to_string();
     }
     if let Some(dict) = col
@@ -348,7 +352,11 @@ async fn test_group_by_with_where() {
     let batch = collect_batches(&batches);
 
     // 3 categories remain after filtering (electronics loses id=1 with price=1.5)
-    assert_eq!(batch.num_rows(), 3, "Expected 3 category groups after filter");
+    assert_eq!(
+        batch.num_rows(),
+        3,
+        "Expected 3 category groups after filter"
+    );
 
     let schema = batch.schema();
     let cat_col = batch.column(schema.index_of("category").unwrap());
@@ -414,8 +422,14 @@ async fn test_sum_avg_without_group_by() {
         .value(0);
 
     let eps = 1e-10;
-    assert!((sum_val - 17.5).abs() < eps, "SUM should be 17.5, got {sum_val}");
-    assert!((avg_val - 3.5).abs() < eps, "AVG should be 3.5, got {avg_val}");
+    assert!(
+        (sum_val - 17.5).abs() < eps,
+        "SUM should be 17.5, got {sum_val}"
+    );
+    assert!(
+        (avg_val - 3.5).abs() < eps,
+        "AVG should be 3.5, got {avg_val}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -441,7 +455,15 @@ fn build_large_index(num_docs: usize) -> Index {
 
     let index = Index::create_from_tempdir(schema_builder.build()).unwrap();
 
-    let status_labels = ["INFO", "ERROR", "WARN", "DEBUG", "OK", "CRITICAL", "EMERGENCY"];
+    let status_labels = [
+        "INFO",
+        "ERROR",
+        "WARN",
+        "DEBUG",
+        "OK",
+        "CRITICAL",
+        "EMERGENCY",
+    ];
     let status_weights = [8000u32, 300, 1200, 500, 500, 20, 1];
     let status_dist =
         rand::distr::weighted::WeightedIndex::new(status_weights.iter().copied()).unwrap();
@@ -541,7 +563,10 @@ fn profile_runtime_configs() {
         eprintln!(
             "Index: {} segments, {} total docs",
             s.segment_readers().len(),
-            s.segment_readers().iter().map(|sr| sr.max_doc()).sum::<u32>(),
+            s.segment_readers()
+                .iter()
+                .map(|sr| sr.max_doc())
+                .sum::<u32>(),
         );
     }
 
@@ -682,7 +707,9 @@ fn investigate_terms_size_perf() {
     }
 
     // Benchmark
-    eprintln!("\n=== TermsAggregation size investigation ({NUM_DOCS} docs, {ITERATIONS} iters) ===\n");
+    eprintln!(
+        "\n=== TermsAggregation size investigation ({NUM_DOCS} docs, {ITERATIONS} iters) ===\n"
+    );
     for (label, agg_json) in &configs {
         let mut durations = Vec::with_capacity(ITERATIONS);
         for _ in 0..ITERATIONS {
@@ -727,7 +754,13 @@ fn build_10m_index() -> Index {
     let index = Index::create_from_tempdir(schema_builder.build()).unwrap();
 
     let status_labels = [
-        "INFO", "ERROR", "WARN", "DEBUG", "OK", "CRITICAL", "EMERGENCY",
+        "INFO",
+        "ERROR",
+        "WARN",
+        "DEBUG",
+        "OK",
+        "CRITICAL",
+        "EMERGENCY",
     ];
     let status_weights = [8000u32, 300, 1200, 500, 500, 20, 1];
     let status_dist =
@@ -739,10 +772,7 @@ fn build_10m_index() -> Index {
     for _ in 0..num_docs {
         let mut doc = TantivyDocument::default();
         doc.add_text(text_field, "cool");
-        doc.add_text(
-            text_field_few,
-            status_labels[status_dist.sample(&mut rng)],
-        );
+        doc.add_text(text_field_few, status_labels[status_dist.sample(&mut rng)]);
         doc.add_f64(score_field_f64, lg_norm.sample(&mut rng));
         writer.add_document(doc).unwrap();
     }
@@ -977,5 +1007,100 @@ async fn profile_10m_terms_overhead() {
     eprintln!(
         "  size=10  native -> DF pushdown:     +{}ms",
         df_pushdown_ms as i128 - native_small_ms as i128
+    );
+}
+
+/// Print the physical plan and isolate reader construction vs DataFusion
+/// execution overhead for the 10M `terms_few` case.
+///
+/// Run with:
+///   cargo test --release --test agg_correctness profile_10m_terms_plan_and_reader -- --nocapture --ignored
+#[ignore]
+#[tokio::test]
+async fn profile_10m_terms_plan_and_reader() {
+    use datafusion::physical_plan::{collect, displayable};
+    use futures::StreamExt;
+    use tantivy::aggregation::AggregationCollector;
+    use tantivy::query::AllQuery;
+
+    eprintln!("Building 10M doc index...");
+    let index = build_10m_index();
+    let reader = index.reader().unwrap();
+    let searcher = reader.searcher();
+    eprintln!("Segments: {}", searcher.segment_readers().len());
+
+    let provider = SingleTableProvider::new(index.clone());
+    let config = SessionConfig::new().with_target_partitions(1);
+    let state = SessionStateBuilder::new()
+        .with_config(config)
+        .with_default_features()
+        .with_physical_optimizer_rule(Arc::new(AggPushdown::new()))
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+    ctx.register_table("t", Arc::new(provider)).unwrap();
+
+    let plan = ctx
+        .sql("SELECT text_few_terms_status, COUNT(*) FROM t GROUP BY text_few_terms_status")
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    eprintln!(
+        "Physical plan:\n{}",
+        displayable(plan.as_ref()).indent(true)
+    );
+
+    let aggs: tantivy::aggregation::agg_req::Aggregations = serde_json::from_value(
+        serde_json::json!({ "t": { "terms": { "field": "text_few_terms_status" } } }),
+    )
+    .unwrap();
+
+    let iters: u128 = 20;
+
+    let _ = index.reader().unwrap();
+    let t_reader = Instant::now();
+    for _ in 0..iters {
+        let fresh_reader = index.reader().unwrap();
+        std::hint::black_box(fresh_reader.searcher().segment_readers().len());
+    }
+    eprintln!(
+        "index.reader():                      {}ms",
+        t_reader.elapsed().as_millis() / iters
+    );
+
+    let collector = AggregationCollector::from_aggs(aggs.clone(), Default::default());
+    let _ = searcher.search(&AllQuery, &collector).unwrap();
+    let t_native = Instant::now();
+    for _ in 0..iters {
+        let collector = AggregationCollector::from_aggs(aggs.clone(), Default::default());
+        let _ = searcher.search(&AllQuery, &collector).unwrap();
+    }
+    eprintln!(
+        "native searcher.search():            {}ms",
+        t_native.elapsed().as_millis() / iters
+    );
+
+    let _ = collect(plan.clone(), ctx.task_ctx()).await.unwrap();
+    let t_execute = Instant::now();
+    for _ in 0..iters {
+        let mut stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let first = stream.next().await.transpose().unwrap().unwrap();
+        assert!(stream.next().await.is_none());
+        std::hint::black_box(first);
+    }
+    eprintln!(
+        "plan.execute(0)+next():              {}ms",
+        t_execute.elapsed().as_millis() / iters
+    );
+
+    let t_collect = Instant::now();
+    for _ in 0..iters {
+        let batches = collect(plan.clone(), ctx.task_ctx()).await.unwrap();
+        std::hint::black_box(batches);
+    }
+    eprintln!(
+        "collect(plan):                       {}ms",
+        t_collect.elapsed().as_millis() / iters
     );
 }

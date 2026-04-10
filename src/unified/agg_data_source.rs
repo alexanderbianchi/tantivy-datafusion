@@ -13,14 +13,14 @@ use datafusion::common::{Result, Statistics};
 use datafusion::error::DataFusionError;
 use datafusion_datasource::source::DataSource;
 use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
 use datafusion_physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
 use datafusion_physical_plan::projection::ProjectionExprs;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{DisplayFormatType, Partitioning, SendableRecordBatchStream};
-use datafusion_physical_expr::PhysicalExpr;
 use futures::stream::{self, StreamExt};
-use tantivy::aggregation::agg_req::{Aggregation, AggregationVariants, Aggregations};
+use tantivy::aggregation::agg_req::Aggregations;
 
 use datafusion::logical_expr::Expr;
 
@@ -146,11 +146,12 @@ impl DataSource for AggDataSource {
                 }
             }
 
-            // Move sync work (including query building) to blocking thread.
-            // Create the IndexReader before spawn_blocking so it's reused.
-            let reader = index.reader()
-                .map_err(|e| DataFusionError::Internal(format!("open reader: {e}")))?;
+            // Move sync work (including reader construction and query building)
+            // to a blocking thread so we never block the async executor.
             tokio::task::spawn_blocking(move || {
+                let reader = index
+                    .reader()
+                    .map_err(|e| DataFusionError::Internal(format!("open reader: {e}")))?;
                 let query = build_combined_query(&index, pre_built_query.as_ref(), &raw_queries)?;
                 crate::unified::agg_exec::execute_tantivy_agg_with_reader(
                     &index,
@@ -227,40 +228,17 @@ impl DataSource for AggDataSource {
     ) -> Result<FilterPushdownPropagation<Arc<dyn DataSource>>> {
         // No filter pushdown support — aggregation runs on the full query result.
         let results: Vec<PushedDown> = filters.iter().map(|_| PushedDown::No).collect();
-        Ok(FilterPushdownPropagation::with_parent_pushdown_result(results))
+        Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+            results,
+        ))
     }
 }
 
 /// Extract all field names referenced by an `Aggregations` tree.
 fn extract_agg_field_names(aggs: &Aggregations) -> Vec<String> {
-    let mut fields = Vec::new();
-    for (_name, agg) in aggs.iter() {
-        collect_fields_from_agg(agg, &mut fields);
-    }
+    let mut fields: Vec<String> = tantivy::aggregation::agg_req::get_fast_field_names(aggs)
+        .into_iter()
+        .collect();
     fields.sort();
-    fields.dedup();
     fields
-}
-
-fn collect_fields_from_agg(agg: &Aggregation, fields: &mut Vec<String>) {
-    match &agg.agg {
-        AggregationVariants::Terms(t) => fields.push(t.field.clone()),
-        AggregationVariants::Histogram(h) => fields.push(h.field.clone()),
-        AggregationVariants::DateHistogram(dh) => fields.push(dh.field.clone()),
-        AggregationVariants::Range(r) => fields.push(r.field.clone()),
-        AggregationVariants::Average(a) => fields.push(a.field.clone()),
-        AggregationVariants::Sum(a) => fields.push(a.field.clone()),
-        AggregationVariants::Min(a) => fields.push(a.field.clone()),
-        AggregationVariants::Max(a) => fields.push(a.field.clone()),
-        AggregationVariants::Count(a) => fields.push(a.field.clone()),
-        AggregationVariants::Stats(a) => fields.push(a.field.clone()),
-        AggregationVariants::ExtendedStats(a) => fields.push(a.field.clone()),
-        AggregationVariants::Percentiles(a) => fields.push(a.field.clone()),
-        AggregationVariants::Cardinality(a) => fields.push(a.field.clone()),
-        AggregationVariants::Filter(_) | AggregationVariants::TopHits(_) => {}
-    }
-    // Recurse into sub-aggregations
-    for (_sub_name, sub_agg) in agg.sub_aggregation.iter() {
-        collect_fields_from_agg(sub_agg, fields);
-    }
 }

@@ -76,8 +76,7 @@ pub fn tantivy_schema_to_arrow_from_index(index: &Index) -> SchemaRef {
         let name = field_entry.name();
 
         let is_multivalued = segment_readers.iter().any(|seg| {
-            field_cardinality(seg, name, field_entry.field_type())
-                == Some(Cardinality::Multivalued)
+            field_cardinality(seg, name, field_entry.field_type()) == Some(Cardinality::Multivalued)
         });
 
         let arrow_type = if is_multivalued {

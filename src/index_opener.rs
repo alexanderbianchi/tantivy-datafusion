@@ -3,6 +3,7 @@ use std::fmt;
 
 use async_trait::async_trait;
 use datafusion::common::Result;
+use datafusion::error::DataFusionError;
 use tantivy::Index;
 
 use crate::schema_mapping::field_cardinality;
@@ -107,6 +108,13 @@ impl DirectIndexOpener {
     pub fn index(&self) -> &Index {
         &self.index
     }
+
+    /// Return a long-lived reader for this index snapshot.
+    pub fn reader(&self) -> Result<tantivy::IndexReader> {
+        self.index
+            .reader()
+            .map_err(|e| DataFusionError::Internal(format!("open reader: {e}")))
+    }
 }
 
 #[async_trait]
@@ -120,7 +128,7 @@ impl IndexOpener for DirectIndexOpener {
     }
 
     fn segment_sizes(&self) -> Vec<u32> {
-        match self.index.reader() {
+        match self.reader() {
             Ok(reader) => {
                 let searcher = reader.searcher();
                 searcher
@@ -140,7 +148,7 @@ impl IndexOpener for DirectIndexOpener {
     fn multi_valued_fields(&self) -> Vec<String> {
         use tantivy::columnar::Cardinality;
         let schema = self.index.schema();
-        let reader = match self.index.reader() {
+        let reader = match self.reader() {
             Ok(r) => r,
             Err(_) => return vec![],
         };
@@ -173,7 +181,6 @@ impl IndexOpener for DirectIndexOpener {
     fn needs_warmup(&self) -> bool {
         false // mmap — data already accessible, no async pre-loading needed
     }
-
     fn as_any(&self) -> &dyn Any {
         self
     }

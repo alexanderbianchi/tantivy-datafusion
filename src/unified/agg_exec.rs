@@ -18,20 +18,6 @@ use tantivy::Index;
 // Core tantivy aggregation execution
 // ---------------------------------------------------------------------------
 
-/// Execute tantivy aggregation using `Searcher::search()` directly.
-///
-/// This uses tantivy's native segment-parallel execution (Rayon thread pool)
-/// rather than iterating segments serially. For multi-segment indexes,
-/// this matches native tantivy performance.
-pub(crate) fn execute_tantivy_agg(
-    index: &Index,
-    aggs: &Aggregations,
-    query: Option<&Arc<dyn Query>>,
-    output_schema: &SchemaRef,
-) -> Result<RecordBatch> {
-    execute_tantivy_agg_with_reader(index, aggs, query, output_schema, None)
-}
-
 pub(crate) fn execute_tantivy_agg_with_reader(
     index: &Index,
     aggs: &Aggregations,
@@ -54,10 +40,8 @@ pub(crate) fn execute_tantivy_agg_with_reader(
     // Use tantivy's native Searcher::search() which parallelizes across
     // segments using Rayon. Our previous manual segment loop was serial,
     // causing a 3x regression on 3-segment indexes.
-    let collector = tantivy::aggregation::AggregationCollector::from_aggs(
-        aggs.clone(),
-        Default::default(),
-    );
+    let collector =
+        tantivy::aggregation::AggregationCollector::from_aggs(aggs.clone(), Default::default());
 
     let effective_query: Box<dyn Query> = match query {
         Some(q) => q.box_clone(),
@@ -113,9 +97,7 @@ fn agg_results_to_batch(
             metric_to_batch(metric, agg_name, agg_def, schema)
         }
         // Bucket aggregations → N rows
-        (_, AggregationResult::BucketResult(bucket)) => {
-            bucket_to_batch(bucket, agg_def, schema)
-        }
+        (_, AggregationResult::BucketResult(bucket)) => bucket_to_batch(bucket, agg_def, schema),
     }
 }
 
@@ -151,7 +133,9 @@ fn extract_metric_value(metric: &MetricResult, agg_name: &str, col_name: &str) -
 
         MetricResult::Stats(stats) => {
             // Schema columns: {name}_min, {name}_max, {name}_sum, {name}_count, {name}_avg
-            let suffix = col_name.strip_prefix(&format!("{agg_name}_")).unwrap_or(col_name);
+            let suffix = col_name
+                .strip_prefix(&format!("{agg_name}_"))
+                .unwrap_or(col_name);
             match suffix {
                 "min" => stats.min,
                 "max" => stats.max,
@@ -163,7 +147,9 @@ fn extract_metric_value(metric: &MetricResult, agg_name: &str, col_name: &str) -
         }
 
         MetricResult::ExtendedStats(es) => {
-            let suffix = col_name.strip_prefix(&format!("{agg_name}_")).unwrap_or(col_name);
+            let suffix = col_name
+                .strip_prefix(&format!("{agg_name}_"))
+                .unwrap_or(col_name);
             match suffix {
                 "min" => es.min,
                 "max" => es.max,
@@ -207,9 +193,7 @@ fn extract_percentile_value(
             }
             None
         }
-        tantivy::aggregation::metric::PercentileValues::HashMap(map) => {
-            map.get(suffix).copied()
-        }
+        tantivy::aggregation::metric::PercentileValues::HashMap(map) => map.get(suffix).copied(),
     }
 }
 
@@ -277,7 +261,9 @@ fn terms_bucket_to_batch(
             // Sub-aggregation metric column
             let values: Vec<Option<f64>> = buckets
                 .iter()
-                .map(|b| extract_sub_agg_value(&b.sub_aggregation, col_name, &agg_def.sub_aggregation))
+                .map(|b| {
+                    extract_sub_agg_value(&b.sub_aggregation, col_name, &agg_def.sub_aggregation)
+                })
                 .collect();
             columns.push(typed_f64_column(&values, field.data_type()));
         }
@@ -298,10 +284,7 @@ fn histogram_bucket_to_batch(
         let col_name = field.name().as_str();
 
         if col_name == "bucket" {
-            let values: Vec<Option<f64>> = buckets
-                .iter()
-                .map(|b| key_to_f64(&b.key))
-                .collect();
+            let values: Vec<Option<f64>> = buckets.iter().map(|b| key_to_f64(&b.key)).collect();
             columns.push(Arc::new(Float64Array::from(values)));
         } else if is_doc_count_column(col_name, &agg_def.sub_aggregation) {
             let values: Vec<i64> = buckets.iter().map(|b| b.doc_count as i64).collect();
@@ -309,7 +292,9 @@ fn histogram_bucket_to_batch(
         } else {
             let values: Vec<Option<f64>> = buckets
                 .iter()
-                .map(|b| extract_sub_agg_value(&b.sub_aggregation, col_name, &agg_def.sub_aggregation))
+                .map(|b| {
+                    extract_sub_agg_value(&b.sub_aggregation, col_name, &agg_def.sub_aggregation)
+                })
                 .collect();
             columns.push(typed_f64_column(&values, field.data_type()));
         }
@@ -330,10 +315,8 @@ fn range_bucket_to_batch(
         let col_name = field.name().as_str();
 
         if col_name == "bucket" {
-            let values: Vec<Option<&str>> = buckets
-                .iter()
-                .map(|b| Some(key_as_str(&b.key)))
-                .collect();
+            let values: Vec<Option<&str>> =
+                buckets.iter().map(|b| Some(key_as_str(&b.key))).collect();
             columns.push(Arc::new(StringArray::from(values)));
         } else if is_doc_count_column(col_name, &agg_def.sub_aggregation) {
             let values: Vec<i64> = buckets.iter().map(|b| b.doc_count as i64).collect();
@@ -341,7 +324,9 @@ fn range_bucket_to_batch(
         } else {
             let values: Vec<Option<f64>> = buckets
                 .iter()
-                .map(|b| extract_sub_agg_value(&b.sub_aggregation, col_name, &agg_def.sub_aggregation))
+                .map(|b| {
+                    extract_sub_agg_value(&b.sub_aggregation, col_name, &agg_def.sub_aggregation)
+                })
                 .collect();
             columns.push(typed_f64_column(&values, field.data_type()));
         }
@@ -482,10 +467,8 @@ fn extract_sub_agg_value(
     sub_agg_defs: &Aggregations,
 ) -> Option<f64> {
     // Try direct match: col_name is a sub-agg key
-    if let Some(result) = sub_agg_results.0.get(col_name) {
-        if let AggregationResult::MetricResult(metric) = result {
-            return extract_simple_metric_value(metric);
-        }
+    if let Some(AggregationResult::MetricResult(metric)) = sub_agg_results.0.get(col_name) {
+        return extract_simple_metric_value(metric);
     }
 
     // Try prefix match for stats-like aggs: col_name = "{sub_agg_name}_{suffix}"

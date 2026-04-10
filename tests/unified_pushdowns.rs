@@ -7,9 +7,7 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::*;
 use tantivy::schema::{Field, SchemaBuilder, FAST, STORED, TEXT};
 use tantivy::{DateTime, Index, IndexWriter, TantivyDocument};
-use tantivy_datafusion::{
-    full_text_udf, AggPushdown, SingleTableProvider,
-};
+use tantivy_datafusion::{full_text_udf, AggPushdown, SingleTableProvider};
 
 // ---------------------------------------------------------------------------
 // Shared helpers (mirrored from single_table.rs / end_to_end.rs)
@@ -53,8 +51,16 @@ fn add_test_documents(
     writer: &IndexWriter,
     fields: (Field, Field, Field, Field, Field, Field, Field, Field),
 ) {
-    let (u64_field, i64_field, f64_field, bool_field, text_field, date_field, ip_field, bytes_field) =
-        fields;
+    let (
+        u64_field,
+        i64_field,
+        f64_field,
+        bool_field,
+        text_field,
+        date_field,
+        ip_field,
+        bytes_field,
+    ) = fields;
 
     let timestamps = [1_000_000i64, 2_000_000, 3_000_000, 4_000_000, 5_000_000];
     let ips: [Ipv4Addr; 5] = [
@@ -87,8 +93,7 @@ fn add_test_documents(
 }
 
 fn create_test_index() -> Index {
-    let (schema, u64_f, i64_f, f64_f, bool_f, text_f, date_f, ip_f, bytes_f) =
-        build_test_schema();
+    let (schema, u64_f, i64_f, f64_f, bool_f, text_f, date_f, ip_f, bytes_f) = build_test_schema();
 
     let index = Index::create_in_ram(schema);
     let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
@@ -219,16 +224,40 @@ async fn test_agg_pushdown_group_by_sum_avg() {
 
     let eps = 1e-10;
     assert_eq!(results[0].0, "books");
-    assert!((results[0].1 - 7.0).abs() < eps, "books SUM: {}", results[0].1);
-    assert!((results[0].2 - 3.5).abs() < eps, "books AVG: {}", results[0].2);
+    assert!(
+        (results[0].1 - 7.0).abs() < eps,
+        "books SUM: {}",
+        results[0].1
+    );
+    assert!(
+        (results[0].2 - 3.5).abs() < eps,
+        "books AVG: {}",
+        results[0].2
+    );
 
     assert_eq!(results[1].0, "clothing");
-    assert!((results[1].1 - 5.5).abs() < eps, "clothing SUM: {}", results[1].1);
-    assert!((results[1].2 - 5.5).abs() < eps, "clothing AVG: {}", results[1].2);
+    assert!(
+        (results[1].1 - 5.5).abs() < eps,
+        "clothing SUM: {}",
+        results[1].1
+    );
+    assert!(
+        (results[1].2 - 5.5).abs() < eps,
+        "clothing AVG: {}",
+        results[1].2
+    );
 
     assert_eq!(results[2].0, "electronics");
-    assert!((results[2].1 - 5.0).abs() < eps, "electronics SUM: {}", results[2].1);
-    assert!((results[2].2 - 2.5).abs() < eps, "electronics AVG: {}", results[2].2);
+    assert!(
+        (results[2].1 - 5.0).abs() < eps,
+        "electronics SUM: {}",
+        results[2].1
+    );
+    assert!(
+        (results[2].2 - 2.5).abs() < eps,
+        "electronics AVG: {}",
+        results[2].2
+    );
 }
 
 #[tokio::test]
@@ -442,5 +471,26 @@ async fn test_plan_has_no_joins() {
     assert!(
         has_custom_ds,
         "Plan should contain a tantivy-specific execution node.\n\nPlan:\n{plan}"
+    );
+}
+
+#[tokio::test]
+async fn test_plan_uses_agg_data_source_for_group_by_count() {
+    let ctx = setup_ctx(create_test_index());
+
+    let df = ctx
+        .sql("EXPLAIN SELECT category, COUNT(*) as cnt FROM t GROUP BY category")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let plan = plan_to_string(&batches);
+
+    assert!(
+        plan.contains("AggDataSource"),
+        "Plan should use AggDataSource for GROUP BY count pushdown.\n\nPlan:\n{plan}"
+    );
+    assert!(
+        !plan.contains("AggregateExec"),
+        "Plan should not leave DataFusion AggregateExec nodes after pushdown.\n\nPlan:\n{plan}"
     );
 }

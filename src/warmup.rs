@@ -31,13 +31,16 @@ pub async fn warmup_inverted_index(index: &Index, query_fields: &[Field]) -> Res
                 DataFusionError::Internal(format!("get inverted index for warmup: {e}"))
             })?;
 
-            inv_index.terms().warm_up_dictionary().await.map_err(|e| {
-                DataFusionError::Internal(format!("warm term dict: {e}"))
-            })?;
+            inv_index
+                .terms()
+                .warm_up_dictionary()
+                .await
+                .map_err(|e| DataFusionError::Internal(format!("warm term dict: {e}")))?;
 
-            (*inv_index).warm_postings_full(false).await.map_err(|e| {
-                DataFusionError::Internal(format!("warm postings: {e}"))
-            })?;
+            (*inv_index)
+                .warm_postings_full(false)
+                .await
+                .map_err(|e| DataFusionError::Internal(format!("warm postings: {e}")))?;
         }
     }
 
@@ -94,10 +97,7 @@ pub async fn warmup_fast_fields(index: &Index) -> Result<()> {
                 continue;
             }
             // Warm by listing column handles and reading file slices.
-            let handles = match ff_reader
-                .list_dynamic_column_handles(entry.name())
-                .await
-            {
+            let handles = match ff_reader.list_dynamic_column_handles(entry.name()).await {
                 Ok(h) => h,
                 Err(_) => continue, // field not present in this segment
             };

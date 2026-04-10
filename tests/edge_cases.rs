@@ -7,9 +7,7 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::*;
 use tantivy::schema::{Field, SchemaBuilder, Term, FAST, STORED, TEXT};
 use tantivy::{DateTime, Index, IndexWriter, TantivyDocument};
-use tantivy_datafusion::{
-    full_text_udf, AggPushdown, SingleTableProvider,
-};
+use tantivy_datafusion::{full_text_udf, AggPushdown, SingleTableProvider};
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -53,8 +51,16 @@ fn add_test_documents(
     writer: &IndexWriter,
     fields: (Field, Field, Field, Field, Field, Field, Field, Field),
 ) {
-    let (u64_field, i64_field, f64_field, bool_field, text_field, date_field, ip_field, bytes_field) =
-        fields;
+    let (
+        u64_field,
+        i64_field,
+        f64_field,
+        bool_field,
+        text_field,
+        date_field,
+        ip_field,
+        bytes_field,
+    ) = fields;
 
     let timestamps = [1_000_000i64, 2_000_000, 3_000_000, 4_000_000, 5_000_000];
     let ips: [Ipv4Addr; 5] = [
@@ -115,8 +121,7 @@ fn total_rows(batches: &[RecordBatch]) -> usize {
 
 /// Standard 5-doc index, then delete docs with id=2 and id=4 (leaves 1, 3, 5).
 fn create_index_with_deletes() -> Index {
-    let (schema, u64_f, i64_f, f64_f, bool_f, text_f, date_f, ip_f, bytes_f) =
-        build_test_schema();
+    let (schema, u64_f, i64_f, f64_f, bool_f, text_f, date_f, ip_f, bytes_f) = build_test_schema();
 
     let index = Index::create_in_ram(schema);
     let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
@@ -145,8 +150,7 @@ fn create_empty_index() -> Index {
 
 /// Two-segment index: first 3 docs in segment 1, remaining 2 in segment 2.
 fn create_multi_segment_index() -> Index {
-    let (schema, u64_f, i64_f, f64_f, bool_f, text_f, date_f, ip_f, bytes_f) =
-        build_test_schema();
+    let (schema, u64_f, i64_f, f64_f, bool_f, text_f, date_f, ip_f, bytes_f) = build_test_schema();
 
     let index = Index::create_in_ram(schema);
     let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
@@ -201,8 +205,7 @@ fn create_multi_segment_index() -> Index {
 
 /// Two-segment index with doc id=2 deleted from segment 1.
 fn create_multi_segment_index_with_deletes() -> Index {
-    let (schema, u64_f, i64_f, f64_f, bool_f, text_f, date_f, ip_f, bytes_f) =
-        build_test_schema();
+    let (schema, u64_f, i64_f, f64_f, bool_f, text_f, date_f, ip_f, bytes_f) = build_test_schema();
 
     let index = Index::create_in_ram(schema);
     let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
@@ -261,8 +264,7 @@ fn create_multi_segment_index_with_deletes() -> Index {
 
 /// Index with exactly 1 document.
 fn create_single_doc_index() -> Index {
-    let (schema, u64_f, i64_f, f64_f, bool_f, text_f, date_f, ip_f, bytes_f) =
-        build_test_schema();
+    let (schema, u64_f, i64_f, f64_f, bool_f, text_f, date_f, ip_f, bytes_f) = build_test_schema();
 
     let index = Index::create_in_ram(schema);
     let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
@@ -294,7 +296,11 @@ async fn test_deleted_docs_select_all() {
     let batches = df.collect().await.unwrap();
     let batch = collect_batches(&batches);
 
-    assert_eq!(batch.num_rows(), 3, "Expected 3 alive docs after deleting 2");
+    assert_eq!(
+        batch.num_rows(),
+        3,
+        "Expected 3 alive docs after deleting 2"
+    );
     let ids = batch.column(0).as_primitive::<UInt64Type>();
     assert_eq!(ids.value(0), 1);
     assert_eq!(ids.value(1), 3);
@@ -319,8 +325,7 @@ async fn test_deleted_docs_count_group_by() {
 
     assert_eq!(batch.num_rows(), 2, "Expected 2 categories (books deleted)");
 
-    let cat_col =
-        arrow::compute::cast(batch.column(0), &arrow::datatypes::DataType::Utf8).unwrap();
+    let cat_col = arrow::compute::cast(batch.column(0), &arrow::datatypes::DataType::Utf8).unwrap();
     let categories = cat_col.as_string::<i32>();
     let counts = batch.column(1).as_primitive::<Int64Type>();
 
@@ -341,7 +346,11 @@ async fn test_deleted_docs_full_text_excludes_deleted() {
         .unwrap();
     let batches = df.collect().await.unwrap();
 
-    assert_eq!(total_rows(&batches), 0, "Deleted 'books' docs should not appear");
+    assert_eq!(
+        total_rows(&batches),
+        0,
+        "Deleted 'books' docs should not appear"
+    );
 }
 
 #[tokio::test]
@@ -472,8 +481,7 @@ async fn test_multi_segment_aggregation() {
 
     assert_eq!(batch.num_rows(), 3);
 
-    let cat_col =
-        arrow::compute::cast(batch.column(0), &arrow::datatypes::DataType::Utf8).unwrap();
+    let cat_col = arrow::compute::cast(batch.column(0), &arrow::datatypes::DataType::Utf8).unwrap();
     let categories = cat_col.as_string::<i32>();
     let counts = batch.column(1).as_primitive::<Int64Type>();
 
@@ -600,8 +608,7 @@ async fn test_multi_segment_with_deletes_aggregation() {
     let batch = collect_batches(&batches);
 
     assert_eq!(batch.num_rows(), 3);
-    let cat_col =
-        arrow::compute::cast(batch.column(0), &arrow::datatypes::DataType::Utf8).unwrap();
+    let cat_col = arrow::compute::cast(batch.column(0), &arrow::datatypes::DataType::Utf8).unwrap();
     let categories = cat_col.as_string::<i32>();
     let counts = batch.column(1).as_primitive::<Int64Type>();
 
@@ -667,7 +674,11 @@ async fn test_zero_match_full_text() {
         .unwrap();
     let batches = df.collect().await.unwrap();
 
-    assert_eq!(total_rows(&batches), 0, "Nonexistent term should match 0 rows");
+    assert_eq!(
+        total_rows(&batches),
+        0,
+        "Nonexistent term should match 0 rows"
+    );
 }
 
 #[tokio::test]

@@ -231,11 +231,7 @@ async fn test_filter_matches_nothing() {
 #[tokio::test]
 async fn test_filter_matches_everything() {
     let ctx = setup_filter_session();
-    let batch = run_sql(
-        &ctx,
-        "SELECT id FROM t WHERE price > 0.0 ORDER BY id",
-    )
-    .await;
+    let batch = run_sql(&ctx, "SELECT id FROM t WHERE price > 0.0 ORDER BY id").await;
 
     assert_eq!(batch.num_rows(), 5);
     let ids = batch.column(0).as_primitive::<UInt64Type>();
@@ -294,11 +290,15 @@ fn test_null_padding_for_missing_fast_field() {
     assert_eq!(batch.num_rows(), 1);
 
     // _doc_id
-    let doc_ids = batch.column(0).as_primitive::<arrow::datatypes::UInt32Type>();
+    let doc_ids = batch
+        .column(0)
+        .as_primitive::<arrow::datatypes::UInt32Type>();
     assert_eq!(doc_ids.value(0), 0);
 
     // _segment_ord
-    let seg_ords = batch.column(1).as_primitive::<arrow::datatypes::UInt32Type>();
+    let seg_ords = batch
+        .column(1)
+        .as_primitive::<arrow::datatypes::UInt32Type>();
     assert_eq!(seg_ords.value(0), 0);
 
     // Real "id" field

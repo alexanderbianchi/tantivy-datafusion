@@ -29,15 +29,11 @@ pub(crate) fn build_combined_query(
     let tantivy_schema = index.schema();
     for (field_name, query_string) in raw_queries {
         let field = tantivy_schema.get_field(field_name).map_err(|e| {
-            DataFusionError::Plan(format!(
-                "full_text: field '{field_name}' not found: {e}"
-            ))
+            DataFusionError::Plan(format!("full_text: field '{field_name}' not found: {e}"))
         })?;
         let parser = QueryParser::for_index(index, vec![field]);
         let parsed = parser.parse_query(query_string).map_err(|e| {
-            DataFusionError::Plan(format!(
-                "full_text: failed to parse '{query_string}': {e}"
-            ))
+            DataFusionError::Plan(format!("full_text: failed to parse '{query_string}': {e}"))
         })?;
         queries.push(parsed);
     }
@@ -82,31 +78,23 @@ pub(crate) fn collect_matching_docs(
                         let mut threshold = Score::MIN;
                         top_n.threshold = Some(threshold);
                         weight
-                            .for_each_pruning(
-                                Score::MIN,
-                                segment_reader,
-                                &mut |doc, score| {
-                                    if alive_bitset.is_deleted(doc) {
-                                        return threshold;
-                                    }
-                                    top_n.push(score, doc);
-                                    threshold = top_n.threshold.unwrap_or(Score::MIN);
-                                    threshold
-                                },
-                            )
+                            .for_each_pruning(Score::MIN, segment_reader, &mut |doc, score| {
+                                if alive_bitset.is_deleted(doc) {
+                                    return threshold;
+                                }
+                                top_n.push(score, doc);
+                                threshold = top_n.threshold.unwrap_or(Score::MIN);
+                                threshold
+                            })
                             .map_err(|e| {
                                 DataFusionError::Internal(format!("topk query execution: {e}"))
                             })?;
                     } else {
                         weight
-                            .for_each_pruning(
-                                Score::MIN,
-                                segment_reader,
-                                &mut |doc, score| {
-                                    top_n.push(score, doc);
-                                    top_n.threshold.unwrap_or(Score::MIN)
-                                },
-                            )
+                            .for_each_pruning(Score::MIN, segment_reader, &mut |doc, score| {
+                                top_n.push(score, doc);
+                                top_n.threshold.unwrap_or(Score::MIN)
+                            })
                             .map_err(|e| {
                                 DataFusionError::Internal(format!("topk query execution: {e}"))
                             })?;
@@ -164,17 +152,13 @@ pub(crate) fn collect_matching_docs(
                         .for_each_no_score(segment_reader, &mut |docs| {
                             matching_docs.extend(docs.iter().filter(|&&d| alive.is_alive(d)));
                         })
-                        .map_err(|e| {
-                            DataFusionError::Internal(format!("query execution: {e}"))
-                        })?;
+                        .map_err(|e| DataFusionError::Internal(format!("query execution: {e}")))?;
                 } else {
                     weight
                         .for_each_no_score(segment_reader, &mut |docs| {
                             matching_docs.extend_from_slice(docs);
                         })
-                        .map_err(|e| {
-                            DataFusionError::Internal(format!("query execution: {e}"))
-                        })?;
+                        .map_err(|e| DataFusionError::Internal(format!("query execution: {e}")))?;
                 }
                 Ok((matching_docs, None))
             }
@@ -184,7 +168,7 @@ pub(crate) fn collect_matching_docs(
             let max_doc = segment_reader.max_doc();
             let alive_bitset = segment_reader.alive_bitset();
             let ids: Vec<u32> = (0..max_doc)
-                .filter(|&doc_id| alive_bitset.map_or(true, |bitset| bitset.is_alive(doc_id)))
+                .filter(|&doc_id| alive_bitset.is_none_or(|bitset| bitset.is_alive(doc_id)))
                 .collect();
             Ok((ids, None))
         }

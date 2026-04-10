@@ -8,10 +8,10 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::config::ConfigOptions;
+use datafusion::common::ScalarValue;
 use datafusion::common::{Result, Statistics};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::DataFusionError;
-use datafusion::common::ScalarValue;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_datasource::source::{DataSource, DataSourceExec};
@@ -26,7 +26,7 @@ use tantivy::query::RangeQuery;
 use tantivy::schema::{FieldType, IndexRecordOption, Schema as TantivySchema, Term};
 use tantivy::{DateTime, Document, Index};
 
-use crate::fast_field_reader::{DictCache, read_segment_fast_fields_to_batch};
+use crate::fast_field_reader::{read_segment_fast_fields_to_batch, DictCache};
 use crate::full_text_udf::extract_full_text_call;
 use crate::index_opener::{DirectIndexOpener, IndexOpener};
 use crate::schema_mapping::{tantivy_schema_to_arrow, tantivy_schema_to_arrow_from_index};
@@ -74,12 +74,10 @@ struct PartitionStat {
 /// Reads fast field min/max from each segment's columnar data. This is cheap:
 /// it only reads column metadata, not document values.
 fn compute_partition_stats(
-    index: &Index,
+    opener: &DirectIndexOpener,
     ff_schema: &SchemaRef,
 ) -> Result<Vec<Option<PartitionStat>>> {
-    let reader = index
-        .reader()
-        .map_err(|e| DataFusionError::Internal(format!("open reader for stats: {e}")))?;
+    let reader = opener.reader()?;
     let searcher = reader.searcher();
 
     let mut stats = Vec::with_capacity(searcher.segment_readers().len());
@@ -100,57 +98,47 @@ fn compute_partition_stats(
             }
 
             let (min_val, max_val) = match field.data_type() {
-                DataType::UInt64 => {
-                    match fast_fields.u64(name) {
-                        Ok(col) if col.values.num_vals() > 0 => (
-                            Some(ScalarValue::UInt64(Some(col.min_value()))),
-                            Some(ScalarValue::UInt64(Some(col.max_value()))),
-                        ),
-                        _ => (None, None),
-                    }
-                }
-                DataType::Int64 => {
-                    match fast_fields.i64(name) {
-                        Ok(col) if col.values.num_vals() > 0 => (
-                            Some(ScalarValue::Int64(Some(col.min_value()))),
-                            Some(ScalarValue::Int64(Some(col.max_value()))),
-                        ),
-                        _ => (None, None),
-                    }
-                }
-                DataType::Float64 => {
-                    match fast_fields.f64(name) {
-                        Ok(col) if col.values.num_vals() > 0 => (
-                            Some(ScalarValue::Float64(Some(col.min_value()))),
-                            Some(ScalarValue::Float64(Some(col.max_value()))),
-                        ),
-                        _ => (None, None),
-                    }
-                }
-                DataType::Timestamp(TimeUnit::Microsecond, _) => {
-                    match fast_fields.date(name) {
-                        Ok(col) if col.values.num_vals() > 0 => (
-                            Some(ScalarValue::TimestampMicrosecond(
-                                Some(col.min_value().into_timestamp_micros()),
-                                None,
-                            )),
-                            Some(ScalarValue::TimestampMicrosecond(
-                                Some(col.max_value().into_timestamp_micros()),
-                                None,
-                            )),
-                        ),
-                        _ => (None, None),
-                    }
-                }
-                DataType::Boolean => {
-                    match fast_fields.bool(name) {
-                        Ok(col) if col.values.num_vals() > 0 => (
-                            Some(ScalarValue::Boolean(Some(col.min_value()))),
-                            Some(ScalarValue::Boolean(Some(col.max_value()))),
-                        ),
-                        _ => (None, None),
-                    }
-                }
+                DataType::UInt64 => match fast_fields.u64(name) {
+                    Ok(col) if col.values.num_vals() > 0 => (
+                        Some(ScalarValue::UInt64(Some(col.min_value()))),
+                        Some(ScalarValue::UInt64(Some(col.max_value()))),
+                    ),
+                    _ => (None, None),
+                },
+                DataType::Int64 => match fast_fields.i64(name) {
+                    Ok(col) if col.values.num_vals() > 0 => (
+                        Some(ScalarValue::Int64(Some(col.min_value()))),
+                        Some(ScalarValue::Int64(Some(col.max_value()))),
+                    ),
+                    _ => (None, None),
+                },
+                DataType::Float64 => match fast_fields.f64(name) {
+                    Ok(col) if col.values.num_vals() > 0 => (
+                        Some(ScalarValue::Float64(Some(col.min_value()))),
+                        Some(ScalarValue::Float64(Some(col.max_value()))),
+                    ),
+                    _ => (None, None),
+                },
+                DataType::Timestamp(TimeUnit::Microsecond, _) => match fast_fields.date(name) {
+                    Ok(col) if col.values.num_vals() > 0 => (
+                        Some(ScalarValue::TimestampMicrosecond(
+                            Some(col.min_value().into_timestamp_micros()),
+                            None,
+                        )),
+                        Some(ScalarValue::TimestampMicrosecond(
+                            Some(col.max_value().into_timestamp_micros()),
+                            None,
+                        )),
+                    ),
+                    _ => (None, None),
+                },
+                DataType::Boolean => match fast_fields.bool(name) {
+                    Ok(col) if col.values.num_vals() > 0 => (
+                        Some(ScalarValue::Boolean(Some(col.min_value()))),
+                        Some(ScalarValue::Boolean(Some(col.max_value()))),
+                    ),
+                    _ => (None, None),
+                },
                 _ => (None, None),
             };
 
@@ -231,7 +219,6 @@ impl SingleTableProvider {
             document_column_idx,
         }
     }
-
 }
 
 impl fmt::Debug for SingleTableProvider {
@@ -290,9 +277,7 @@ impl TableProvider for SingleTableProvider {
         for filter in filters {
             if let Some((field_name, query_string)) = extract_full_text_call(filter) {
                 tantivy_schema.get_field(&field_name).map_err(|e| {
-                    DataFusionError::Plan(format!(
-                        "full_text: field '{field_name}' not found: {e}"
-                    ))
+                    DataFusionError::Plan(format!("full_text: field '{field_name}' not found: {e}"))
                 })?;
                 raw_queries.push((field_name, query_string));
             } else if let Some(q) = logical_expr_to_tantivy_query(filter, &tantivy_schema) {
@@ -301,16 +286,16 @@ impl TableProvider for SingleTableProvider {
             }
         }
         // Combine fast field tantivy queries into a single pre-built query.
-        let pre_built_query: Option<Arc<dyn tantivy::query::Query>> =
-            if tantivy_queries.is_empty() {
-                None
-            } else if tantivy_queries.len() == 1 {
-                Some(Arc::from(tantivy_queries.into_iter().next().unwrap()))
-            } else {
-                Some(Arc::new(tantivy::query::BooleanQuery::intersection(
-                    tantivy_queries,
-                )))
-            };
+        let pre_built_query: Option<Arc<dyn tantivy::query::Query>> = if tantivy_queries.is_empty()
+        {
+            None
+        } else if tantivy_queries.len() == 1 {
+            Some(Arc::from(tantivy_queries.into_iter().next().unwrap()))
+        } else {
+            Some(Arc::new(tantivy::query::BooleanQuery::intersection(
+                tantivy_queries,
+            )))
+        };
 
         // 2. Analyze projection.
         let projected_indices: Vec<usize> = match projection {
@@ -368,13 +353,12 @@ impl TableProvider for SingleTableProvider {
         // For DirectIndexOpener (local), we can cheaply read fast field
         // min/max from columnar metadata. For remote openers, stats are
         // unavailable and we fall back to unknown.
-        let partition_stats: Vec<Option<PartitionStat>> = if let Some(direct) =
-            self.opener.as_any().downcast_ref::<DirectIndexOpener>()
-        {
-            compute_partition_stats(direct.index(), &self.fast_field_schema)?
-        } else {
-            vec![None; num_segments]
-        };
+        let partition_stats: Vec<Option<PartitionStat>> =
+            if let Some(direct) = self.opener.as_any().downcast_ref::<DirectIndexOpener>() {
+                compute_partition_stats(direct, &self.fast_field_schema)?
+            } else {
+                vec![None; num_segments]
+            };
 
         let data_source = SingleTableDataSource {
             opener: self.opener.clone(),
@@ -659,54 +643,66 @@ impl DataSource for SingleTableDataSource {
             // Async setup: open index + warmup
             let index = match opener.open().await {
                 Ok(i) => i,
-                Err(e) => { let _ = tx.send(Err(e)).await; return; }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
             };
 
             // Skip warmup for local/mmap openers — data already accessible.
             if needs_warmup {
-            // Warmup runs once across all partitions (best-effort). The first
-            // partition to reach this point initialises the OnceCell; others
-            // wait briefly or get the cached result.
-            //
-            // Design note: individual warmup errors are logged but swallowed
-            // inside the closure, so the OnceCell always transitions to the
-            // initialised state. This is intentional — warmup is advisory and
-            // sync reads will still succeed (just slower). Retrying on every
-            // partition would be wasteful and unlikely to help with transient
-            // errors since the same index/segments are involved.
-            {
-                let index_ref = index.clone();
-                let ff_schema_ref = ff_projected_schema.clone();
-                let rq_ref = raw_queries.clone();
-                warmup_done.get_or_init(|| async move {
-                    let ff_names: Vec<&str> = ff_schema_ref
-                        .fields()
-                        .iter()
-                        .map(|f| f.name().as_str())
-                        .collect();
-                    let _ = crate::warmup::warmup_fast_fields_by_name(&index_ref, &ff_names).await;
+                // Warmup runs once across all partitions (best-effort). The first
+                // partition to reach this point initialises the OnceCell; others
+                // wait briefly or get the cached result.
+                //
+                // Design note: individual warmup errors are logged but swallowed
+                // inside the closure, so the OnceCell always transitions to the
+                // initialised state. This is intentional — warmup is advisory and
+                // sync reads will still succeed (just slower). Retrying on every
+                // partition would be wasteful and unlikely to help with transient
+                // errors since the same index/segments are involved.
+                {
+                    let index_ref = index.clone();
+                    let ff_schema_ref = ff_projected_schema.clone();
+                    let rq_ref = raw_queries.clone();
+                    warmup_done
+                        .get_or_init(|| async move {
+                            let ff_names: Vec<&str> = ff_schema_ref
+                                .fields()
+                                .iter()
+                                .map(|f| f.name().as_str())
+                                .collect();
+                            let _ =
+                                crate::warmup::warmup_fast_fields_by_name(&index_ref, &ff_names)
+                                    .await;
 
-                    let queried_fields: Vec<tantivy::schema::Field> = rq_ref
-                        .iter()
-                        .filter_map(|(field_name, _)| index_ref.schema().get_field(field_name).ok())
-                        .collect();
-                    if !queried_fields.is_empty() {
-                        let _ = crate::warmup::warmup_inverted_index(&index_ref, &queried_fields).await;
-                    }
-                }).await;
-            }
+                            let queried_fields: Vec<tantivy::schema::Field> = rq_ref
+                                .iter()
+                                .filter_map(|(field_name, _)| {
+                                    index_ref.schema().get_field(field_name).ok()
+                                })
+                                .collect();
+                            if !queried_fields.is_empty() {
+                                let _ = crate::warmup::warmup_inverted_index(
+                                    &index_ref,
+                                    &queried_fields,
+                                )
+                                .await;
+                            }
+                        })
+                        .await;
+                }
 
-            // Warm up the document store separately when needed.
-            if needs_document {
-                crate::warmup::warmup_document_store(&index).await.ok();
-            }
+                // Warm up the document store separately when needed.
+                if needs_document {
+                    crate::warmup::warmup_document_store(&index).await.ok();
+                }
             } // end if needs_warmup
 
             // Blocking batch generation — send batches as they're produced.
             let tx_blocking = tx.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let query =
-                    build_combined_query(&index, pre_built_query.as_ref(), &raw_queries)?;
+                let query = build_combined_query(&index, pre_built_query.as_ref(), &raw_queries)?;
                 let cfg = ScanConfig {
                     index,
                     segment_idx,
@@ -722,15 +718,23 @@ impl DataSource for SingleTableDataSource {
                     topk,
                     query,
                 };
-                generate_single_table_batch_streaming(
-                    &cfg,
-                    |batch| tx_blocking.blocking_send(Ok(batch)).is_ok(),
-                )
-            }).await;
+                generate_single_table_batch_streaming(&cfg, |batch| {
+                    tx_blocking.blocking_send(Ok(batch)).is_ok()
+                })
+            })
+            .await;
 
             match result {
-                Ok(Err(e)) => { let _ = tx.send(Err(e)).await; }
-                Err(e) => { let _ = tx.send(Err(DataFusionError::Internal(format!("spawn_blocking: {e}")))).await; }
+                Ok(Err(e)) => {
+                    let _ = tx.send(Err(e)).await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(DataFusionError::Internal(format!(
+                            "spawn_blocking: {e}"
+                        ))))
+                        .await;
+                }
                 Ok(Ok(())) => {} // tx drops naturally, closing the channel
             }
         });
@@ -877,7 +881,9 @@ impl DataSource for SingleTableDataSource {
         // its FilterExec as a safety net. Tantivy-convertible predicates
         // are already pushed at the logical level via supports_filters_pushdown.
         let results: Vec<PushedDown> = filters.iter().map(|_| PushedDown::No).collect();
-        Ok(FilterPushdownPropagation::with_parent_pushdown_result(results))
+        Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+            results,
+        ))
     }
 }
 
@@ -908,11 +914,7 @@ impl<'a> ChunkBuilder<'a> {
     /// Assemble a single `RecordBatch` from a chunk of doc_ids and optional
     /// scores. Reads fast fields, builds score/document arrays, and projects
     /// to the output schema.
-    fn build(
-        &self,
-        chunk_ids: &[u32],
-        chunk_scores: Option<&[f32]>,
-    ) -> Result<RecordBatch> {
+    fn build(&self, chunk_ids: &[u32], chunk_scores: Option<&[f32]>) -> Result<RecordBatch> {
         // Read fast fields for this chunk.
         let ff_batch = read_segment_fast_fields_to_batch(
             self.segment_reader,
@@ -945,10 +947,10 @@ impl<'a> ChunkBuilder<'a> {
             let mut doc_builder =
                 StringBuilder::with_capacity(chunk_ids.len(), chunk_ids.len() * 256);
             for &doc_id in chunk_ids {
-                let doc: tantivy::TantivyDocument = store.get(doc_id).map_err(|e| {
-                    DataFusionError::Internal(format!("read doc {doc_id}: {e}"))
-                })?;
-                doc_builder.append_value(&doc.to_json(&self.tantivy_schema));
+                let doc: tantivy::TantivyDocument = store
+                    .get(doc_id)
+                    .map_err(|e| DataFusionError::Internal(format!("read doc {doc_id}: {e}")))?;
+                doc_builder.append_value(doc.to_json(&self.tantivy_schema));
             }
             Some(Arc::new(doc_builder.finish()) as Arc<dyn arrow::array::Array>)
         } else {
@@ -961,11 +963,9 @@ impl<'a> ChunkBuilder<'a> {
 
         for &unified_idx in &self.projected_indices {
             if unified_idx == self.score_column_idx {
-                output_columns.push(
-                    score_array.clone().unwrap_or_else(|| {
-                        arrow::array::new_null_array(&DataType::Float32, chunk_rows)
-                    }),
-                );
+                output_columns.push(score_array.clone().unwrap_or_else(|| {
+                    arrow::array::new_null_array(&DataType::Float32, chunk_rows)
+                }));
             } else if unified_idx == self.document_column_idx {
                 output_columns.push(
                     doc_array
@@ -1177,10 +1177,7 @@ fn logical_expr_to_tantivy_query(
                 Bound::Unbounded,
                 Bound::Excluded(term.clone()),
             ));
-            let gt = Box::new(RangeQuery::new(
-                Bound::Excluded(term),
-                Bound::Unbounded,
-            ));
+            let gt = Box::new(RangeQuery::new(Bound::Excluded(term), Bound::Unbounded));
             Some(Box::new(tantivy::query::BooleanQuery::union(vec![lt, gt])))
         }
         _ => None,
@@ -1269,22 +1266,20 @@ fn logical_scalar_to_term(
         (FieldType::Bool(_), ScalarValue::Boolean(Some(v))) => {
             Some(Term::from_field_bool(field, *v))
         }
-        (FieldType::Str(_), ScalarValue::Utf8(Some(s))) => {
-            Some(Term::from_field_text(field, s))
-        }
+        (FieldType::Str(_), ScalarValue::Utf8(Some(s))) => Some(Term::from_field_text(field, s)),
         // Date — tantivy DateTime stores nanoseconds internally.
-        (FieldType::Date(_), ScalarValue::TimestampMicrosecond(Some(v), _)) => {
-            Some(Term::from_field_date(field, DateTime::from_timestamp_micros(*v)))
-        }
-        (FieldType::Date(_), ScalarValue::TimestampSecond(Some(v), _)) => {
-            Some(Term::from_field_date(field, DateTime::from_timestamp_secs(*v)))
-        }
-        (FieldType::Date(_), ScalarValue::TimestampMillisecond(Some(v), _)) => {
-            Some(Term::from_field_date(field, DateTime::from_timestamp_millis(*v)))
-        }
-        (FieldType::Date(_), ScalarValue::TimestampNanosecond(Some(v), _)) => {
-            Some(Term::from_field_date(field, DateTime::from_timestamp_nanos(*v)))
-        }
+        (FieldType::Date(_), ScalarValue::TimestampMicrosecond(Some(v), _)) => Some(
+            Term::from_field_date(field, DateTime::from_timestamp_micros(*v)),
+        ),
+        (FieldType::Date(_), ScalarValue::TimestampSecond(Some(v), _)) => Some(
+            Term::from_field_date(field, DateTime::from_timestamp_secs(*v)),
+        ),
+        (FieldType::Date(_), ScalarValue::TimestampMillisecond(Some(v), _)) => Some(
+            Term::from_field_date(field, DateTime::from_timestamp_millis(*v)),
+        ),
+        (FieldType::Date(_), ScalarValue::TimestampNanosecond(Some(v), _)) => Some(
+            Term::from_field_date(field, DateTime::from_timestamp_nanos(*v)),
+        ),
         // IpAddr — mapped to Utf8 in schema_mapping, tantivy stores as Ipv6Addr.
         (FieldType::IpAddr(_), ScalarValue::Utf8(Some(s))) => {
             let ip: std::net::IpAddr = s.parse().ok()?;
@@ -1358,9 +1353,8 @@ pub(crate) fn serialize_fast_field_filters(exprs: &[Expr]) -> Result<String> {
             })
         })
         .collect();
-    serde_json::to_string(&filters).map_err(|e| {
-        DataFusionError::Internal(format!("serialize fast field filters: {e}"))
-    })
+    serde_json::to_string(&filters)
+        .map_err(|e| DataFusionError::Internal(format!("serialize fast field filters: {e}")))
 }
 
 /// Deserialize fast field filter JSON and reconstruct tantivy queries.
@@ -1374,9 +1368,8 @@ pub(crate) fn deserialize_fast_field_filters(
     if json.is_empty() {
         return Ok(Vec::new());
     }
-    let filters: Vec<FastFieldFilter> = serde_json::from_str(json).map_err(|e| {
-        DataFusionError::Internal(format!("deserialize fast field filters: {e}"))
-    })?;
+    let filters: Vec<FastFieldFilter> = serde_json::from_str(json)
+        .map_err(|e| DataFusionError::Internal(format!("deserialize fast field filters: {e}")))?;
     let mut queries = Vec::with_capacity(filters.len());
     for f in &filters {
         let scalar = json_pair_to_scalar(&f.value, &f.value_type)?;
@@ -1466,9 +1459,7 @@ fn json_pair_to_scalar(value: &str, value_type: &str) -> Result<ScalarValue> {
             use base64::Engine;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(value)
-                .map_err(|e| {
-                    DataFusionError::Internal(format!("decode base64 binary: {e}"))
-                })?;
+                .map_err(|e| DataFusionError::Internal(format!("decode base64 binary: {e}")))?;
             Ok(ScalarValue::Binary(Some(bytes)))
         }
         "ts_s" => Ok(ScalarValue::TimestampSecond(

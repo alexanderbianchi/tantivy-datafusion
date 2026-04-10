@@ -14,9 +14,7 @@ use tantivy::aggregation::metric::{
 };
 
 use crate::unified::agg_data_source::AggDataSource;
-use crate::unified::plan_traversal::{
-    find_partial_aggregate, find_single_table_datasource,
-};
+use crate::unified::plan_traversal::{find_partial_aggregate, find_single_table_datasource};
 use datafusion_datasource::source::DataSourceExec;
 
 /// A physical optimizer rule that replaces DataFusion's `AggregateExec`
@@ -44,6 +42,12 @@ impl AggPushdown {
     }
 }
 
+impl Default for AggPushdown {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PhysicalOptimizerRule for AggPushdown {
     fn optimize(
         &self,
@@ -63,21 +67,15 @@ impl PhysicalOptimizerRule for AggPushdown {
 }
 
 /// Attempt to replace an `AggregateExec` subtree with a `DataSourceExec(AggDataSource)`.
-fn try_rewrite(
-    plan: Arc<dyn ExecutionPlan>,
-) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
+fn try_rewrite(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
     let Some(agg) = plan.as_any().downcast_ref::<AggregateExec>() else {
         return Ok(Transformed::no(plan));
     };
 
     // Handle both single-phase and two-phase aggregation patterns.
     match agg.mode() {
-        AggregateMode::Single | AggregateMode::SinglePartitioned => {
-            try_rewrite_single(agg, &plan)
-        }
-        AggregateMode::Final | AggregateMode::FinalPartitioned => {
-            try_rewrite_two_phase(agg, &plan)
-        }
+        AggregateMode::Single | AggregateMode::SinglePartitioned => try_rewrite_single(agg, &plan),
+        AggregateMode::Final | AggregateMode::FinalPartitioned => try_rewrite_two_phase(agg, &plan),
         AggregateMode::Partial => {
             // Partial on its own — not the top-level, skip
             Ok(Transformed::no(plan))
@@ -113,7 +111,9 @@ fn try_rewrite_single(
                 st_ds.pre_built_query().cloned(),
                 st_ds.fast_field_filter_exprs().to_vec(),
             );
-            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(agg_ds)))));
+            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(
+                agg_ds,
+            )))));
         }
     }
 
@@ -149,7 +149,9 @@ fn try_rewrite_two_phase(
                 st_ds.pre_built_query().cloned(),
                 st_ds.fast_field_filter_exprs().to_vec(),
             );
-            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(agg_ds)))));
+            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(
+                agg_ds,
+            )))));
         }
     }
 
@@ -244,4 +246,3 @@ fn derive_tantivy_aggregations(agg: &AggregateExec) -> Option<Aggregations> {
 
     Some(aggs)
 }
-

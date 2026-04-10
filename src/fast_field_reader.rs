@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use arrow::array::{
     ArrayRef, BinaryBuilder, BooleanBuilder, DictionaryArray, Float64Builder, Int32Builder,
-    Int64Builder, ListBuilder, StringBuilder, StringArray, TimestampMicrosecondBuilder,
+    Int64Builder, ListBuilder, StringArray, StringBuilder, TimestampMicrosecondBuilder,
     UInt32Array, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Int32Type, SchemaRef, TimeUnit};
@@ -23,10 +23,7 @@ pub struct DictCache {
 
 impl DictCache {
     /// Build the cache for every `Dictionary`-typed field in `projected_schema`.
-    pub fn build(
-        segment_reader: &SegmentReader,
-        projected_schema: &SchemaRef,
-    ) -> Result<Self> {
+    pub fn build(segment_reader: &SegmentReader, projected_schema: &SchemaRef) -> Result<Self> {
         let fast_fields = segment_reader.fast_fields();
         let mut entries = HashMap::new();
 
@@ -45,13 +42,10 @@ impl DictCache {
             let mut streamer = str_col
                 .dictionary()
                 .stream()
-                .map_err(|e| {
-                    DataFusionError::Internal(format!("stream dict '{name}': {e}"))
-                })?;
+                .map_err(|e| DataFusionError::Internal(format!("stream dict '{name}': {e}")))?;
             while streamer.advance() {
-                let s = std::str::from_utf8(streamer.key()).map_err(|e| {
-                    DataFusionError::Internal(format!("dict utf8 '{name}': {e}"))
-                })?;
+                let s = std::str::from_utf8(streamer.key())
+                    .map_err(|e| DataFusionError::Internal(format!("dict utf8 '{name}': {e}")))?;
                 builder.append_value(s);
             }
             entries.insert(name.to_string(), Arc::new(builder.finish()));
@@ -92,11 +86,8 @@ pub fn read_segment_fast_fields_to_batch(
                 Some(range) => (range.start, range.end),
                 None => (0, segment_reader.max_doc()),
             };
-            let iter = (start..end).filter(|&doc_id| {
-                alive_bitset
-                    .map(|bs| bs.is_alive(doc_id))
-                    .unwrap_or(true)
-            });
+            let iter = (start..end)
+                .filter(|&doc_id| alive_bitset.map(|bs| bs.is_alive(doc_id)).unwrap_or(true));
             match limit {
                 Some(lim) => iter.take(lim).collect(),
                 None => iter.collect(),
@@ -112,8 +103,7 @@ pub fn read_segment_fast_fields_to_batch(
 
         // Handle synthetic internal columns
         if name == "_doc_id" {
-            let array: ArrayRef =
-                Arc::new(UInt32Array::from(docs.iter().copied().collect::<Vec<_>>()));
+            let array: ArrayRef = Arc::new(UInt32Array::from(docs.to_vec()));
             columns.push(array);
             continue;
         }
@@ -136,7 +126,7 @@ pub fn read_segment_fast_fields_to_batch(
                     Arc::new(builder.finish())
                 }
                 Err(_) => arrow::array::new_null_array(field.data_type(), num_docs),
-            }
+            },
             DataType::Int64 => match fast_fields.i64(name) {
                 Ok(col) => {
                     let mut builder = Int64Builder::with_capacity(num_docs);
@@ -149,7 +139,7 @@ pub fn read_segment_fast_fields_to_batch(
                     Arc::new(builder.finish())
                 }
                 Err(_) => arrow::array::new_null_array(field.data_type(), num_docs),
-            }
+            },
             DataType::Float64 => match fast_fields.f64(name) {
                 Ok(col) => {
                     let mut builder = Float64Builder::with_capacity(num_docs);
@@ -162,7 +152,7 @@ pub fn read_segment_fast_fields_to_batch(
                     Arc::new(builder.finish())
                 }
                 Err(_) => arrow::array::new_null_array(field.data_type(), num_docs),
-            }
+            },
             DataType::Boolean => match fast_fields.bool(name) {
                 Ok(col) => {
                     let mut builder = BooleanBuilder::with_capacity(num_docs);
@@ -175,7 +165,7 @@ pub fn read_segment_fast_fields_to_batch(
                     Arc::new(builder.finish())
                 }
                 Err(_) => arrow::array::new_null_array(field.data_type(), num_docs),
-            }
+            },
             DataType::Timestamp(TimeUnit::Microsecond, None) => match fast_fields.date(name) {
                 Ok(col) => {
                     let mut builder = TimestampMicrosecondBuilder::with_capacity(num_docs);
@@ -188,7 +178,7 @@ pub fn read_segment_fast_fields_to_batch(
                     Arc::new(builder.finish())
                 }
                 Err(_) => arrow::array::new_null_array(field.data_type(), num_docs),
-            }
+            },
             DataType::Dictionary(_, _) => {
                 // Str fast field → DictionaryArray<Int32, Utf8>
                 let str_col = match fast_fields.str(name) {
@@ -218,11 +208,8 @@ pub fn read_segment_fast_fields_to_batch(
 
                     let dict_values: ArrayRef = Arc::clone(values) as ArrayRef;
                     Arc::new(
-                        DictionaryArray::<Int32Type>::try_new(
-                            keys_builder.finish(),
-                            dict_values,
-                        )
-                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
+                        DictionaryArray::<Int32Type>::try_new(keys_builder.finish(), dict_values)
+                            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
                     )
                 } else {
                     // Fallback: per-chunk compact dictionary (no cache provided).
@@ -266,9 +253,9 @@ pub fn read_segment_fast_fields_to_batch(
                     let mut ord_iter = bytes_col.term_ords(doc_id);
                     if let Some(ord) = ord_iter.next() {
                         buf.clear();
-                        bytes_col
-                            .ord_to_bytes(ord, &mut buf)
-                            .map_err(|e| DataFusionError::Internal(format!("ord_to_bytes '{name}': {e}")))?;
+                        bytes_col.ord_to_bytes(ord, &mut buf).map_err(|e| {
+                            DataFusionError::Internal(format!("ord_to_bytes '{name}': {e}"))
+                        })?;
                         builder.append_value(&buf);
                     } else {
                         builder.append_null();
@@ -456,8 +443,7 @@ fn build_compact_dict_array(
         }
     }
 
-    let mut dict_builder =
-        StringBuilder::with_capacity(seen_ords.len(), seen_ords.len() * 16);
+    let mut dict_builder = StringBuilder::with_capacity(seen_ords.len(), seen_ords.len() * 16);
     let mut buf = String::new();
     for &ord in &seen_ords {
         buf.clear();
