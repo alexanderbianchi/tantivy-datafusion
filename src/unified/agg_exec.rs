@@ -9,17 +9,20 @@ use tantivy::aggregation::agg_result::{
     AggregationResult, AggregationResults, BucketEntry, BucketResult, MetricResult,
     RangeBucketEntry,
 };
-use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
 use tantivy::aggregation::metric::{PercentilesMetricResult, SingleMetricResult};
-use tantivy::aggregation::{AggContextParams, AggregationSegmentCollector, Key};
-use tantivy::collector::SegmentCollector;
-use tantivy::query::{EnableScoring, Query};
+use tantivy::aggregation::Key;
+use tantivy::query::Query;
 use tantivy::Index;
 
 // ---------------------------------------------------------------------------
 // Core tantivy aggregation execution
 // ---------------------------------------------------------------------------
 
+/// Execute tantivy aggregation using `Searcher::search()` directly.
+///
+/// This uses tantivy's native segment-parallel execution (Rayon thread pool)
+/// rather than iterating segments serially. For multi-segment indexes,
+/// this matches native tantivy performance.
 pub(crate) fn execute_tantivy_agg(
     index: &Index,
     aggs: &Aggregations,
@@ -29,7 +32,6 @@ pub(crate) fn execute_tantivy_agg(
     execute_tantivy_agg_with_reader(index, aggs, query, output_schema, None)
 }
 
-/// Execute tantivy aggregation, optionally reusing an existing `IndexReader`.
 pub(crate) fn execute_tantivy_agg_with_reader(
     index: &Index,
     aggs: &Aggregations,
@@ -49,87 +51,24 @@ pub(crate) fn execute_tantivy_agg_with_reader(
     };
     let searcher = reader.searcher();
 
-    let context = AggContextParams::default();
-    let mut merged: Option<IntermediateAggregationResults> = None;
+    // Use tantivy's native Searcher::search() which parallelizes across
+    // segments using Rayon. Our previous manual segment loop was serial,
+    // causing a 3x regression on 3-segment indexes.
+    let collector = tantivy::aggregation::AggregationCollector::from_aggs(
+        aggs.clone(),
+        Default::default(),
+    );
 
-    for (seg_ord, seg_reader) in searcher.segment_readers().iter().enumerate() {
-        let mut collector = AggregationSegmentCollector::from_agg_req_and_reader(
-            aggs,
-            seg_reader,
-            seg_ord as u32,
-            &context,
-        )
-        .map_err(|e| DataFusionError::Internal(format!("create segment collector: {e}")))?;
-
-        // Stream doc IDs in cache-friendly chunks via for_each_no_score,
-        // matching tantivy's native collection pattern (512-doc blocks).
-        collect_into_segment_collector(seg_reader, query, &index.schema(), &mut collector)
-            .map_err(|e| DataFusionError::Internal(format!("collect segment: {e}")))?;
-
-        let intermediate = collector
-            .harvest()
-            .map_err(|e| DataFusionError::Internal(format!("harvest segment results: {e}")))?;
-
-        match merged {
-            None => merged = Some(intermediate),
-            Some(ref mut m) => m
-                .merge_fruits(intermediate)
-                .map_err(|e| DataFusionError::Internal(format!("merge intermediates: {e}")))?,
-        }
-    }
-
-    // Merge across segments
-    let merged = match merged {
-        Some(m) => m,
-        None => return Ok(RecordBatch::new_empty(output_schema.clone())),
-    };
-
-    // Convert to final results
-    let final_result = merged
-        .into_final_result(aggs.clone(), Default::default())
-        .map_err(|e| DataFusionError::Internal(format!("finalize results: {e}")))?;
-
-    agg_results_to_batch(&final_result, aggs, output_schema)
-}
-
-/// Stream doc IDs into a segment collector in cache-friendly blocks,
-/// matching tantivy's native collection pattern.
-///
-/// When a query is set, uses `for_each_no_score` which delivers docs in
-/// ~512-doc chunks directly from the scorer. When no query, generates
-/// chunks from the alive doc ID range.
-const COLLECT_BLOCK_SIZE: usize = 512;
-
-fn collect_into_segment_collector(
-    seg_reader: &tantivy::SegmentReader,
-    query: Option<&Arc<dyn Query>>,
-    schema: &tantivy::schema::Schema,
-    collector: &mut AggregationSegmentCollector,
-) -> tantivy::Result<()> {
-    let alive_bitset = seg_reader.alive_bitset();
-
-    // Use AllQuery for the no-query case — tantivy's AllScorer delivers docs
-    // in bulk blocks, much faster than per-doc iteration with alive_bitset checks.
     let effective_query: Box<dyn Query> = match query {
         Some(q) => q.box_clone(),
         None => Box::new(tantivy::query::AllQuery),
     };
-    let weight = effective_query.weight(EnableScoring::disabled_from_schema(schema))?;
 
-    if let Some(alive) = alive_bitset {
-        let mut buf = Vec::with_capacity(COLLECT_BLOCK_SIZE);
-        weight.for_each_no_score(seg_reader, &mut |docs| {
-            buf.clear();
-            buf.extend(docs.iter().filter(|&&d| alive.is_alive(d)));
-            collector.collect_block(&buf);
-        })?;
-    } else {
-        weight.for_each_no_score(seg_reader, &mut |docs| {
-            collector.collect_block(docs);
-        })?;
-    }
+    let agg_results = searcher
+        .search(effective_query.as_ref(), &collector)
+        .map_err(|e| DataFusionError::Internal(format!("aggregation search: {e}")))?;
 
-    Ok(())
+    agg_results_to_batch(&agg_results, aggs, output_schema)
 }
 
 // ---------------------------------------------------------------------------
