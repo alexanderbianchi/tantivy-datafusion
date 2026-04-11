@@ -238,7 +238,7 @@ fn build_unified_schema(fast_field_schema: &SchemaRef) -> (SchemaRef, usize, usi
     let score_column_idx = unified_fields.len();
     unified_fields.push(Arc::new(Field::new("_score", DataType::Float32, true)));
     let document_column_idx = unified_fields.len();
-    unified_fields.push(Arc::new(Field::new("_document", DataType::Utf8, false)));
+    unified_fields.push(Arc::new(Field::new("_document", DataType::Utf8, true)));
     (
         Arc::new(Schema::new(unified_fields)),
         score_column_idx,
@@ -585,12 +585,17 @@ impl TableProvider for SingleTableProvider {
 
         ff_indices.sort();
         ff_indices.dedup();
-        if ff_indices.is_empty() {
-            ff_indices.push(self.fast_field_schema.index_of("_doc_id").map_err(|_| {
-                DataFusionError::Internal(
-                    "fast field schema missing required _doc_id column".into(),
-                )
-            })?);
+        // _doc_id is always needed: as a fallback when no fast fields are
+        // projected, and for async document fetch when needs_document is true.
+        let doc_id_idx = self.fast_field_schema.index_of("_doc_id").map_err(|_| {
+            DataFusionError::Internal(
+                "fast field schema missing required _doc_id column".into(),
+            )
+        })?;
+        if ff_indices.is_empty() || (needs_document && !ff_indices.contains(&doc_id_idx)) {
+            ff_indices.push(doc_id_idx);
+            ff_indices.sort();
+            ff_indices.dedup();
         }
 
         let ff_projected_schema = {
@@ -1063,9 +1068,9 @@ impl DataSource for SingleTableDataSource {
                                 .await?;
                         }
 
-                        if needs_document_ref {
-                            crate::warmup::warmup_document_store(&index_ref).await?;
-                        }
+                        // Document store warmup is NOT needed — document retrieval
+                        // uses Searcher::doc_async() which reads blocks on demand
+                        // via the async I/O path.
 
                         Ok::<(), DataFusionError>(())
                     })
@@ -1076,10 +1081,14 @@ impl DataSource for SingleTableDataSource {
                 }
             } // end if needs_warmup
 
-            // Blocking batch generation — send batches as they're produced.
-            let tx_blocking = tx.clone();
+            // Blocking batch generation — batches exclude _document. When
+            // needs_document, the async loop below adds it via doc_async.
+            let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(2);
+            let index_for_docs = index.clone();
+            let output_schema_for_docs = projected_schema.clone();
             let cancelled_blocking = Arc::clone(&cancelled_task);
-            let result = tokio::task::spawn_blocking(move || {
+
+            let blocking_handle = tokio::task::spawn_blocking(move || {
                 let split_fast_field_query = match pre_built_query {
                     Some(query) => Some(query),
                     None => build_split_fast_field_query(&fast_field_filter_exprs, &index.schema()),
@@ -1105,12 +1114,33 @@ impl DataSource for SingleTableDataSource {
                     cancelled: cancelled_blocking,
                 };
                 generate_single_table_batch_streaming(&cfg, |batch| {
-                    tx_blocking.blocking_send(Ok(batch)).is_ok()
+                    raw_tx.blocking_send(Ok(batch)).is_ok()
                 })
-            })
-            .await;
+            });
 
-            match result {
+            // Forward batches, adding _document column async when needed.
+            let tantivy_schema = index_for_docs.schema();
+            while let Some(result) = raw_rx.recv().await {
+                let to_send = match result {
+                    Ok(batch) if needs_document => {
+                        fill_document_column_async(
+                            batch,
+                            &index_for_docs,
+                            segment_idx,
+                            &output_schema_for_docs,
+                            &tantivy_schema,
+                        )
+                        .await
+                    }
+                    other => other,
+                };
+                if tx.send(to_send).await.is_err() {
+                    break;
+                }
+            }
+
+            // Propagate errors from the blocking task.
+            match blocking_handle.await {
                 Ok(Err(e)) => {
                     let _ = tx.send(Err(e)).await;
                 }
@@ -1121,7 +1151,7 @@ impl DataSource for SingleTableDataSource {
                         ))))
                         .await;
                 }
-                Ok(Ok(())) => {} // tx drops naturally, closing the channel
+                Ok(Ok(())) => {}
             }
         });
         let guard = AbortOnDrop { handle, cancelled };
@@ -1132,6 +1162,7 @@ impl DataSource for SingleTableDataSource {
         let stream = futures::stream::unfold((rx, guard), |(mut rx, guard)| async move {
             rx.recv().await.map(|batch| (batch, (rx, guard)))
         });
+
         let tracked = stream.map(move |result| {
             if let Ok(ref batch) = result {
                 metrics_guard.0.record_output(batch.num_rows());
@@ -1279,6 +1310,77 @@ impl DataSource for SingleTableDataSource {
 }
 
 // ---------------------------------------------------------------------------
+// Async document column fill
+// ---------------------------------------------------------------------------
+
+/// Add the `_document` column to a batch that was produced without it.
+///
+/// Reads `_doc_id` from the batch, fetches each document via
+/// `Searcher::doc_async` (per-block async I/O), and returns a new batch
+/// with `_document` inserted at the correct position per the output schema.
+async fn fill_document_column_async(
+    batch: RecordBatch,
+    index: &Index,
+    segment_idx: usize,
+    output_schema: &SchemaRef,
+    tantivy_schema: &tantivy::schema::Schema,
+) -> Result<RecordBatch> {
+    let intermediate_schema = batch.schema();
+
+    // Find _doc_id to get document addresses.
+    let doc_id_idx = intermediate_schema.index_of("_doc_id").map_err(|_| {
+        DataFusionError::Internal(
+            "_doc_id column required for document fetch but not in batch".into(),
+        )
+    })?;
+    let doc_ids = batch
+        .column(doc_id_idx)
+        .as_any()
+        .downcast_ref::<arrow::array::UInt32Array>()
+        .ok_or_else(|| DataFusionError::Internal("_doc_id column is not UInt32".into()))?;
+
+    let reader = index
+        .reader()
+        .map_err(|e| DataFusionError::Internal(format!("open reader for doc fetch: {e}")))?;
+    let searcher = reader.searcher();
+
+    // Fetch documents async — each call reads only the specific store block needed.
+    let mut doc_builder = StringBuilder::with_capacity(doc_ids.len(), doc_ids.len() * 256);
+    for idx in 0..doc_ids.len() {
+        let doc_id = doc_ids.value(idx);
+        let doc_addr = tantivy::DocAddress::new(segment_idx as u32, doc_id);
+        let doc: tantivy::TantivyDocument = searcher
+            .doc_async(doc_addr)
+            .await
+            .map_err(|e| DataFusionError::Internal(format!("async doc fetch {doc_id}: {e}")))?;
+        doc_builder.append_value(doc.to_json(tantivy_schema));
+    }
+    let doc_array: Arc<dyn arrow::array::Array> = Arc::new(doc_builder.finish());
+
+    // Build output columns in the order defined by output_schema,
+    // pulling from the intermediate batch or inserting _document.
+    let mut output_columns: Vec<Arc<dyn arrow::array::Array>> =
+        Vec::with_capacity(output_schema.fields().len());
+
+    for field in output_schema.fields() {
+        if field.name() == "_document" {
+            output_columns.push(Arc::clone(&doc_array));
+        } else {
+            let col_idx = intermediate_schema.index_of(field.name()).map_err(|_| {
+                DataFusionError::Internal(format!(
+                    "column '{}' not found in intermediate batch",
+                    field.name()
+                ))
+            })?;
+            output_columns.push(batch.column(col_idx).clone());
+        }
+    }
+
+    RecordBatch::try_new(Arc::clone(output_schema), output_columns)
+        .map_err(|e| DataFusionError::Internal(format!("build batch with docs: {e}")))
+}
+
+// ---------------------------------------------------------------------------
 // Core batch generation
 // ---------------------------------------------------------------------------
 
@@ -1297,18 +1399,17 @@ struct ChunkBuilder<'a> {
     needs_score: bool,
     needs_document: bool,
     segment_ord: u32,
-    tantivy_schema: tantivy::schema::Schema,
-    store_reader: Option<tantivy::store::StoreReader>,
     dict_cache: DictCache,
 }
 
 impl<'a> ChunkBuilder<'a> {
-    /// Assemble a single `RecordBatch` from a chunk of doc_ids and optional
-    /// scores. Reads fast fields, builds score/document arrays, and projects
-    /// to the output schema.
+    /// Assemble a `RecordBatch` from a chunk of doc_ids and optional scores.
+    ///
+    /// Produces fast fields and scores only — `_document` is excluded here and
+    /// added asynchronously by `fill_document_column_async` after this batch
+    /// exits `spawn_blocking`. The returned schema is `intermediate_schema`
+    /// (projected schema minus `_document`).
     fn build(&self, chunk_ids: &[u32], chunk_scores: Option<&[f32]>) -> Result<RecordBatch> {
-        // Read split-native fast fields for this chunk, then coerce them into
-        // the canonical projected fast-field schema.
         let source_ff_batch = read_segment_fast_fields_to_batch(
             self.segment_reader,
             self.source_ff_schema,
@@ -1319,10 +1420,8 @@ impl<'a> ChunkBuilder<'a> {
             Some(&self.dict_cache),
         )?;
         let ff_batch = apply_fast_field_projection(&source_ff_batch, self.fast_field_projection)?;
-
         let chunk_rows = ff_batch.num_rows();
 
-        // Build score array.
         let score_array: Option<Arc<dyn arrow::array::Array>> = if self.needs_score {
             match chunk_scores {
                 Some(sc) => Some(Arc::new(Float32Array::from_iter_values(sc.iter().copied()))),
@@ -1332,37 +1431,34 @@ impl<'a> ChunkBuilder<'a> {
             None
         };
 
-        // Build document array.
-        let doc_array: Option<Arc<dyn arrow::array::Array>> = if self.needs_document {
-            let store = self.store_reader.as_ref().ok_or_else(|| {
-                DataFusionError::Internal("store_reader required when needs_document".into())
-            })?;
-            let mut doc_builder =
-                StringBuilder::with_capacity(chunk_ids.len(), chunk_ids.len() * 256);
-            for &doc_id in chunk_ids {
-                let doc: tantivy::TantivyDocument = store
-                    .get(doc_id)
-                    .map_err(|e| DataFusionError::Internal(format!("read doc {doc_id}: {e}")))?;
-                doc_builder.append_value(doc.to_json(&self.tantivy_schema));
-            }
-            Some(Arc::new(doc_builder.finish()) as Arc<dyn arrow::array::Array>)
-        } else {
-            None
-        };
+        let mut output_columns: Vec<Arc<dyn arrow::array::Array>> = Vec::new();
+        let mut output_fields: Vec<arrow::datatypes::Field> = Vec::new();
 
-        // Assemble output columns.
-        let mut output_columns: Vec<Arc<dyn arrow::array::Array>> =
-            Vec::with_capacity(self.projected_indices.len());
+        // When _document is needed, always include _doc_id in the intermediate
+        // batch so fill_document_column_async can find document addresses.
+        let doc_id_already_projected = self
+            .projected_indices
+            .iter()
+            .any(|&idx| self.unified_schema.field(idx).name() == "_doc_id");
+        if self.needs_document && !doc_id_already_projected {
+            let doc_id_name = "_doc_id";
+            if let Ok(ff_idx) = ff_batch.schema().index_of(doc_id_name) {
+                output_columns.push(ff_batch.column(ff_idx).clone());
+                output_fields.push(
+                    arrow::datatypes::Field::new(doc_id_name, DataType::UInt32, false),
+                );
+            }
+        }
 
         for &unified_idx in &self.projected_indices {
-            if unified_idx == self.score_column_idx {
+            if unified_idx == self.document_column_idx {
+                // Skip _document — it's added async after spawn_blocking.
+                continue;
+            } else if unified_idx == self.score_column_idx {
                 output_columns.push(score_array.clone().unwrap_or_else(|| {
                     arrow::array::new_null_array(&DataType::Float32, chunk_rows)
                 }));
-            } else if unified_idx == self.document_column_idx {
-                output_columns.push(doc_array.clone().ok_or_else(|| {
-                    DataFusionError::Internal("_document requested but not built".into())
-                })?);
+                output_fields.push(self.unified_schema.field(unified_idx).clone());
             } else {
                 let col_name = self.unified_schema.field(unified_idx).name();
                 let ff_col_idx = ff_batch.schema().index_of(col_name).map_err(|_| {
@@ -1371,10 +1467,12 @@ impl<'a> ChunkBuilder<'a> {
                     ))
                 })?;
                 output_columns.push(ff_batch.column(ff_col_idx).clone());
+                output_fields.push(self.unified_schema.field(unified_idx).clone());
             }
         }
 
-        RecordBatch::try_new(self.projected_schema.clone(), output_columns)
+        let intermediate_schema = Arc::new(Schema::new(output_fields));
+        RecordBatch::try_new(intermediate_schema, output_columns)
             .map_err(|e| DataFusionError::Internal(format!("build output batch: {e}")))
     }
 }
@@ -1426,16 +1524,9 @@ fn generate_single_table_batch_streaming(
     let segment_reader = &segment_readers[segment_idx];
 
     // Build the chunk builder once for this segment.
+    // Document store is NOT opened here — document retrieval is async and
+    // happens outside spawn_blocking via fill_document_column_async.
     let needs_document = cfg.needs_document;
-    let store_reader = if needs_document {
-        Some(
-            segment_reader
-                .get_store_reader(100)
-                .map_err(|e| DataFusionError::Internal(format!("open store reader: {e}")))?,
-        )
-    } else {
-        None
-    };
 
     let projected_indices: Vec<usize> = match &cfg.projection {
         Some(indices) => indices.clone(),
@@ -1456,8 +1547,6 @@ fn generate_single_table_batch_streaming(
         needs_score,
         needs_document,
         segment_ord: segment_idx as u32,
-        tantivy_schema: index.schema(),
-        store_reader,
         dict_cache,
     };
     let mut remaining = cfg.row_limit.unwrap_or(usize::MAX);

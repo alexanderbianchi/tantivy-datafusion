@@ -12,6 +12,7 @@ use datafusion::common::Result;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::Expr;
 use tantivy::schema::{Field, FieldType};
+use tantivy::directory::Directory;
 use tantivy::{Index, IndexReader, ReloadPolicy};
 
 async fn open_reader_for_warmup(index: &Index) -> Result<IndexReader> {
@@ -145,45 +146,41 @@ pub async fn warmup_fast_fields(index: &Index) -> Result<()> {
 
 /// Warm up the document store for all segments.
 ///
-/// Pre-loads the store file slices so tantivy's `StoreReader` can read
-/// documents synchronously inside `spawn_blocking`.
-///
-/// Tantivy's store uses a block-based LRU cache and does not expose async
-/// file-slice warmup like fast fields do. The pragmatic approach here is to
-/// open each segment's `StoreReader` (which reads the footer/index into cache)
-/// and read a small number of documents to warm the first blocks. Subsequent
-/// reads happen inside `spawn_blocking` and will hit the cache for these
-/// initial blocks.
+/// Pre-loads the `.store` file data into the directory cache via async reads
+/// so that tantivy's synchronous `StoreReader` hits cache instead of the
+/// underlying storage.
 pub async fn warmup_document_store(index: &Index) -> Result<()> {
-    let index = index.clone();
-    tokio::task::spawn_blocking(move || {
-        let reader = index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::Manual)
-            .try_into()
-            .map_err(|e| DataFusionError::Internal(format!("warmup doc store reader: {e}")))?;
-        let searcher = reader.searcher();
+    let reader = open_reader_for_warmup(index).await?;
+    let searcher = reader.searcher();
 
-        for segment_reader in searcher.segment_readers() {
-            // Opening the store reader reads the footer/index into cache.
-            let store_reader = segment_reader
-                .get_store_reader(100)
-                .map_err(|e| DataFusionError::Internal(format!("warmup doc store reader: {e}")))?;
-            // Reading doc 0 triggers loading the first block, which warms the
-            // file handle.
-            if segment_reader.max_doc() > 0 {
-                store_reader
-                    .get::<tantivy::TantivyDocument>(0)
-                    .map_err(|e| {
-                        DataFusionError::Internal(format!("warmup doc store read: {e}"))
-                    })?;
-            }
-        }
+    for segment_reader in searcher.segment_readers() {
+        // Build the .store file path: "{segment_uuid}.store"
+        let uuid = segment_reader.segment_id().uuid_string();
+        let store_path = std::path::PathBuf::from(format!("{uuid}.store"));
 
-        Ok(())
-    })
-    .await
-    .map_err(|e| DataFusionError::Internal(format!("warmup doc store spawn: {e}")))?
+        // Open the file slice and pre-load via async read into the cache.
+        let file_slice = index
+            .directory()
+            .open_read(&store_path)
+            .map_err(|err| {
+                DataFusionError::Internal(format!(
+                    "warmup doc store open {}: {err}",
+                    store_path.display()
+                ))
+            })?;
+
+        file_slice
+            .read_bytes_async()
+            .await
+            .map_err(|err| {
+                DataFusionError::Internal(format!(
+                    "warmup doc store read {}: {err}",
+                    store_path.display()
+                ))
+            })?;
+    }
+
+    Ok(())
 }
 
 /// Warm up everything needed for a typical query: fast fields +
