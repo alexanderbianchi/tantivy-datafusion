@@ -6,7 +6,7 @@ use datafusion::common::Result;
 use datafusion::error::DataFusionError;
 use tantivy::aggregation::agg_req::{Aggregation, AggregationVariants, Aggregations};
 use tantivy::aggregation::agg_result::{
-    AggregationResult, AggregationResults, BucketEntry, BucketResult, MetricResult,
+    AggregationResult, AggregationResults, BucketEntries, BucketEntry, BucketResult, MetricResult,
     RangeBucketEntry,
 };
 use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
@@ -306,6 +306,17 @@ fn scalar_to_array(value: Option<f64>, data_type: &DataType) -> ArrayRef {
     }
 }
 
+/// Iterate over the entries in a `BucketEntries` enum.
+///
+/// `BucketEntries::iter()` is `pub(crate)` in upstream tantivy, so we
+/// pattern-match on the public enum variants directly.
+fn bucket_entries_iter<T>(entries: &BucketEntries<T>) -> Box<dyn Iterator<Item = &T> + '_> {
+    match entries {
+        BucketEntries::Vec(vec) => Box::new(vec.iter()),
+        BucketEntries::HashMap(map) => Box::new(map.values()),
+    }
+}
+
 /// Convert a bucket result to an N-row RecordBatch.
 fn bucket_to_batch(
     bucket: &BucketResult,
@@ -319,11 +330,11 @@ fn bucket_to_batch(
             ..
         } => terms_bucket_to_batch(buckets, agg_def, schema),
         BucketResult::Histogram { buckets } => {
-            let entries: Vec<&BucketEntry> = buckets.iter().collect();
+            let entries: Vec<&BucketEntry> = bucket_entries_iter(buckets).collect();
             histogram_bucket_to_batch(&entries, agg_def, schema)
         }
         BucketResult::Range { buckets } => {
-            let entries: Vec<&RangeBucketEntry> = buckets.iter().collect();
+            let entries: Vec<&RangeBucketEntry> = bucket_entries_iter(buckets).collect();
             range_bucket_to_batch(&entries, agg_def, schema)
         }
         _ => Err(DataFusionError::Internal(

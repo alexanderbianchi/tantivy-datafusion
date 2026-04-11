@@ -344,6 +344,7 @@ async fn test_single_table_with_topk_roundtrip() {
     let decoded = codec.try_decode(&buf, &[], &task_ctx).unwrap();
 
     assert_eq!(decoded.schema(), exec_with_topk.schema());
+    assert_eq!(single_table_ds(&decoded).topk(), Some(10));
 }
 
 #[tokio::test]
@@ -626,6 +627,65 @@ async fn test_multi_split_partial_state_agg_data_source_roundtrip() {
     let decoded_ds = agg_ds(&decoded);
     assert_eq!(decoded_ds.split_openers().len(), 2);
     assert_eq!(decoded_ds.output_mode(), AggOutputMode::PartialStates);
+}
+
+#[tokio::test]
+async fn test_multi_split_partial_state_agg_data_source_with_fast_field_filters_roundtrip() {
+    let left = create_test_index();
+    let right = create_test_index();
+    let filter = col("price").gt(lit(2.0));
+
+    let provider = SingleTableProvider::from_splits(vec![
+        Arc::new(NamedDirectOpener::new("left", left.clone())),
+        Arc::new(NamedDirectOpener::new("right", right.clone())),
+    ])
+    .unwrap();
+    let session = SessionContext::new();
+    let state = session.state();
+    let scan_exec = provider.scan(&state, None, &[filter], None).await.unwrap();
+    let scan_ds = single_table_ds(&scan_exec);
+
+    let aggs: tantivy::aggregation::agg_req::Aggregations =
+        serde_json::from_value(serde_json::json!({
+            "category_terms": {
+                "terms": { "field": "category" }
+            }
+        }))
+        .unwrap();
+    let output_schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("category", arrow::datatypes::DataType::Utf8, false),
+        arrow::datatypes::Field::new("doc_count", arrow::datatypes::DataType::Int64, false),
+    ]));
+    let exec = Arc::new(DataSourceExec::new(Arc::new(
+        AggDataSource::from_split_openers_partial_states(
+            vec![
+                Arc::new(NamedDirectOpener::new("left", left.clone())),
+                Arc::new(NamedDirectOpener::new("right", right.clone())),
+            ],
+            Arc::new(aggs),
+            output_schema,
+            scan_ds.raw_queries().to_vec(),
+            scan_ds.pre_built_query().cloned(),
+            scan_ds.fast_field_filter_exprs().to_vec(),
+        ),
+    )));
+
+    let codec = TantivyCodec;
+    let mut buf = Vec::new();
+    codec.try_encode(exec.clone(), &mut buf).unwrap();
+
+    let mut split_indices = HashMap::new();
+    split_indices.insert("left".to_string(), left);
+    split_indices.insert("right".to_string(), right);
+    let decode_session = session_with_named_openers(split_indices);
+    let decoded = codec
+        .try_decode(&buf, &[], &decode_session.state().task_ctx())
+        .unwrap();
+
+    let decoded_ds = agg_ds(&decoded);
+    assert_eq!(decoded_ds.output_mode(), AggOutputMode::PartialStates);
+    assert!(!decoded_ds.fast_field_filter_exprs().is_empty());
+    assert!(decoded_ds.pre_built_query().is_none());
 }
 
 #[tokio::test]

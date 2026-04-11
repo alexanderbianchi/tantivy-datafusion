@@ -5,10 +5,12 @@
 //! This module pre-loads the needed data into the directory's cache
 //! so that tantivy's sync reads hit memory instead of storage.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::Result;
 use datafusion::error::DataFusionError;
+use datafusion::logical_expr::Expr;
 use tantivy::schema::{Field, FieldType};
 use tantivy::{Index, IndexReader, ReloadPolicy};
 
@@ -23,6 +25,29 @@ async fn open_reader_for_warmup(index: &Index) -> Result<IndexReader> {
     })
     .await
     .map_err(|e| DataFusionError::Internal(format!("warmup reader spawn: {e}")))?
+}
+
+/// Collect fast-field names referenced by pushed-down filter expressions.
+///
+/// Only columns that exist on the given tantivy schema are returned.
+pub(crate) fn fast_field_filter_field_names(
+    tantivy_schema: &tantivy::schema::Schema,
+    filter_exprs: &[Expr],
+) -> Result<Vec<String>> {
+    let mut field_names = BTreeSet::new();
+
+    for expr in filter_exprs {
+        expr.apply(|node| {
+            if let Expr::Column(column) = node {
+                if tantivy_schema.get_field(&column.name).is_ok() {
+                    field_names.insert(column.name.clone());
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+    }
+
+    Ok(field_names.into_iter().collect())
 }
 
 /// Warm up the inverted index data needed for full-text queries.
@@ -194,4 +219,28 @@ pub async fn warmup_all_text_fields(index: &Index) -> Result<()> {
     }
 
     warmup_inverted_index(index, &text_fields).await
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::prelude::{col, lit};
+    use tantivy::schema::{SchemaBuilder, FAST};
+
+    use super::fast_field_filter_field_names;
+
+    #[test]
+    fn test_fast_field_filter_field_names_extracts_existing_columns() {
+        let mut builder = SchemaBuilder::new();
+        builder.add_u64_field("price", FAST);
+        builder.add_bool_field("active", FAST);
+        let schema = builder.build();
+
+        let filters = vec![
+            col("price").gt(lit(3u64)).and(col("active").eq(lit(true))),
+            col("missing").eq(lit(1u64)),
+        ];
+
+        let names = fast_field_filter_field_names(&schema, &filters).unwrap();
+        assert_eq!(names, vec!["active".to_string(), "price".to_string()]);
+    }
 }

@@ -42,7 +42,7 @@ pub(crate) fn build_combined_query(
 
     match queries.len() {
         0 => Ok(None),
-        1 => Ok(Some(Arc::from(queries.into_iter().next().unwrap()))),
+        1 => Ok(queries.into_iter().next().map(Arc::from)),
         _ => Ok(Some(Arc::new(BooleanQuery::intersection(queries)))),
     }
 }
@@ -65,29 +65,22 @@ pub(crate) fn collect_topk_docs(
     let weight = query
         .weight(EnableScoring::enabled_from_searcher(searcher))
         .map_err(|e| DataFusionError::Internal(format!("create weight: {e}")))?;
-    let mut top_n: TopNComputer<Score, DocId, _> = TopNComputer::new(topk);
     let alive_bitset = segment_reader.alive_bitset();
 
-    if let Some(alive_bitset) = alive_bitset {
-        let mut threshold = Score::MIN;
-        top_n.threshold = Some(threshold);
-        weight
-            .for_each_pruning(Score::MIN, segment_reader, &mut |doc, score| {
-                if alive_bitset.is_deleted(doc) {
-                    return threshold;
-                }
-                top_n.push(score, doc);
-                threshold = top_n.threshold.unwrap_or(Score::MIN);
-                threshold
-            })
-            .map_err(|e| DataFusionError::Internal(format!("topk query execution: {e}")))?;
-    } else {
-        weight
-            .for_each_pruning(Score::MIN, segment_reader, &mut |doc, score| {
-                top_n.push(score, doc);
-                top_n.threshold.unwrap_or(Score::MIN)
-            })
-            .map_err(|e| DataFusionError::Internal(format!("topk query execution: {e}")))?;
+    // Collect scored documents using a manual scorer loop rather than
+    // for_each_pruning, because TopNComputer::threshold is pub(crate) in
+    // upstream tantivy. We still use TopNComputer for efficient top-N
+    // selection but forgo Block-WAND pruning.
+    let mut top_n: TopNComputer<Score, DocId, _> = TopNComputer::new(topk);
+    let mut scorer = weight
+        .scorer(segment_reader, 1.0)
+        .map_err(|e| DataFusionError::Internal(format!("create scorer: {e}")))?;
+    let mut doc = scorer.doc();
+    while doc != TERMINATED {
+        if alive_bitset.is_none_or(|alive| alive.is_alive(doc)) {
+            top_n.push(scorer.score(), doc);
+        }
+        doc = scorer.advance();
     }
 
     let results = top_n.into_sorted_vec();
@@ -140,6 +133,124 @@ pub(crate) struct MatchingDocChunksConfig<'a> {
     pub(crate) cancelled: &'a AtomicBool,
 }
 
+fn execute_scored_query_chunks<F>(
+    segment_reader: &SegmentReader,
+    searcher: &Searcher,
+    query: &Arc<dyn tantivy::query::Query>,
+    batch_size: usize,
+    cancelled: &AtomicBool,
+    on_chunk: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&[DocId], Option<&[Score]>) -> Result<bool>,
+{
+    let weight = query
+        .weight(EnableScoring::enabled_from_searcher(searcher))
+        .map_err(|e| DataFusionError::Internal(format!("create weight: {e}")))?;
+    let alive_bitset = segment_reader.alive_bitset();
+    let mut scorer = weight
+        .scorer(segment_reader, 1.0)
+        .map_err(|e| DataFusionError::Internal(format!("create scorer: {e}")))?;
+    let mut ids = Vec::with_capacity(batch_size);
+    let mut scores = Vec::with_capacity(batch_size);
+    let mut doc = scorer.doc();
+
+    while doc != TERMINATED {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if alive_bitset.is_none_or(|alive| alive.is_alive(doc)) {
+            ids.push(doc);
+            scores.push(scorer.score());
+
+            if ids.len() == batch_size && !flush_scored_buffer(&mut ids, &mut scores, on_chunk)? {
+                return Ok(());
+            }
+        }
+        doc = scorer.advance();
+    }
+
+    flush_scored_buffer(&mut ids, &mut scores, on_chunk)?;
+    Ok(())
+}
+
+fn execute_unscored_query_chunks<F>(
+    segment_reader: &SegmentReader,
+    index_schema: &tantivy::schema::Schema,
+    query: &Arc<dyn tantivy::query::Query>,
+    batch_size: usize,
+    cancelled: &AtomicBool,
+    on_chunk: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&[DocId], Option<&[Score]>) -> Result<bool>,
+{
+    let weight = query
+        .weight(EnableScoring::disabled_from_schema(index_schema))
+        .map_err(|e| DataFusionError::Internal(format!("create weight: {e}")))?;
+    let alive_bitset = segment_reader.alive_bitset();
+    let mut docset = weight
+        .scorer(segment_reader, 1.0)
+        .map_err(|e| DataFusionError::Internal(format!("create scorer: {e}")))?;
+    let mut raw_docs = [0u32; tantivy::COLLECT_BLOCK_BUFFER_LEN];
+    let mut doc_buffer = Vec::with_capacity(batch_size);
+
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let num_docs = docset.fill_buffer(&mut raw_docs);
+        if num_docs == 0 {
+            break;
+        }
+        for &doc in &raw_docs[..num_docs] {
+            if alive_bitset.is_some_and(|alive| !alive.is_alive(doc)) {
+                continue;
+            }
+            doc_buffer.push(doc);
+
+            if doc_buffer.len() == batch_size && !flush_doc_buffer(&mut doc_buffer, on_chunk)? {
+                return Ok(());
+            }
+        }
+        if num_docs < raw_docs.len() {
+            break;
+        }
+    }
+
+    flush_doc_buffer(&mut doc_buffer, on_chunk)?;
+    Ok(())
+}
+
+fn execute_full_scan_chunks<F>(
+    segment_reader: &SegmentReader,
+    batch_size: usize,
+    cancelled: &AtomicBool,
+    on_chunk: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&[DocId], Option<&[Score]>) -> Result<bool>,
+{
+    let max_doc = segment_reader.max_doc();
+    let alive_bitset = segment_reader.alive_bitset();
+    let mut doc_buffer = Vec::with_capacity(batch_size);
+
+    for doc_id in 0..max_doc {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if alive_bitset.is_none_or(|bitset| bitset.is_alive(doc_id)) {
+            doc_buffer.push(doc_id);
+        }
+        if doc_buffer.len() == batch_size && !flush_doc_buffer(&mut doc_buffer, on_chunk)? {
+            return Ok(());
+        }
+    }
+
+    flush_doc_buffer(&mut doc_buffer, on_chunk)?;
+    Ok(())
+}
+
 /// Execute a tantivy query on a single segment and stream matching doc ids in
 /// `batch_size` chunks through `on_chunk`.
 ///
@@ -165,99 +276,23 @@ where
         cancelled,
     } = cfg;
 
-    match query {
-        Some(query) => {
-            if needs_score {
-                let weight = query
-                    .weight(EnableScoring::enabled_from_searcher(searcher))
-                    .map_err(|e| DataFusionError::Internal(format!("create weight: {e}")))?;
-                let alive_bitset = segment_reader.alive_bitset();
-                let mut scorer = weight
-                    .scorer(segment_reader, 1.0)
-                    .map_err(|e| DataFusionError::Internal(format!("create scorer: {e}")))?;
-                let mut ids = Vec::with_capacity(batch_size);
-                let mut scores = Vec::with_capacity(batch_size);
-                let mut doc = scorer.doc();
-                while doc != TERMINATED {
-                    if cancelled.load(Ordering::Relaxed) {
-                        return Ok(());
-                    }
-                    if alive_bitset.is_none_or(|alive| alive.is_alive(doc)) {
-                        ids.push(doc);
-                        scores.push(scorer.score());
-
-                        if ids.len() == batch_size
-                            && !flush_scored_buffer(&mut ids, &mut scores, &mut on_chunk)?
-                        {
-                            return Ok(());
-                        }
-                    }
-                    doc = scorer.advance();
-                }
-
-                flush_scored_buffer(&mut ids, &mut scores, &mut on_chunk)?;
-                Ok(())
-            } else {
-                let weight = query
-                    .weight(EnableScoring::disabled_from_schema(index_schema))
-                    .map_err(|e| DataFusionError::Internal(format!("create weight: {e}")))?;
-                let alive_bitset = segment_reader.alive_bitset();
-                let mut docset = weight
-                    .scorer(segment_reader, 1.0)
-                    .map_err(|e| DataFusionError::Internal(format!("create scorer: {e}")))?;
-                let mut raw_docs = [0u32; tantivy::COLLECT_BLOCK_BUFFER_LEN];
-                let mut doc_buffer = Vec::with_capacity(batch_size);
-
-                loop {
-                    if cancelled.load(Ordering::Relaxed) {
-                        return Ok(());
-                    }
-                    let num_docs = docset.fill_buffer(&mut raw_docs);
-                    if num_docs == 0 {
-                        break;
-                    }
-                    for &doc in &raw_docs[..num_docs] {
-                        if alive_bitset.is_some_and(|alive| !alive.is_alive(doc)) {
-                            continue;
-                        }
-                        doc_buffer.push(doc);
-
-                        if doc_buffer.len() == batch_size
-                            && !flush_doc_buffer(&mut doc_buffer, &mut on_chunk)?
-                        {
-                            return Ok(());
-                        }
-                    }
-                    if num_docs < raw_docs.len() {
-                        break;
-                    }
-                }
-
-                flush_doc_buffer(&mut doc_buffer, &mut on_chunk)?;
-                Ok(())
-            }
-        }
-        None => {
-            let max_doc = segment_reader.max_doc();
-            let alive_bitset = segment_reader.alive_bitset();
-            let mut doc_buffer = Vec::with_capacity(batch_size);
-
-            for doc_id in 0..max_doc {
-                if cancelled.load(Ordering::Relaxed) {
-                    return Ok(());
-                }
-                if alive_bitset.is_none_or(|bitset| bitset.is_alive(doc_id)) {
-                    doc_buffer.push(doc_id);
-                }
-                if doc_buffer.len() == batch_size
-                    && !flush_doc_buffer(&mut doc_buffer, &mut on_chunk)?
-                {
-                    return Ok(());
-                }
-            }
-
-            flush_doc_buffer(&mut doc_buffer, &mut on_chunk)?;
-            Ok(())
-        }
+    match (query, needs_score) {
+        (Some(query), true) => execute_scored_query_chunks(
+            segment_reader,
+            searcher,
+            query,
+            batch_size,
+            cancelled,
+            &mut on_chunk,
+        ),
+        (Some(query), false) => execute_unscored_query_chunks(
+            segment_reader,
+            index_schema,
+            query,
+            batch_size,
+            cancelled,
+            &mut on_chunk,
+        ),
+        (None, _) => execute_full_scan_chunks(segment_reader, batch_size, cancelled, &mut on_chunk),
     }
 }

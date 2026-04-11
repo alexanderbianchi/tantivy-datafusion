@@ -313,7 +313,7 @@ fn filter_is_pushdown_safe(expr: &Expr, splits: &[SplitDescriptor]) -> bool {
 pub(crate) fn build_split_fast_field_query(
     exprs: &[Expr],
     tantivy_schema: &TantivySchema,
-) -> Result<Option<Arc<dyn tantivy::query::Query>>> {
+) -> Option<Arc<dyn tantivy::query::Query>> {
     let mut queries: Vec<Box<dyn tantivy::query::Query>> = Vec::new();
 
     for expr in exprs {
@@ -324,18 +324,18 @@ pub(crate) fn build_split_fast_field_query(
                 }
             }
             FilterPushdownSupport::MissingField => {
-                return Ok(Some(Arc::new(tantivy::query::EmptyQuery)));
+                return Some(Arc::new(tantivy::query::EmptyQuery));
             }
-            FilterPushdownSupport::Unsupported => return Ok(None),
+            FilterPushdownSupport::Unsupported => return None,
         }
     }
 
     match queries.len() {
-        0 => Ok(None),
-        1 => Ok(Some(Arc::from(queries.into_iter().next().unwrap()))),
-        _ => Ok(Some(Arc::new(tantivy::query::BooleanQuery::intersection(
+        0 => None,
+        1 => queries.into_iter().next().map(Arc::from),
+        _ => Some(Arc::new(tantivy::query::BooleanQuery::intersection(
             queries,
-        )))),
+        ))),
     }
 }
 
@@ -407,6 +407,7 @@ pub struct SingleTableProvider {
 
 impl SingleTableProvider {
     /// Create a provider from an already-opened tantivy index.
+    #[must_use]
     pub fn new(index: Index) -> Self {
         let ff_schema = tantivy_schema_to_arrow_from_index(&index);
         Self::from_splits_with_fast_field_schema(
@@ -422,6 +423,7 @@ impl SingleTableProvider {
     /// segment cardinality so multi-valued fast fields become `List<T>`.
     /// Generic remote openers fall back to schema-only mapping; workers rely
     /// on serialized `multi_valued_fields` metadata to recover `List<T>`.
+    #[must_use]
     pub fn from_opener(opener: Arc<dyn IndexOpener>) -> Self {
         let ff_schema = fast_field_schema_for_opener(&opener);
         Self::from_splits_with_fast_field_schema(vec![opener], ff_schema)
@@ -488,8 +490,12 @@ impl SingleTableProvider {
 impl fmt::Debug for SingleTableProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SingleTableProvider")
+            .field("splits", &self.splits.len())
             .field("unified_schema", &self.unified_schema)
-            .finish()
+            .field("fast_field_schema", &self.fast_field_schema)
+            .field("score_column_idx", &self.score_column_idx)
+            .field("document_column_idx", &self.document_column_idx)
+            .finish_non_exhaustive()
     }
 }
 
@@ -552,7 +558,7 @@ impl TableProvider for SingleTableProvider {
             }
         }
         let cached_pre_built_query = if self.splits.len() == 1 {
-            build_split_fast_field_query(&fast_field_filter_exprs, &self.splits[0].opener.schema())?
+            build_split_fast_field_query(&fast_field_filter_exprs, &self.splits[0].opener.schema())
         } else {
             None
         };
@@ -580,7 +586,11 @@ impl TableProvider for SingleTableProvider {
         ff_indices.sort();
         ff_indices.dedup();
         if ff_indices.is_empty() {
-            ff_indices.push(self.fast_field_schema.index_of("_doc_id").unwrap());
+            ff_indices.push(self.fast_field_schema.index_of("_doc_id").map_err(|_| {
+                DataFusionError::Internal(
+                    "fast field schema missing required _doc_id column".into(),
+                )
+            })?);
         }
 
         let ff_projected_schema = {
@@ -723,8 +733,6 @@ impl SingleTableDataSource {
         Self {
             pre_built_query: if splits.len() == 1 {
                 build_split_fast_field_query(&fast_field_filter_exprs, &splits[0].opener.schema())
-                    .ok()
-                    .flatten()
             } else {
                 None
             },
@@ -803,6 +811,7 @@ impl SingleTableDataSource {
     }
 
     /// Create a copy with the topk limit set.
+    #[must_use]
     pub fn with_topk(&self, topk: usize) -> Self {
         self.clone_with(|s| s.topk = Some(topk))
     }
@@ -825,12 +834,6 @@ impl SingleTableDataSource {
     /// Used by the codec for serialization.
     pub fn fast_field_filter_exprs(&self) -> &[Expr] {
         &self.fast_field_filter_exprs
-    }
-
-    /// SingleTableDataSource does not carry pre-set aggregations.
-    /// The `AggPushdown` optimizer derives them from the AggregateExec.
-    pub fn aggregations(&self) -> Option<&Arc<tantivy::aggregation::agg_req::Aggregations>> {
-        None
     }
 
     /// Aggregate per-partition statistics into overall table statistics.
@@ -911,8 +914,8 @@ impl SingleTableDataSource {
     }
 
     /// Access the projection indices.
-    pub fn projection(&self) -> Option<&Vec<usize>> {
-        self.schema.projection.as_ref()
+    pub fn projection(&self) -> Option<&[usize]> {
+        self.schema.projection.as_deref()
     }
 
     /// Whether _score is needed.
@@ -930,24 +933,26 @@ impl SingleTableDataSource {
 
         if self.topk.is_some() && self.schema.needs_score {
             if let Ok(score_idx) = schema.index_of("_score") {
-                return vec![LexOrdering::new([PhysicalSortExpr::new(
+                if let Some(ordering) = LexOrdering::new([PhysicalSortExpr::new(
                     Arc::new(PhysicalColumn::new("_score", score_idx)),
                     SortOptions {
                         descending: true,
                         nulls_first: false,
                     },
-                )])
-                .unwrap()];
+                )]) {
+                    return vec![ordering];
+                }
             }
             return Vec::new();
         }
 
         if let Ok(doc_id_idx) = schema.index_of("_doc_id") {
-            return vec![LexOrdering::new([PhysicalSortExpr::new(
+            if let Some(ordering) = LexOrdering::new([PhysicalSortExpr::new(
                 Arc::new(PhysicalColumn::new("_doc_id", doc_id_idx)),
                 SortOptions::default(),
-            )])
-            .unwrap()];
+            )]) {
+                return vec![ordering];
+            }
         }
 
         Vec::new()
@@ -1020,10 +1025,11 @@ impl DataSource for SingleTableDataSource {
                 let index_ref = index.clone();
                 let ff_schema_ref = ff_projected_schema.clone();
                 let rq_ref = raw_queries.clone();
+                let ff_filter_exprs_ref = fast_field_filter_exprs.clone();
                 let needs_document_ref = needs_document;
                 if let Err(err) = warmup_done
                     .get_or_try_init(|| async move {
-                        let ff_names: Vec<&str> = ff_schema_ref
+                        let mut ff_names: std::collections::BTreeSet<String> = ff_schema_ref
                             .fields()
                             .iter()
                             .filter_map(|field| {
@@ -1031,11 +1037,18 @@ impl DataSource for SingleTableDataSource {
                                     .schema()
                                     .get_field(field.name())
                                     .ok()
-                                    .map(|_| field.name().as_str())
+                                    .map(|_| field.name().to_string())
                             })
                             .collect();
+                        ff_names.extend(crate::warmup::fast_field_filter_field_names(
+                            &index_ref.schema(),
+                            &ff_filter_exprs_ref,
+                        )?);
                         if !ff_names.is_empty() {
-                            crate::warmup::warmup_fast_fields_by_name(&index_ref, &ff_names)
+                            let ff_names: Vec<String> = ff_names.into_iter().collect();
+                            let ff_name_refs: Vec<&str> =
+                                ff_names.iter().map(String::as_str).collect();
+                            crate::warmup::warmup_fast_fields_by_name(&index_ref, &ff_name_refs)
                                 .await?;
                         }
 
@@ -1069,9 +1082,7 @@ impl DataSource for SingleTableDataSource {
             let result = tokio::task::spawn_blocking(move || {
                 let split_fast_field_query = match pre_built_query {
                     Some(query) => Some(query),
-                    None => {
-                        build_split_fast_field_query(&fast_field_filter_exprs, &index.schema())?
-                    }
+                    None => build_split_fast_field_query(&fast_field_filter_exprs, &index.schema()),
                 };
                 let query =
                     build_combined_query(&index, split_fast_field_query.as_ref(), &raw_queries)?;
@@ -1314,7 +1325,7 @@ impl<'a> ChunkBuilder<'a> {
         // Build score array.
         let score_array: Option<Arc<dyn arrow::array::Array>> = if self.needs_score {
             match chunk_scores {
-                Some(sc) => Some(Arc::new(Float32Array::from(sc.to_vec()))),
+                Some(sc) => Some(Arc::new(Float32Array::from_iter_values(sc.iter().copied()))),
                 None => Some(arrow::array::new_null_array(&DataType::Float32, chunk_rows)),
             }
         } else {
@@ -1323,10 +1334,9 @@ impl<'a> ChunkBuilder<'a> {
 
         // Build document array.
         let doc_array: Option<Arc<dyn arrow::array::Array>> = if self.needs_document {
-            let store = self
-                .store_reader
-                .as_ref()
-                .expect("store_reader required when needs_document");
+            let store = self.store_reader.as_ref().ok_or_else(|| {
+                DataFusionError::Internal("store_reader required when needs_document".into())
+            })?;
             let mut doc_builder =
                 StringBuilder::with_capacity(chunk_ids.len(), chunk_ids.len() * 256);
             for &doc_id in chunk_ids {
@@ -1350,11 +1360,9 @@ impl<'a> ChunkBuilder<'a> {
                     arrow::array::new_null_array(&DataType::Float32, chunk_rows)
                 }));
             } else if unified_idx == self.document_column_idx {
-                output_columns.push(
-                    doc_array
-                        .clone()
-                        .expect("_document requested but not built"),
-                );
+                output_columns.push(doc_array.clone().ok_or_else(|| {
+                    DataFusionError::Internal("_document requested but not built".into())
+                })?);
             } else {
                 let col_name = self.unified_schema.field(unified_idx).name();
                 let ff_col_idx = ff_batch.schema().index_of(col_name).map_err(|_| {

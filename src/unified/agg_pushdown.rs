@@ -92,7 +92,9 @@ fn try_rewrite(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn Execu
 
     // Handle both single-phase and two-phase aggregation patterns.
     match agg.mode() {
-        AggregateMode::Single | AggregateMode::SinglePartitioned => try_rewrite_single(agg, &plan),
+        AggregateMode::Single | AggregateMode::SinglePartitioned => {
+            Ok(try_rewrite_single(agg, &plan))
+        }
         AggregateMode::Final | AggregateMode::FinalPartitioned => try_rewrite_two_phase(agg, &plan),
         AggregateMode::Partial => {
             // Partial on its own — not the top-level, skip
@@ -112,19 +114,19 @@ fn has_group_by(agg: &AggregateExec) -> bool {
 fn try_rewrite_single(
     agg: &AggregateExec,
     plan: &Arc<dyn ExecutionPlan>,
-) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
+) -> Transformed<Arc<dyn ExecutionPlan>> {
     if !has_group_by(agg) {
-        return Ok(Transformed::no(plan.clone()));
+        return Transformed::no(plan.clone());
     }
     if agg.filter_expr().iter().any(|expr| expr.is_some()) {
-        return Ok(Transformed::no(plan.clone()));
+        return Transformed::no(plan.clone());
     }
 
     let input = agg.input();
 
     if let Some(st_ds) = find_single_table_datasource(input) {
         if !agg_fields_exist_on_all_splits(agg, st_ds) {
-            return Ok(Transformed::no(plan.clone()));
+            return Transformed::no(plan.clone());
         }
         if let Some(tantivy_aggs) = derive_tantivy_aggregations(agg).map(Arc::new) {
             let agg_ds = AggDataSource::from_split_openers(
@@ -135,24 +137,20 @@ fn try_rewrite_single(
                 st_ds.pre_built_query().cloned(),
                 st_ds.fast_field_filter_exprs().to_vec(),
             );
-            return Ok(Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(
-                agg_ds,
-            )))));
+            return Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(agg_ds))));
         }
     }
 
-    Ok(Transformed::no(plan.clone()))
+    Transformed::no(plan.clone())
 }
 
 /// Rewrite two-phase: keep `AggregateExec(Final*)` and replace the partial side
 /// with a partitioned `AggDataSource` that emits DataFusion-compatible partial
 /// aggregate state rows.
 fn try_rewrite_two_phase(
-    _final_agg: &AggregateExec,
+    final_agg: &AggregateExec,
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
-    let final_agg = plan.as_any().downcast_ref::<AggregateExec>().unwrap();
-
     if !has_group_by(final_agg) {
         return Ok(Transformed::no(plan.clone()));
     }

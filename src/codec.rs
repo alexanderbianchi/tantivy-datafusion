@@ -187,7 +187,7 @@ fn reconstruct_pre_built_query(
         return Ok(None);
     }
     if queries.len() == 1 {
-        Ok(Some(Arc::from(queries.into_iter().next().unwrap())))
+        Ok(queries.into_iter().next().map(Arc::from))
     } else {
         Ok(Some(Arc::new(tantivy::query::BooleanQuery::intersection(
             queries,
@@ -203,7 +203,7 @@ fn reconstruct_pre_built_query(
 fn build_single_table_scan_schema(
     canonical_ff_schema: &SchemaRef,
     projection: &Option<Vec<usize>>,
-) -> ScanSchema {
+) -> Result<ScanSchema> {
     use arrow::datatypes::{DataType, Field, Schema};
 
     // Build unified schema: fast fields + _score + _document.
@@ -238,7 +238,11 @@ fn build_single_table_scan_schema(
     ff_indices.sort();
     ff_indices.dedup();
     if ff_indices.is_empty() {
-        ff_indices.push(canonical_ff_schema.index_of("_doc_id").unwrap());
+        ff_indices.push(canonical_ff_schema.index_of("_doc_id").map_err(|_| {
+            DataFusionError::Internal(
+                "canonical fast field schema missing required _doc_id column".into(),
+            )
+        })?);
     }
 
     let ff_projected = {
@@ -257,7 +261,7 @@ fn build_single_table_scan_schema(
         Arc::new(Schema::new(fields))
     };
 
-    ScanSchema {
+    Ok(ScanSchema {
         unified: unified_schema,
         projected,
         ff_projected,
@@ -266,7 +270,7 @@ fn build_single_table_scan_schema(
         document_idx,
         needs_score,
         needs_document,
-    }
+    })
 }
 
 /// Extract serializable metadata from an opener.
@@ -509,7 +513,7 @@ fn decode_single_table(
     } else {
         decode_schema_bytes(&proto.canonical_ff_schema_bytes)?
     };
-    let scan_schema = build_single_table_scan_schema(&canonical_ff_schema, &projection);
+    let scan_schema = build_single_table_scan_schema(&canonical_ff_schema, &projection)?;
 
     let raw_queries: Vec<(String, String)> = if proto.raw_queries_json.is_empty() {
         Vec::new()
