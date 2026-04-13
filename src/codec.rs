@@ -169,13 +169,24 @@ fn build_single_table_scan_schema(
 
     ff_indices.sort();
     ff_indices.dedup();
-    if ff_indices.is_empty() {
-        ff_indices.push(canonical_ff_schema.index_of("_doc_id").map_err(|_| {
-            DataFusionError::Internal(
-                "canonical fast field schema missing required _doc_id column".into(),
-            )
-        })?);
+    let doc_id_idx = canonical_ff_schema.index_of("_doc_id").map_err(|_| {
+        DataFusionError::Internal(
+            "canonical fast field schema missing required _doc_id column".into(),
+        )
+    })?;
+    let segment_ord_idx = canonical_ff_schema.index_of("_segment_ord").map_err(|_| {
+        DataFusionError::Internal(
+            "canonical fast field schema missing required _segment_ord column".into(),
+        )
+    })?;
+    if ff_indices.is_empty() || (needs_document && !ff_indices.contains(&doc_id_idx)) {
+        ff_indices.push(doc_id_idx);
     }
+    if needs_document && !ff_indices.contains(&segment_ord_idx) {
+        ff_indices.push(segment_ord_idx);
+    }
+    ff_indices.sort();
+    ff_indices.dedup();
 
     let ff_projected = {
         let fields: Vec<arrow::datatypes::Field> = ff_indices
