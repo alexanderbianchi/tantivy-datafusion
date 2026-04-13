@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use datafusion::common::Result;
 use datafusion::error::DataFusionError;
-use tantivy::collector::TopNComputer;
 use tantivy::query::{BooleanQuery, EnableScoring, QueryParser};
 use tantivy::{DocId, DocSet, Index, Score, Searcher, SegmentReader, TERMINATED};
 
@@ -45,53 +44,6 @@ pub(crate) fn build_combined_query(
         1 => Ok(queries.into_iter().next().map(Arc::from)),
         _ => Ok(Some(Arc::new(BooleanQuery::intersection(queries)))),
     }
-}
-
-/// Execute a top-k tantivy query on a single segment and collect matching
-/// doc ids with BM25 scores.
-///
-/// This path is already bounded by `k` via Block-WAND pruning and remains
-/// separate from the streaming scan path.
-pub(crate) fn collect_topk_docs(
-    segment_reader: &SegmentReader,
-    searcher: &Searcher,
-    query: Option<&Arc<dyn tantivy::query::Query>>,
-    topk: usize,
-) -> Result<(Vec<DocId>, Vec<Score>)> {
-    let query = query.ok_or_else(|| {
-        DataFusionError::Internal("topk collection requires an active query".into())
-    })?;
-
-    let weight = query
-        .weight(EnableScoring::enabled_from_searcher(searcher))
-        .map_err(|e| DataFusionError::Internal(format!("create weight: {e}")))?;
-    let alive_bitset = segment_reader.alive_bitset();
-
-    // Collect scored documents using a manual scorer loop rather than
-    // for_each_pruning, because TopNComputer::threshold is pub(crate) in
-    // upstream tantivy. We still use TopNComputer for efficient top-N
-    // selection but forgo Block-WAND pruning.
-    let mut top_n: TopNComputer<Score, DocId, _> = TopNComputer::new(topk);
-    let mut scorer = weight
-        .scorer(segment_reader, 1.0)
-        .map_err(|e| DataFusionError::Internal(format!("create scorer: {e}")))?;
-    let mut doc = scorer.doc();
-    while doc != TERMINATED {
-        if alive_bitset.is_none_or(|alive| alive.is_alive(doc)) {
-            top_n.push(scorer.score(), doc);
-        }
-        doc = scorer.advance();
-    }
-
-    let results = top_n.into_sorted_vec();
-    let mut ids = Vec::with_capacity(results.len());
-    let mut scores = Vec::with_capacity(results.len());
-    for item in results {
-        ids.push(item.doc);
-        scores.push(item.sort_key);
-    }
-
-    Ok((ids, scores))
 }
 
 fn flush_doc_buffer<F>(doc_buffer: &mut Vec<DocId>, on_chunk: &mut F) -> Result<bool>

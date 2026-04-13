@@ -466,9 +466,11 @@ fn range_bucket_to_batch(
         let col_name = field.name().as_str();
 
         if col_name == "bucket" {
-            let values: Vec<Option<&str>> =
-                buckets.iter().map(|b| Some(key_as_str(&b.key))).collect();
-            columns.push(Arc::new(StringArray::from(values)));
+            let values: Vec<Option<String>> = buckets
+                .iter()
+                .map(|bucket| Some(key_as_str(&bucket.key).to_string()))
+                .collect();
+            columns.push(cast_key_column(&values, field.data_type()));
         } else if is_doc_count_column(col_name, &agg_def.sub_aggregation) {
             let values: Vec<i64> = buckets.iter().map(|b| b.doc_count as i64).collect();
             columns.push(Arc::new(Int64Array::from(values)));
@@ -557,6 +559,7 @@ fn cast_key_column(values: &[Option<String>], data_type: &DataType) -> ArrayRef 
     ));
     match data_type {
         DataType::Utf8 => string_arr,
+        DataType::Utf8View => arrow::compute::cast(&string_arr, data_type).unwrap_or(string_arr),
         DataType::Dictionary(_, _) => {
             // Produce a Dictionary<Int32, Utf8> array matching the schema
             arrow::compute::cast(&string_arr, data_type).unwrap_or(string_arr)
@@ -591,6 +594,18 @@ fn cast_key_column(values: &[Option<String>], data_type: &DataType) -> ArrayRef 
         }
         // Fallback: produce string
         _ => string_arr,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cast_key_column_respects_utf8_view_schema() {
+        let values = vec![Some("api".to_string()), Some("web".to_string())];
+        let array = cast_key_column(&values, &DataType::Utf8View);
+        assert_eq!(array.data_type(), &DataType::Utf8View);
     }
 }
 

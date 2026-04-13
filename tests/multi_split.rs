@@ -268,7 +268,7 @@ async fn test_multi_split_full_text_ignores_splits_missing_field() {
 }
 
 #[tokio::test]
-async fn test_multi_split_partition_count_flattens_split_segments() {
+async fn test_multi_split_partition_count_matches_split_count() {
     let mut builder = SchemaBuilder::new();
     let id = builder.add_u64_field("id", FAST | STORED);
     let schema = builder.build();
@@ -301,5 +301,5 @@ async fn test_multi_split_partition_count_flattens_split_segments() {
     let state = ctx.state();
     let exec = provider.scan(&state, None, &[], None).await.unwrap();
 
-    assert_eq!(exec.properties().partitioning.partition_count(), 3);
+    assert_eq!(exec.properties().partitioning.partition_count(), 2);
 }

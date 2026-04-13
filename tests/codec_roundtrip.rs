@@ -17,20 +17,18 @@ use tantivy::{DateTime, Index, IndexWriter, TantivyDocument};
 use tantivy_datafusion::unified::agg_data_source::{AggDataSource, AggOutputMode};
 use tantivy_datafusion::unified::single_table_provider::SingleTableDataSource;
 use tantivy_datafusion::{
-    full_text_udf, DirectIndexOpener, IndexOpener, OpenerFactoryExt, OpenerMetadata,
-    SingleTableProvider, TantivyCodec,
+    full_text_udf, DirectIndexOpener, IndexOpener, PreparedSplit, SingleTableProvider,
+    SplitDescriptor, SplitRuntimeFactory, SplitRuntimeFactoryExt, TantivyCodec,
 };
 
 #[derive(Debug, Clone)]
 struct NamedDirectOpener {
-    identifier: String,
     inner: DirectIndexOpener,
 }
 
 impl NamedDirectOpener {
-    fn new(identifier: impl Into<String>, index: Index) -> Self {
+    fn new(index: Index) -> Self {
         Self {
-            identifier: identifier.into(),
             inner: DirectIndexOpener::new(index),
         }
     }
@@ -38,20 +36,12 @@ impl NamedDirectOpener {
 
 #[async_trait]
 impl IndexOpener for NamedDirectOpener {
-    async fn open(&self) -> Result<Index> {
-        self.inner.open().await
+    async fn prepare(&self) -> Result<Arc<PreparedSplit>> {
+        self.inner.prepare().await
     }
 
     fn schema(&self) -> tantivy::schema::Schema {
         self.inner.schema()
-    }
-
-    fn segment_sizes(&self) -> Vec<u32> {
-        self.inner.segment_sizes()
-    }
-
-    fn identifier(&self) -> &str {
-        &self.identifier
     }
 
     fn needs_warmup(&self) -> bool {
@@ -64,6 +54,30 @@ impl IndexOpener for NamedDirectOpener {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[derive(Debug)]
+struct StaticSplitRuntimeFactory {
+    indices: Arc<HashMap<String, Index>>,
+    fallback: Option<Index>,
+}
+
+#[async_trait]
+impl SplitRuntimeFactory for StaticSplitRuntimeFactory {
+    async fn prepare_split(&self, descriptor: &SplitDescriptor) -> Result<Arc<PreparedSplit>> {
+        let index = self
+            .indices
+            .get(&descriptor.split_id)
+            .cloned()
+            .or_else(|| self.fallback.clone())
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Internal(format!(
+                    "missing test split {}",
+                    descriptor.split_id
+                ))
+            })?;
+        Ok(Arc::new(PreparedSplit::new(index, Arc::new(()))?))
     }
 }
 
@@ -127,26 +141,19 @@ fn create_test_index() -> Index {
 /// `DirectIndexOpener` wrapping the given index.
 fn session_with_opener(index: Index) -> SessionContext {
     let mut config = SessionConfig::new();
-    let test_index = index.clone();
-    config.set_opener_factory(Arc::new(
-        move |_meta: OpenerMetadata| -> Arc<dyn IndexOpener> {
-            Arc::new(DirectIndexOpener::new(test_index.clone()))
-        },
-    ));
+    config.set_split_runtime_factory(Arc::new(StaticSplitRuntimeFactory {
+        indices: Arc::new(HashMap::new()),
+        fallback: Some(index),
+    }));
     SessionContext::new_with_config(config)
 }
 
 fn session_with_named_openers(indices: HashMap<String, Index>) -> SessionContext {
     let mut config = SessionConfig::new();
-    config.set_opener_factory(Arc::new(
-        move |meta: OpenerMetadata| -> Arc<dyn IndexOpener> {
-            let index = indices
-                .get(&meta.identifier)
-                .unwrap_or_else(|| panic!("missing split {}", meta.identifier))
-                .clone();
-            Arc::new(NamedDirectOpener::new(meta.identifier, index))
-        },
-    ));
+    config.set_split_runtime_factory(Arc::new(StaticSplitRuntimeFactory {
+        indices: Arc::new(indices),
+        fallback: None,
+    }));
     SessionContext::new_with_config(config)
 }
 
@@ -373,8 +380,8 @@ async fn test_multi_split_single_table_roundtrip() {
 
     let provider = SingleTableProvider::from_splits_with_fast_field_schema(
         vec![
-            Arc::new(NamedDirectOpener::new("left", left.clone())),
-            Arc::new(NamedDirectOpener::new("right", right.clone())),
+            Arc::new(NamedDirectOpener::new(left.clone())),
+            Arc::new(NamedDirectOpener::new(right.clone())),
         ],
         canonical_schema,
     )
@@ -385,8 +392,8 @@ async fn test_multi_split_single_table_roundtrip() {
     let exec = provider.scan(&state, None, &[], None).await.unwrap();
 
     let mut split_indices = HashMap::new();
-    split_indices.insert("left".to_string(), left);
-    split_indices.insert("right".to_string(), right);
+    split_indices.insert("local-split-0".to_string(), left);
+    split_indices.insert("local-split-1".to_string(), right);
     let decode_session = session_with_named_openers(split_indices);
 
     let codec = TantivyCodec;
@@ -397,8 +404,9 @@ async fn test_multi_split_single_table_roundtrip() {
         .unwrap();
 
     let decoded_ds = single_table_ds(&decoded);
-    assert_eq!(decoded_ds.split_openers().len(), 2);
-    assert!(decoded_ds.single_split_opener().is_none());
+    assert_eq!(decoded_ds.split_descriptors().len(), 2);
+    assert!(decoded_ds.single_local_split_opener().is_none());
+    assert!(decoded_ds.local_split_openers().is_empty());
     assert_eq!(
         decoded.properties().partitioning.partition_count(),
         exec.properties().partitioning.partition_count()
@@ -550,8 +558,8 @@ async fn test_multi_split_agg_data_source_roundtrip() {
     let exec = Arc::new(DataSourceExec::new(Arc::new(
         AggDataSource::from_split_openers(
             vec![
-                Arc::new(NamedDirectOpener::new("left", left.clone())),
-                Arc::new(NamedDirectOpener::new("right", right.clone())),
+                Arc::new(NamedDirectOpener::new(left.clone())),
+                Arc::new(NamedDirectOpener::new(right.clone())),
             ],
             Arc::new(aggs),
             output_schema,
@@ -566,15 +574,15 @@ async fn test_multi_split_agg_data_source_roundtrip() {
     codec.try_encode(exec.clone(), &mut buf).unwrap();
 
     let mut split_indices = HashMap::new();
-    split_indices.insert("left".to_string(), left);
-    split_indices.insert("right".to_string(), right);
+    split_indices.insert("local-split-0".to_string(), left);
+    split_indices.insert("local-split-1".to_string(), right);
     let decode_session = session_with_named_openers(split_indices);
     let decoded = codec
         .try_decode(&buf, &[], &decode_session.state().task_ctx())
         .unwrap();
 
     let decoded_ds = agg_ds(&decoded);
-    assert_eq!(decoded_ds.split_openers().len(), 2);
+    assert_eq!(decoded_ds.split_descriptors().len(), 2);
     assert!(decoded_ds.single_split_opener().is_none());
 }
 
@@ -601,8 +609,8 @@ async fn test_multi_split_partial_state_agg_data_source_roundtrip() {
     let exec = Arc::new(DataSourceExec::new(Arc::new(
         AggDataSource::from_split_openers_partial_states(
             vec![
-                Arc::new(NamedDirectOpener::new("left", left.clone())),
-                Arc::new(NamedDirectOpener::new("right", right.clone())),
+                Arc::new(NamedDirectOpener::new(left.clone())),
+                Arc::new(NamedDirectOpener::new(right.clone())),
             ],
             Arc::new(aggs),
             output_schema,
@@ -617,15 +625,15 @@ async fn test_multi_split_partial_state_agg_data_source_roundtrip() {
     codec.try_encode(exec.clone(), &mut buf).unwrap();
 
     let mut split_indices = HashMap::new();
-    split_indices.insert("left".to_string(), left);
-    split_indices.insert("right".to_string(), right);
+    split_indices.insert("local-split-0".to_string(), left);
+    split_indices.insert("local-split-1".to_string(), right);
     let decode_session = session_with_named_openers(split_indices);
     let decoded = codec
         .try_decode(&buf, &[], &decode_session.state().task_ctx())
         .unwrap();
 
     let decoded_ds = agg_ds(&decoded);
-    assert_eq!(decoded_ds.split_openers().len(), 2);
+    assert_eq!(decoded_ds.split_descriptors().len(), 2);
     assert_eq!(decoded_ds.output_mode(), AggOutputMode::PartialStates);
 }
 
@@ -636,8 +644,8 @@ async fn test_multi_split_partial_state_agg_data_source_with_fast_field_filters_
     let filter = col("price").gt(lit(2.0));
 
     let provider = SingleTableProvider::from_splits(vec![
-        Arc::new(NamedDirectOpener::new("left", left.clone())),
-        Arc::new(NamedDirectOpener::new("right", right.clone())),
+        Arc::new(NamedDirectOpener::new(left.clone())),
+        Arc::new(NamedDirectOpener::new(right.clone())),
     ])
     .unwrap();
     let session = SessionContext::new();
@@ -659,8 +667,8 @@ async fn test_multi_split_partial_state_agg_data_source_with_fast_field_filters_
     let exec = Arc::new(DataSourceExec::new(Arc::new(
         AggDataSource::from_split_openers_partial_states(
             vec![
-                Arc::new(NamedDirectOpener::new("left", left.clone())),
-                Arc::new(NamedDirectOpener::new("right", right.clone())),
+                Arc::new(NamedDirectOpener::new(left.clone())),
+                Arc::new(NamedDirectOpener::new(right.clone())),
             ],
             Arc::new(aggs),
             output_schema,
@@ -675,8 +683,8 @@ async fn test_multi_split_partial_state_agg_data_source_with_fast_field_filters_
     codec.try_encode(exec.clone(), &mut buf).unwrap();
 
     let mut split_indices = HashMap::new();
-    split_indices.insert("left".to_string(), left);
-    split_indices.insert("right".to_string(), right);
+    split_indices.insert("local-split-0".to_string(), left);
+    split_indices.insert("local-split-1".to_string(), right);
     let decode_session = session_with_named_openers(split_indices);
     let decoded = codec
         .try_decode(&buf, &[], &decode_session.state().task_ctx())

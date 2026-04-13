@@ -4,8 +4,9 @@ use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use arrow::array::{Float32Array, RecordBatch, StringBuilder};
+use arrow::array::{ArrayRef, Float32Array, RecordBatch, StringBuilder, UInt32Array};
 use arrow::compute::SortOptions;
+use arrow::compute::{concat_batches, take};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
@@ -27,23 +28,24 @@ use datafusion_physical_plan::projection::ProjectionExprs;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{DisplayFormatType, Partitioning, SendableRecordBatchStream};
 use futures::stream::StreamExt;
+use tantivy::collector::TopDocs;
 use tantivy::query::RangeQuery;
 use tantivy::schema::{FieldType, IndexRecordOption, Schema as TantivySchema, Term};
-use tantivy::{DateTime, Document, Index};
+use tantivy::{DateTime, DocAddress, Document, Index};
 
 use crate::fast_field_reader::{read_segment_fast_fields_to_batch, DictCache};
 use crate::full_text_udf::extract_full_text_call;
 use crate::index_opener::{DirectIndexOpener, IndexOpener};
 use crate::schema_mapping::{
-    tantivy_schema_to_arrow_from_index, tantivy_schema_to_arrow_with_multi_valued,
+    tantivy_schema_to_arrow_from_index, tantivy_schema_to_arrow_from_searcher,
+    tantivy_schema_to_arrow_with_multi_valued,
 };
+use crate::split_runtime::{PreparedSplit, SplitDescriptor, SplitRuntimeFactoryExt};
 use crate::type_coercion::{
     apply_fast_field_projection, infer_canonical_fast_field_schema, plan_fast_field_projection,
     FastFieldProjectionPlan,
 };
-use crate::util::{
-    build_combined_query, collect_topk_docs, for_each_matching_doc_chunks, MatchingDocChunksConfig,
-};
+use crate::util::{build_combined_query, for_each_matching_doc_chunks, MatchingDocChunksConfig};
 
 /// Guard that calls `BaselineMetrics::done()` on drop so elapsed time is
 /// recorded even when the stream is cancelled.
@@ -173,23 +175,22 @@ fn compute_partition_stats(
 }
 
 #[derive(Debug, Clone)]
-struct SplitDescriptor {
-    opener: Arc<dyn IndexOpener>,
+struct PlannedSplit {
+    descriptor: SplitDescriptor,
+    opener: Option<Arc<dyn IndexOpener>>,
     fast_field_schema: SchemaRef,
-    num_segments: usize,
-    partition_stats: Vec<Option<PartitionStat>>,
+    partition_stat: Option<PartitionStat>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct SplitExecutionPlan {
-    pub(crate) opener: Arc<dyn IndexOpener>,
-    pub(crate) fast_field_projection: FastFieldProjectionPlan,
+    pub(crate) descriptor: SplitDescriptor,
+    pub(crate) opener: Option<Arc<dyn IndexOpener>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PartitionSpec {
     pub(crate) split_idx: usize,
-    pub(crate) segment_idx: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,24 +213,82 @@ fn fast_field_schema_for_opener(opener: &Arc<dyn IndexOpener>) -> SchemaRef {
         })
 }
 
-fn build_split_descriptor(opener: Arc<dyn IndexOpener>) -> Result<SplitDescriptor> {
-    let fast_field_schema = fast_field_schema_for_opener(&opener);
-    let num_segments = opener.segment_sizes().len().max(1);
-    let mut partition_stats =
-        if let Some(direct) = opener.as_any().downcast_ref::<DirectIndexOpener>() {
-            compute_partition_stats(direct, &fast_field_schema)?
-        } else {
-            vec![None; num_segments]
-        };
-    if partition_stats.is_empty() {
-        partition_stats.resize(num_segments, None);
+fn split_descriptor_from_opener(
+    opener: &Arc<dyn IndexOpener>,
+    fallback_id: impl Into<String>,
+) -> SplitDescriptor {
+    SplitDescriptor::new(
+        fallback_id.into(),
+        Vec::new(),
+        opener.schema(),
+        opener.multi_valued_fields(),
+    )
+}
+
+fn aggregate_partition_stats(stats: &[Option<PartitionStat>]) -> Option<PartitionStat> {
+    let known: Vec<&PartitionStat> = stats.iter().filter_map(|stat| stat.as_ref()).collect();
+    if known.is_empty() {
+        return None;
     }
 
-    Ok(SplitDescriptor {
-        opener,
+    let num_rows = known.iter().map(|stat| stat.num_rows).sum();
+    let has_deletes = known.iter().any(|stat| stat.has_deletes);
+    let mut column_stats: Vec<(String, Option<ScalarValue>, Option<ScalarValue>)> = Vec::new();
+
+    if let Some(first) = known.first() {
+        for (name, _, _) in &first.column_stats {
+            let mut min_value: Option<ScalarValue> = None;
+            let mut max_value: Option<ScalarValue> = None;
+
+            for stat in &known {
+                if let Some((_, min_candidate, max_candidate)) = stat
+                    .column_stats
+                    .iter()
+                    .find(|(candidate, _, _)| candidate == name)
+                {
+                    if let Some(candidate) = min_candidate {
+                        min_value = match min_value {
+                            Some(current) if current <= *candidate => Some(current),
+                            _ => Some(candidate.clone()),
+                        };
+                    }
+                    if let Some(candidate) = max_candidate {
+                        max_value = match max_value {
+                            Some(current) if current >= *candidate => Some(current),
+                            _ => Some(candidate.clone()),
+                        };
+                    }
+                }
+            }
+
+            column_stats.push((name.clone(), min_value, max_value));
+        }
+    }
+
+    Some(PartitionStat {
+        num_rows,
+        has_deletes,
+        column_stats,
+    })
+}
+
+fn build_planned_split(
+    opener: Arc<dyn IndexOpener>,
+    fallback_id: impl Into<String>,
+) -> Result<PlannedSplit> {
+    let fast_field_schema = fast_field_schema_for_opener(&opener);
+    let partition_stats = if let Some(direct) = opener.as_any().downcast_ref::<DirectIndexOpener>()
+    {
+        compute_partition_stats(direct, &fast_field_schema)?
+    } else {
+        Vec::new()
+    };
+
+    Ok(PlannedSplit {
+        descriptor: split_descriptor_from_opener(&opener, fallback_id),
+        opener: Some(opener),
         fast_field_schema,
-        num_segments,
-        partition_stats,
+        partition_stat: aggregate_partition_stats(&partition_stats),
     })
 }
 
@@ -296,11 +355,11 @@ fn analyze_fast_field_filter_support(
     }
 }
 
-fn filter_is_pushdown_safe(expr: &Expr, splits: &[SplitDescriptor]) -> bool {
+fn filter_is_pushdown_safe(expr: &Expr, splits: &[PlannedSplit]) -> bool {
     let mut any_query = false;
 
     for split in splits {
-        match analyze_fast_field_filter_support(expr, &split.opener.schema()) {
+        match analyze_fast_field_filter_support(expr, &split.descriptor.tantivy_schema) {
             FilterPushdownSupport::Query => any_query = true,
             FilterPushdownSupport::MissingField => {}
             FilterPushdownSupport::Unsupported => return false,
@@ -398,7 +457,7 @@ fn translate_partition_stat(
 /// ORDER BY _score DESC LIMIT 10
 /// ```
 pub struct SingleTableProvider {
-    splits: Vec<SplitDescriptor>,
+    splits: Vec<PlannedSplit>,
     unified_schema: SchemaRef,
     fast_field_schema: SchemaRef,
     score_column_idx: usize,
@@ -465,25 +524,57 @@ impl SingleTableProvider {
 
         let fast_field_schema = normalize_canonical_fast_field_schema(&fast_field_schema);
 
-        let splits: Vec<SplitDescriptor> = split_openers
+        let splits: Vec<PlannedSplit> = split_openers
             .into_iter()
-            .map(build_split_descriptor)
+            .enumerate()
+            .map(|(idx, opener)| build_planned_split(opener, format!("local-split-{idx}")))
             .collect::<Result<_>>()?;
 
         for split in &splits {
             plan_fast_field_projection(&split.fast_field_schema, &fast_field_schema)?;
         }
 
+        Ok(Self::from_planned_splits(splits, fast_field_schema))
+    }
+
+    pub fn from_split_descriptors_with_fast_field_schema(
+        split_descriptors: Vec<SplitDescriptor>,
+        fast_field_schema: SchemaRef,
+    ) -> Result<Self> {
+        if split_descriptors.is_empty() {
+            return Err(DataFusionError::Plan(
+                "SingleTableProvider requires at least one split descriptor".into(),
+            ));
+        }
+
+        let fast_field_schema = normalize_canonical_fast_field_schema(&fast_field_schema);
+        let splits: Vec<PlannedSplit> = split_descriptors
+            .into_iter()
+            .map(|descriptor| PlannedSplit {
+                fast_field_schema: tantivy_schema_to_arrow_with_multi_valued(
+                    &descriptor.tantivy_schema,
+                    &descriptor.multi_valued_fields,
+                ),
+                descriptor,
+                opener: None,
+                partition_stat: None,
+            })
+            .collect();
+
+        Ok(Self::from_planned_splits(splits, fast_field_schema))
+    }
+
+    fn from_planned_splits(splits: Vec<PlannedSplit>, fast_field_schema: SchemaRef) -> Self {
         let (unified_schema, score_column_idx, document_column_idx) =
             build_unified_schema(&fast_field_schema);
 
-        Ok(Self {
+        Self {
             splits,
             unified_schema,
             fast_field_schema,
             score_column_idx,
             document_column_idx,
-        })
+        }
     }
 }
 
@@ -543,10 +634,13 @@ impl TableProvider for SingleTableProvider {
         let mut fast_field_filter_exprs: Vec<Expr> = Vec::new();
         for filter in filters {
             if let Some((field_name, query_string)) = extract_full_text_call(filter) {
-                let field_exists = self
-                    .splits
-                    .iter()
-                    .any(|split| split.opener.schema().get_field(&field_name).is_ok());
+                let field_exists = self.splits.iter().any(|split| {
+                    split
+                        .descriptor
+                        .tantivy_schema
+                        .get_field(&field_name)
+                        .is_ok()
+                });
                 if !field_exists {
                     return Err(DataFusionError::Plan(format!(
                         "full_text: field '{field_name}' not found in any split"
@@ -558,7 +652,10 @@ impl TableProvider for SingleTableProvider {
             }
         }
         let cached_pre_built_query = if self.splits.len() == 1 {
-            build_split_fast_field_query(&fast_field_filter_exprs, &self.splits[0].opener.schema())
+            build_split_fast_field_query(
+                &fast_field_filter_exprs,
+                &self.splits[0].descriptor.tantivy_schema,
+            )
         } else {
             None
         };
@@ -585,18 +682,27 @@ impl TableProvider for SingleTableProvider {
 
         ff_indices.sort();
         ff_indices.dedup();
-        // _doc_id is always needed: as a fallback when no fast fields are
-        // projected, and for async document fetch when needs_document is true.
+        // _doc_id and _segment_ord are always needed: as a fallback when no
+        // fast fields are projected, and for async document fetch.
         let doc_id_idx = self.fast_field_schema.index_of("_doc_id").map_err(|_| {
-            DataFusionError::Internal(
-                "fast field schema missing required _doc_id column".into(),
-            )
+            DataFusionError::Internal("fast field schema missing required _doc_id column".into())
         })?;
+        let segment_ord_idx = self
+            .fast_field_schema
+            .index_of("_segment_ord")
+            .map_err(|_| {
+                DataFusionError::Internal(
+                    "fast field schema missing required _segment_ord column".into(),
+                )
+            })?;
         if ff_indices.is_empty() || (needs_document && !ff_indices.contains(&doc_id_idx)) {
             ff_indices.push(doc_id_idx);
-            ff_indices.sort();
-            ff_indices.dedup();
         }
+        if needs_document && !ff_indices.contains(&segment_ord_idx) {
+            ff_indices.push(segment_ord_idx);
+        }
+        ff_indices.sort();
+        ff_indices.dedup();
 
         let ff_projected_schema = {
             let fields: Vec<Field> = ff_indices
@@ -619,32 +725,25 @@ impl TableProvider for SingleTableProvider {
             .iter()
             .map(|split| {
                 Ok(SplitExecutionPlan {
-                    opener: Arc::clone(&split.opener),
-                    fast_field_projection: plan_fast_field_projection(
-                        &split.fast_field_schema,
-                        &ff_projected_schema,
-                    )?,
+                    descriptor: split.descriptor.clone(),
+                    opener: split.opener.as_ref().map(Arc::clone),
                 })
             })
             .collect::<Result<_>>()?;
 
-        let mut partition_map = Vec::new();
-        let mut partition_stats = Vec::new();
-        for (split_idx, split) in self.splits.iter().enumerate() {
-            for segment_idx in 0..split.num_segments {
-                partition_map.push(PartitionSpec {
-                    split_idx,
-                    segment_idx,
-                });
-                partition_stats.push(translate_partition_stat(
-                    split
-                        .partition_stats
-                        .get(segment_idx)
-                        .and_then(|stat| stat.as_ref()),
-                    &split_plans[split_idx].fast_field_projection,
-                ));
-            }
-        }
+        let partition_map: Vec<PartitionSpec> = (0..self.splits.len())
+            .map(|split_idx| PartitionSpec { split_idx })
+            .collect();
+        let partition_stats: Vec<Option<PartitionStat>> = self
+            .splits
+            .iter()
+            .map(|split| {
+                let projection =
+                    plan_fast_field_projection(&split.fast_field_schema, &ff_projected_schema)
+                        .ok()?;
+                translate_partition_stat(split.partition_stat.as_ref(), &projection)
+            })
+            .collect();
 
         let data_source = SingleTableDataSource {
             splits: split_plans,
@@ -708,7 +807,7 @@ pub struct SingleTableDataSource {
     pub(crate) topk: Option<usize>,
     row_limit: Option<usize>,
     partition_map: Vec<PartitionSpec>,
-    /// Per-partition (segment) statistics for partition pruning.
+    /// Per-partition (split) statistics for partition pruning.
     /// Indexed by partition number. `None` means stats are unavailable for
     /// that partition (e.g. remote opener without metadata).
     partition_stats: Vec<Option<PartitionStat>>,
@@ -737,7 +836,10 @@ impl SingleTableDataSource {
             .collect();
         Self {
             pre_built_query: if splits.len() == 1 {
-                build_split_fast_field_query(&fast_field_filter_exprs, &splits[0].opener.schema())
+                build_split_fast_field_query(
+                    &fast_field_filter_exprs,
+                    &splits[0].descriptor.tantivy_schema,
+                )
             } else {
                 None
             },
@@ -772,18 +874,26 @@ impl SingleTableDataSource {
         new
     }
 
-    /// Access the split openers.
-    pub fn split_openers(&self) -> Vec<Arc<dyn IndexOpener>> {
+    /// Access the split descriptors.
+    pub fn split_descriptors(&self) -> Vec<SplitDescriptor> {
         self.splits
             .iter()
-            .map(|split| Arc::clone(&split.opener))
+            .map(|split| split.descriptor.clone())
             .collect()
     }
 
-    /// Access the sole opener when the data source spans a single split.
-    pub fn single_split_opener(&self) -> Option<&Arc<dyn IndexOpener>> {
+    /// Access any local split openers embedded in this datasource.
+    pub fn local_split_openers(&self) -> Vec<Arc<dyn IndexOpener>> {
+        self.splits
+            .iter()
+            .filter_map(|split| split.opener.as_ref().map(Arc::clone))
+            .collect()
+    }
+
+    /// Access the sole local opener when the data source spans a single local split.
+    pub fn single_local_split_opener(&self) -> Option<&Arc<dyn IndexOpener>> {
         match self.splits.as_slice() {
-            [split] => Some(&split.opener),
+            [split] => split.opener.as_ref(),
             _ => None,
         }
     }
@@ -794,7 +904,7 @@ impl SingleTableDataSource {
     }
 
     /// The number of partitions this data source is partitioned over.
-    pub fn num_segments(&self) -> usize {
+    pub fn num_partitions(&self) -> usize {
         self.partition_map.len()
     }
 
@@ -950,18 +1060,36 @@ impl SingleTableDataSource {
             }
             return Vec::new();
         }
-
-        if let Ok(doc_id_idx) = schema.index_of("_doc_id") {
-            if let Some(ordering) = LexOrdering::new([PhysicalSortExpr::new(
-                Arc::new(PhysicalColumn::new("_doc_id", doc_id_idx)),
-                SortOptions::default(),
-            )]) {
-                return vec![ordering];
-            }
-        }
-
         Vec::new()
     }
+}
+
+async fn prepare_split(
+    split: &SplitExecutionPlan,
+    context: &datafusion::execution::TaskContext,
+) -> Result<Arc<PreparedSplit>> {
+    if let Some(opener) = &split.opener {
+        return opener.prepare().await;
+    }
+
+    let factory = context
+        .session_config()
+        .get_split_runtime_factory()
+        .ok_or_else(|| {
+            DataFusionError::Internal(
+                "no SplitRuntimeFactory registered on session config; \
+                 remote split execution requires config.set_split_runtime_factory(...)"
+                    .into(),
+            )
+        })?;
+    factory.prepare_split(&split.descriptor).await
+}
+
+fn split_needs_warmup(split: &SplitExecutionPlan) -> bool {
+    split
+        .opener
+        .as_ref()
+        .is_none_or(|opener| opener.needs_warmup())
 }
 
 impl DataSource for SingleTableDataSource {
@@ -980,12 +1108,8 @@ impl DataSource for SingleTableDataSource {
             .get(partition_spec.split_idx)
             .ok_or_else(|| DataFusionError::Internal("invalid split index".to_string()))?
             .clone();
-        let opener = Arc::clone(&split.opener);
-        let segment_idx = partition_spec.segment_idx;
         let raw_queries = self.raw_queries.clone();
         let ff_projected_schema = self.schema.ff_projected.clone();
-        let source_ff_schema = split.fast_field_projection.source_schema.clone();
-        let fast_field_projection = split.fast_field_projection.clone();
         let unified_schema = self.schema.unified.clone();
         let projected_schema = self.schema.projected.clone();
         let projection = self.schema.projection.clone();
@@ -1007,7 +1131,7 @@ impl DataSource for SingleTableDataSource {
                 .get(partition_spec.split_idx)
                 .ok_or_else(|| DataFusionError::Internal("invalid warmup split index".into()))?,
         );
-        let needs_warmup = opener.needs_warmup();
+        let needs_warmup = split_needs_warmup(&split);
         let row_limit = self.row_limit;
         let cancelled = Arc::new(AtomicBool::new(false));
 
@@ -1016,61 +1140,78 @@ impl DataSource for SingleTableDataSource {
 
         let cancelled_task = Arc::clone(&cancelled);
         let handle = tokio::spawn(async move {
-            // Async setup: open index + warmup
-            let index = match opener.open().await {
-                Ok(i) => i,
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
+            let prepared = match prepare_split(&split, context.as_ref()).await {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    let _ = tx.send(Err(err)).await;
                     return;
                 }
             };
 
-            // Skip warmup for local/mmap openers — data already accessible.
+            let source_ff_schema = if split.opener.is_some() {
+                tantivy_schema_to_arrow_from_searcher(
+                    &prepared.index().schema(),
+                    prepared.searcher(),
+                )
+            } else {
+                tantivy_schema_to_arrow_with_multi_valued(
+                    &split.descriptor.tantivy_schema,
+                    &split.descriptor.multi_valued_fields,
+                )
+            };
+            let fast_field_projection =
+                match plan_fast_field_projection(&source_ff_schema, &ff_projected_schema) {
+                    Ok(plan) => plan,
+                    Err(err) => {
+                        let _ = tx.send(Err(err)).await;
+                        return;
+                    }
+                };
+
             if needs_warmup {
-                let index_ref = index.clone();
-                let ff_schema_ref = ff_projected_schema.clone();
-                let rq_ref = raw_queries.clone();
-                let ff_filter_exprs_ref = fast_field_filter_exprs.clone();
-                let needs_document_ref = needs_document;
+                let searcher = prepared.searcher().clone();
+                let tantivy_schema = prepared.index().schema();
+                let source_ff_schema = source_ff_schema.clone();
+                let raw_queries = raw_queries.clone();
+                let fast_field_filter_exprs = fast_field_filter_exprs.clone();
                 if let Err(err) = warmup_done
                     .get_or_try_init(|| async move {
-                        let mut ff_names: std::collections::BTreeSet<String> = ff_schema_ref
+                        let mut ff_names: std::collections::BTreeSet<String> = source_ff_schema
                             .fields()
                             .iter()
                             .filter_map(|field| {
-                                index_ref
-                                    .schema()
-                                    .get_field(field.name())
-                                    .ok()
-                                    .map(|_| field.name().to_string())
+                                let name = field.name();
+                                if name == "_doc_id" || name == "_segment_ord" {
+                                    None
+                                } else {
+                                    tantivy_schema
+                                        .get_field(name)
+                                        .ok()
+                                        .map(|_| name.to_string())
+                                }
                             })
                             .collect();
                         ff_names.extend(crate::warmup::fast_field_filter_field_names(
-                            &index_ref.schema(),
-                            &ff_filter_exprs_ref,
+                            &tantivy_schema,
+                            &fast_field_filter_exprs,
                         )?);
+
                         if !ff_names.is_empty() {
                             let ff_names: Vec<String> = ff_names.into_iter().collect();
                             let ff_name_refs: Vec<&str> =
                                 ff_names.iter().map(String::as_str).collect();
-                            crate::warmup::warmup_fast_fields_by_name(&index_ref, &ff_name_refs)
+                            crate::warmup::warmup_fast_fields_by_name(&searcher, &ff_name_refs)
                                 .await?;
                         }
 
-                        let queried_fields: Vec<tantivy::schema::Field> = rq_ref
+                        let queried_fields: Vec<tantivy::schema::Field> = raw_queries
                             .iter()
-                            .filter_map(|(field_name, _)| {
-                                index_ref.schema().get_field(field_name).ok()
-                            })
+                            .filter_map(|(field_name, _)| tantivy_schema.get_field(field_name).ok())
                             .collect();
                         if !queried_fields.is_empty() {
-                            crate::warmup::warmup_inverted_index(&index_ref, &queried_fields)
+                            crate::warmup::warmup_inverted_index(&searcher, &queried_fields)
                                 .await?;
                         }
-
-                        // Document store warmup is NOT needed — document retrieval
-                        // uses Searcher::doc_async() which reads blocks on demand
-                        // via the async I/O path.
 
                         Ok::<(), DataFusionError>(())
                     })
@@ -1079,30 +1220,34 @@ impl DataSource for SingleTableDataSource {
                     let _ = tx.send(Err(err)).await;
                     return;
                 }
-            } // end if needs_warmup
+            }
 
             // Blocking batch generation — batches exclude _document. When
             // needs_document, the async loop below adds it via doc_async.
             let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(2);
-            let index_for_docs = index.clone();
+            let prepared_for_docs = Arc::clone(&prepared);
             let output_schema_for_docs = projected_schema.clone();
             let cancelled_blocking = Arc::clone(&cancelled_task);
 
             let blocking_handle = tokio::task::spawn_blocking(move || {
                 let split_fast_field_query = match pre_built_query {
                     Some(query) => Some(query),
-                    None => build_split_fast_field_query(&fast_field_filter_exprs, &index.schema()),
+                    None => build_split_fast_field_query(
+                        &fast_field_filter_exprs,
+                        &prepared.index().schema(),
+                    ),
                 };
-                let query =
-                    build_combined_query(&index, split_fast_field_query.as_ref(), &raw_queries)?;
+                let query = build_combined_query(
+                    prepared.index(),
+                    split_fast_field_query.as_ref(),
+                    &raw_queries,
+                )?;
                 let cfg = ScanConfig {
-                    index,
-                    segment_idx,
+                    prepared,
                     batch_size,
                     source_ff_schema,
                     fast_field_projection,
                     unified_schema,
-                    projected_schema,
                     projection,
                     score_column_idx,
                     document_column_idx,
@@ -1119,14 +1264,13 @@ impl DataSource for SingleTableDataSource {
             });
 
             // Forward batches, adding _document column async when needed.
-            let tantivy_schema = index_for_docs.schema();
+            let tantivy_schema = prepared_for_docs.index().schema();
             while let Some(result) = raw_rx.recv().await {
                 let to_send = match result {
                     Ok(batch) if needs_document => {
                         fill_document_column_async(
                             batch,
-                            &index_for_docs,
-                            segment_idx,
+                            &prepared_for_docs,
                             &output_schema_for_docs,
                             &tantivy_schema,
                         )
@@ -1320,8 +1464,7 @@ impl DataSource for SingleTableDataSource {
 /// with `_document` inserted at the correct position per the output schema.
 async fn fill_document_column_async(
     batch: RecordBatch,
-    index: &Index,
-    segment_idx: usize,
+    prepared: &PreparedSplit,
     output_schema: &SchemaRef,
     tantivy_schema: &tantivy::schema::Schema,
 ) -> Result<RecordBatch> {
@@ -1338,21 +1481,29 @@ async fn fill_document_column_async(
         .as_any()
         .downcast_ref::<arrow::array::UInt32Array>()
         .ok_or_else(|| DataFusionError::Internal("_doc_id column is not UInt32".into()))?;
-
-    let reader = index
-        .reader()
-        .map_err(|e| DataFusionError::Internal(format!("open reader for doc fetch: {e}")))?;
-    let searcher = reader.searcher();
+    let segment_ord_idx = intermediate_schema.index_of("_segment_ord").map_err(|_| {
+        DataFusionError::Internal(
+            "_segment_ord column required for document fetch but not in batch".into(),
+        )
+    })?;
+    let segment_ords = batch
+        .column(segment_ord_idx)
+        .as_any()
+        .downcast_ref::<arrow::array::UInt32Array>()
+        .ok_or_else(|| DataFusionError::Internal("_segment_ord column is not UInt32".into()))?;
 
     // Fetch documents async — each call reads only the specific store block needed.
     let mut doc_builder = StringBuilder::with_capacity(doc_ids.len(), doc_ids.len() * 256);
     for idx in 0..doc_ids.len() {
         let doc_id = doc_ids.value(idx);
-        let doc_addr = tantivy::DocAddress::new(segment_idx as u32, doc_id);
-        let doc: tantivy::TantivyDocument = searcher
-            .doc_async(doc_addr)
-            .await
-            .map_err(|e| DataFusionError::Internal(format!("async doc fetch {doc_id}: {e}")))?;
+        let segment_ord = segment_ords.value(idx);
+        let doc_addr = DocAddress::new(segment_ord, doc_id);
+        let doc: tantivy::TantivyDocument =
+            prepared.searcher().doc_async(doc_addr).await.map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "async doc fetch segment={segment_ord} doc={doc_id}: {e}"
+                ))
+            })?;
         doc_builder.append_value(doc.to_json(tantivy_schema));
     }
     let doc_array: Arc<dyn arrow::array::Array> = Arc::new(doc_builder.finish());
@@ -1392,7 +1543,6 @@ struct ChunkBuilder<'a> {
     source_ff_schema: &'a SchemaRef,
     fast_field_projection: &'a FastFieldProjectionPlan,
     unified_schema: &'a SchemaRef,
-    projected_schema: &'a SchemaRef,
     projected_indices: Vec<usize>,
     score_column_idx: usize,
     document_column_idx: usize,
@@ -1434,8 +1584,9 @@ impl<'a> ChunkBuilder<'a> {
         let mut output_columns: Vec<Arc<dyn arrow::array::Array>> = Vec::new();
         let mut output_fields: Vec<arrow::datatypes::Field> = Vec::new();
 
-        // When _document is needed, always include _doc_id in the intermediate
-        // batch so fill_document_column_async can find document addresses.
+        // When _document is needed, always include _doc_id and _segment_ord in
+        // the intermediate batch so fill_document_column_async can find
+        // document addresses across split-local segments.
         let doc_id_already_projected = self
             .projected_indices
             .iter()
@@ -1444,9 +1595,26 @@ impl<'a> ChunkBuilder<'a> {
             let doc_id_name = "_doc_id";
             if let Ok(ff_idx) = ff_batch.schema().index_of(doc_id_name) {
                 output_columns.push(ff_batch.column(ff_idx).clone());
-                output_fields.push(
-                    arrow::datatypes::Field::new(doc_id_name, DataType::UInt32, false),
-                );
+                output_fields.push(arrow::datatypes::Field::new(
+                    doc_id_name,
+                    DataType::UInt32,
+                    false,
+                ));
+            }
+        }
+        let segment_ord_already_projected = self
+            .projected_indices
+            .iter()
+            .any(|&idx| self.unified_schema.field(idx).name() == "_segment_ord");
+        if self.needs_document && !segment_ord_already_projected {
+            let segment_ord_name = "_segment_ord";
+            if let Ok(ff_idx) = ff_batch.schema().index_of(segment_ord_name) {
+                output_columns.push(ff_batch.column(ff_idx).clone());
+                output_fields.push(arrow::datatypes::Field::new(
+                    segment_ord_name,
+                    DataType::UInt32,
+                    false,
+                ));
             }
         }
 
@@ -1485,13 +1653,11 @@ impl<'a> ChunkBuilder<'a> {
 /// Configuration for a single-segment batch generation pass.
 /// Constructed in `open()` and moved into `spawn_blocking`.
 struct ScanConfig {
-    index: Index,
-    segment_idx: usize,
+    prepared: Arc<PreparedSplit>,
     batch_size: usize,
     source_ff_schema: SchemaRef,
     fast_field_projection: FastFieldProjectionPlan,
     unified_schema: SchemaRef,
-    projected_schema: SchemaRef,
     projection: Option<Vec<usize>>,
     score_column_idx: usize,
     document_column_idx: usize,
@@ -1509,45 +1675,14 @@ fn generate_single_table_batch_streaming(
     cfg: &ScanConfig,
     mut emit: impl FnMut(RecordBatch) -> bool,
 ) -> Result<()> {
-    let index = &cfg.index;
-    let segment_idx = cfg.segment_idx;
+    let index = cfg.prepared.index();
     let batch_size = cfg.batch_size;
     let needs_score = cfg.needs_score;
-    let reader = index
-        .reader()
-        .map_err(|e| DataFusionError::Internal(format!("open reader: {e}")))?;
-    let searcher = reader.searcher();
-    let segment_readers = searcher.segment_readers();
-    if segment_idx >= segment_readers.len() {
-        return Ok(());
-    }
-    let segment_reader = &segment_readers[segment_idx];
-
-    // Build the chunk builder once for this segment.
-    // Document store is NOT opened here — document retrieval is async and
-    // happens outside spawn_blocking via fill_document_column_async.
-    let needs_document = cfg.needs_document;
+    let searcher = cfg.prepared.searcher();
 
     let projected_indices: Vec<usize> = match &cfg.projection {
         Some(indices) => indices.clone(),
         None => (0..cfg.unified_schema.fields().len()).collect(),
-    };
-
-    let dict_cache = DictCache::build(segment_reader, &cfg.source_ff_schema)?;
-
-    let builder = ChunkBuilder {
-        segment_reader,
-        source_ff_schema: &cfg.source_ff_schema,
-        fast_field_projection: &cfg.fast_field_projection,
-        unified_schema: &cfg.unified_schema,
-        projected_schema: &cfg.projected_schema,
-        projected_indices,
-        score_column_idx: cfg.score_column_idx,
-        document_column_idx: cfg.document_column_idx,
-        needs_score,
-        needs_document,
-        segment_ord: segment_idx as u32,
-        dict_cache,
     };
     let mut remaining = cfg.row_limit.unwrap_or(usize::MAX);
 
@@ -1556,60 +1691,149 @@ fn generate_single_table_batch_streaming(
         if effective_topk == 0 {
             return Ok(());
         }
-        let (doc_ids, scores) = collect_topk_docs(
-            segment_reader,
-            &searcher,
-            cfg.query.as_ref(),
-            effective_topk,
-        )?;
-        if doc_ids.is_empty() {
+        let query = cfg.query.as_ref().ok_or_else(|| {
+            DataFusionError::Internal("topk collection requires an active query".into())
+        })?;
+        let hits = searcher
+            .search(
+                query.as_ref(),
+                &TopDocs::with_limit(effective_topk).order_by_score(),
+            )
+            .map_err(|e| DataFusionError::Internal(format!("topk search: {e}")))?;
+        if hits.is_empty() {
             return Ok(());
         }
 
-        let total = doc_ids.len();
-        let mut offset = 0;
-        while offset < total && remaining > 0 {
+        let mut grouped: std::collections::BTreeMap<u32, Vec<(u32, f32, usize)>> =
+            std::collections::BTreeMap::new();
+        for (original_pos, (score, doc_addr)) in hits.into_iter().enumerate() {
+            grouped.entry(doc_addr.segment_ord).or_default().push((
+                doc_addr.doc_id,
+                score,
+                original_pos,
+            ));
+        }
+
+        let mut segment_batches = Vec::new();
+        let mut take_positions = vec![0u32; effective_topk];
+        let mut concat_offset = 0usize;
+
+        for (segment_ord, rows) in grouped {
+            let segment_reader = searcher.segment_reader(segment_ord);
+            let dict_cache = DictCache::build(segment_reader, &cfg.source_ff_schema)?;
+            let builder = ChunkBuilder {
+                segment_reader,
+                source_ff_schema: &cfg.source_ff_schema,
+                fast_field_projection: &cfg.fast_field_projection,
+                unified_schema: &cfg.unified_schema,
+                projected_indices: projected_indices.clone(),
+                score_column_idx: cfg.score_column_idx,
+                document_column_idx: cfg.document_column_idx,
+                needs_score,
+                needs_document: cfg.needs_document,
+                segment_ord,
+                dict_cache,
+            };
+            let mut doc_ids = Vec::with_capacity(rows.len());
+            let mut scores = Vec::with_capacity(rows.len());
+            for (local_idx, (doc_id, score, original_pos)) in rows.into_iter().enumerate() {
+                doc_ids.push(doc_id);
+                scores.push(score);
+                take_positions[original_pos] = (concat_offset + local_idx) as u32;
+            }
+            let batch = builder.build(&doc_ids, Some(&scores))?;
+            concat_offset += batch.num_rows();
+            segment_batches.push(batch);
+        }
+
+        let reordered = if segment_batches.len() == 1 {
+            segment_batches.pop().unwrap()
+        } else {
+            let schema = segment_batches
+                .first()
+                .map(RecordBatch::schema)
+                .ok_or_else(|| DataFusionError::Internal("missing topk batches".into()))?;
+            let concatenated = concat_batches(&schema, &segment_batches)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            let take_indices = UInt32Array::from_iter_values(take_positions.iter().copied());
+            let columns: Vec<ArrayRef> = concatenated
+                .columns()
+                .iter()
+                .map(|column| {
+                    take(column.as_ref(), &take_indices, None)
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+                })
+                .collect::<Result<_>>()?;
+            RecordBatch::try_new(concatenated.schema(), columns)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
+        };
+
+        let total_rows = reordered.num_rows();
+        let mut offset = 0usize;
+        while offset < total_rows {
             if cfg.cancelled.load(Ordering::Relaxed) {
                 return Ok(());
             }
-            let end = (offset + batch_size).min(total).min(offset + remaining);
-            let batch = builder.build(&doc_ids[offset..end], Some(&scores[offset..end]))?;
+            let len = (total_rows - offset).min(batch_size);
+            let batch = reordered.slice(offset, len);
             if batch.num_rows() > 0 && !emit(batch) {
                 return Ok(());
             }
-            remaining -= end - offset;
-            offset = end;
+            offset += len;
         }
         return Ok(());
     }
 
-    for_each_matching_doc_chunks(
-        MatchingDocChunksConfig {
-            segment_reader,
-            searcher: &searcher,
-            query: cfg.query.as_ref(),
-            index_schema: &index.schema(),
-            needs_score,
-            batch_size,
-            cancelled: cfg.cancelled.as_ref(),
-        },
-        |chunk_ids, chunk_scores| {
-            if remaining == 0 || cfg.cancelled.load(Ordering::Relaxed) {
-                return Ok(false);
-            }
+    for (segment_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
+        if remaining == 0 || cfg.cancelled.load(Ordering::Relaxed) {
+            break;
+        }
 
-            let take = remaining.min(chunk_ids.len());
-            let batch = builder.build(
-                &chunk_ids[..take],
-                chunk_scores.map(|scores| &scores[..take]),
-            )?;
-            remaining -= take;
-            if batch.num_rows() > 0 && !emit(batch) {
-                return Ok(false);
-            }
-            Ok(remaining > 0)
-        },
-    )
+        let dict_cache = DictCache::build(segment_reader, &cfg.source_ff_schema)?;
+        let builder = ChunkBuilder {
+            segment_reader,
+            source_ff_schema: &cfg.source_ff_schema,
+            fast_field_projection: &cfg.fast_field_projection,
+            unified_schema: &cfg.unified_schema,
+            projected_indices: projected_indices.clone(),
+            score_column_idx: cfg.score_column_idx,
+            document_column_idx: cfg.document_column_idx,
+            needs_score,
+            needs_document: cfg.needs_document,
+            segment_ord: segment_ord as u32,
+            dict_cache,
+        };
+
+        for_each_matching_doc_chunks(
+            MatchingDocChunksConfig {
+                segment_reader,
+                searcher,
+                query: cfg.query.as_ref(),
+                index_schema: &index.schema(),
+                needs_score,
+                batch_size,
+                cancelled: cfg.cancelled.as_ref(),
+            },
+            |chunk_ids, chunk_scores| {
+                if remaining == 0 || cfg.cancelled.load(Ordering::Relaxed) {
+                    return Ok(false);
+                }
+
+                let take = remaining.min(chunk_ids.len());
+                let batch = builder.build(
+                    &chunk_ids[..take],
+                    chunk_scores.map(|scores| &scores[..take]),
+                )?;
+                remaining -= take;
+                if batch.num_rows() > 0 && !emit(batch) {
+                    return Ok(false);
+                }
+                Ok(remaining > 0)
+            },
+        )?;
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

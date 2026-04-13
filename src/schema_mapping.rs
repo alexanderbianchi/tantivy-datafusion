@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use tantivy::columnar::Cardinality;
 use tantivy::schema::FieldType;
-use tantivy::Index;
+use tantivy::{Index, Searcher};
 
 /// Maps a tantivy field type to the scalar Arrow data type.
 fn scalar_arrow_type(field_type: &FieldType) -> Option<DataType> {
@@ -61,6 +61,20 @@ pub fn tantivy_schema_to_arrow_from_index(index: &Index) -> SchemaRef {
     let segment_readers = searcher.segment_readers();
     if segment_readers.is_empty() {
         return tantivy_schema_to_arrow(&schema);
+    }
+
+    tantivy_schema_to_arrow_from_searcher(&schema, &searcher)
+}
+
+/// Converts a tantivy schema to an Arrow schema using an existing searcher to
+/// detect multi-valued fields.
+pub fn tantivy_schema_to_arrow_from_searcher(
+    schema: &tantivy::schema::Schema,
+    searcher: &Searcher,
+) -> SchemaRef {
+    let segment_readers = searcher.segment_readers();
+    if segment_readers.is_empty() {
+        return tantivy_schema_to_arrow(schema);
     }
 
     let mut fields: Vec<Field> = vec![

@@ -11,9 +11,9 @@ use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::Result;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::Expr;
-use tantivy::schema::{Field, FieldType};
 use tantivy::directory::Directory;
-use tantivy::{Index, IndexReader, ReloadPolicy};
+use tantivy::schema::{Field, FieldType};
+use tantivy::{Index, IndexReader, ReloadPolicy, Searcher};
 
 async fn open_reader_for_warmup(index: &Index) -> Result<IndexReader> {
     let index = index.clone();
@@ -54,10 +54,7 @@ pub(crate) fn fast_field_filter_field_names(
 /// Warm up the inverted index data needed for full-text queries.
 ///
 /// Pre-loads term dictionaries and posting lists for the given fields.
-pub async fn warmup_inverted_index(index: &Index, query_fields: &[Field]) -> Result<()> {
-    let reader = open_reader_for_warmup(index).await?;
-    let searcher = reader.searcher();
-
+pub async fn warmup_inverted_index(searcher: &Searcher, query_fields: &[Field]) -> Result<()> {
     let fields: HashSet<Field> = query_fields.iter().copied().collect();
 
     for segment_reader in searcher.segment_readers() {
@@ -85,10 +82,7 @@ pub async fn warmup_inverted_index(index: &Index, query_fields: &[Field]) -> Res
 /// Warm up fast fields for specific field names only.
 ///
 /// Only pre-loads the fields that will actually be read.
-pub async fn warmup_fast_fields_by_name(index: &Index, field_names: &[&str]) -> Result<()> {
-    let reader = open_reader_for_warmup(index).await?;
-    let searcher = reader.searcher();
-
+pub async fn warmup_fast_fields_by_name(searcher: &Searcher, field_names: &[&str]) -> Result<()> {
     for segment_reader in searcher.segment_readers() {
         let ff_reader = segment_reader.fast_fields();
         for &name in field_names {
@@ -159,25 +153,19 @@ pub async fn warmup_document_store(index: &Index) -> Result<()> {
         let store_path = std::path::PathBuf::from(format!("{uuid}.store"));
 
         // Open the file slice and pre-load via async read into the cache.
-        let file_slice = index
-            .directory()
-            .open_read(&store_path)
-            .map_err(|err| {
-                DataFusionError::Internal(format!(
-                    "warmup doc store open {}: {err}",
-                    store_path.display()
-                ))
-            })?;
+        let file_slice = index.directory().open_read(&store_path).map_err(|err| {
+            DataFusionError::Internal(format!(
+                "warmup doc store open {}: {err}",
+                store_path.display()
+            ))
+        })?;
 
-        file_slice
-            .read_bytes_async()
-            .await
-            .map_err(|err| {
-                DataFusionError::Internal(format!(
-                    "warmup doc store read {}: {err}",
-                    store_path.display()
-                ))
-            })?;
+        file_slice.read_bytes_async().await.map_err(|err| {
+            DataFusionError::Internal(format!(
+                "warmup doc store read {}: {err}",
+                store_path.display()
+            ))
+        })?;
     }
 
     Ok(())
@@ -215,7 +203,9 @@ pub async fn warmup_all_text_fields(index: &Index) -> Result<()> {
         return Ok(());
     }
 
-    warmup_inverted_index(index, &text_fields).await
+    let reader = open_reader_for_warmup(index).await?;
+    let searcher = reader.searcher();
+    warmup_inverted_index(&searcher, &text_fields).await
 }
 
 #[cfg(test)]

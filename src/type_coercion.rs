@@ -29,7 +29,6 @@ pub(crate) struct FastFieldColumnPlan {
 
 #[derive(Debug, Clone)]
 pub(crate) struct FastFieldProjectionPlan {
-    pub(crate) source_schema: SchemaRef,
     pub(crate) output_schema: SchemaRef,
     pub(crate) columns: Vec<FastFieldColumnPlan>,
 }
@@ -133,7 +132,6 @@ pub(crate) fn plan_fast_field_projection(
     }
 
     Ok(FastFieldProjectionPlan {
-        source_schema: Arc::new(Schema::new(source_fields)),
         output_schema: Arc::clone(canonical_schema),
         columns: column_plans,
     })
@@ -232,19 +230,27 @@ fn scalar_cast_supported(source: &DataType, target: &DataType) -> bool {
     }
 
     match (source, target) {
-        (DataType::Dictionary(_, value_type), DataType::Utf8)
-            if value_type.as_ref() == &DataType::Utf8 =>
+        (DataType::Dictionary(_, value_type), target)
+            if value_type.as_ref() == &DataType::Utf8 && is_utf8_like(target) =>
         {
             true
         }
-        (DataType::Utf8, DataType::Utf8) => true,
-        (source, DataType::Utf8) if is_numeric(source) => true,
-        (DataType::Boolean, DataType::Utf8) => true,
-        (DataType::Timestamp(_, _), DataType::Utf8) => true,
+        (source, target)
+            if is_utf8_like(target) && matches!(source, DataType::Utf8 | DataType::Utf8View) =>
+        {
+            true
+        }
+        (source, target) if is_utf8_like(target) && is_numeric(source) => true,
+        (DataType::Boolean, target) if is_utf8_like(target) => true,
+        (DataType::Timestamp(_, _), target) if is_utf8_like(target) => true,
         (source, target) if is_numeric(source) && is_numeric(target) => true,
         (DataType::Timestamp(_, _), DataType::Timestamp(_, _)) => true,
         _ => false,
     }
+}
+
+fn is_utf8_like(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Utf8 | DataType::Utf8View)
 }
 
 fn is_numeric(data_type: &DataType) -> bool {
@@ -289,6 +295,7 @@ fn promotable_scalar_type(data_type: &DataType) -> Option<DataType> {
         | DataType::Float64
         | DataType::Boolean
         | DataType::Utf8
+        | DataType::Utf8View
         | DataType::Binary
         | DataType::Timestamp(TimeUnit::Microsecond, None) => Some(data_type.clone()),
         DataType::Dictionary(_, value_type) if value_type.as_ref() == &DataType::Utf8 => {
@@ -296,6 +303,29 @@ fn promotable_scalar_type(data_type: &DataType) -> Option<DataType> {
         }
         DataType::List(inner) => Some(inner.data_type().clone()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scalar_cast_supported_accepts_numeric_to_utf8_view() {
+        assert!(scalar_cast_supported(
+            &DataType::Float64,
+            &DataType::Utf8View
+        ));
+        assert!(scalar_cast_supported(
+            &DataType::UInt64,
+            &DataType::Utf8View
+        ));
+    }
+
+    #[test]
+    fn scalar_cast_supported_accepts_utf8_dictionary_to_utf8_view() {
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        assert!(scalar_cast_supported(&dict_type, &DataType::Utf8View));
     }
 }
 
