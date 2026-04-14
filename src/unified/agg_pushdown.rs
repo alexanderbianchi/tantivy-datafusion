@@ -129,26 +129,15 @@ fn try_rewrite_single(
             return Transformed::no(plan.clone());
         }
         if let Some(tantivy_aggs) = derive_tantivy_aggregations(agg).map(Arc::new) {
-            let local_split_openers = st_ds.local_split_openers();
-            let agg_ds = if local_split_openers.len() == st_ds.split_descriptors().len() {
-                AggDataSource::from_split_openers(
-                    local_split_openers,
-                    tantivy_aggs,
-                    agg.schema(),
-                    st_ds.raw_queries().to_vec(),
-                    st_ds.pre_built_query().cloned(),
-                    st_ds.fast_field_filter_exprs().to_vec(),
-                )
-            } else {
-                AggDataSource::from_split_descriptors(
-                    st_ds.split_descriptors(),
-                    tantivy_aggs,
-                    agg.schema(),
-                    st_ds.raw_queries().to_vec(),
-                    st_ds.pre_built_query().cloned(),
-                    st_ds.fast_field_filter_exprs().to_vec(),
-                )
-            };
+            let agg_ds = AggDataSource::from_split_descriptors_with_runtime_factory(
+                st_ds.split_descriptors(),
+                tantivy_aggs,
+                agg.schema(),
+                st_ds.raw_queries().to_vec(),
+                st_ds.pre_built_query().cloned(),
+                st_ds.fast_field_filter_exprs().to_vec(),
+                st_ds.local_runtime_factory(),
+            );
             return Transformed::yes(Arc::new(DataSourceExec::new(Arc::new(agg_ds))));
         }
     }
@@ -186,26 +175,15 @@ fn try_rewrite_two_phase(
             return Ok(Transformed::no(plan.clone()));
         }
         if let Some(tantivy_aggs) = derive_tantivy_partial_aggregations(partial_agg).map(Arc::new) {
-            let local_split_openers = st_ds.local_split_openers();
-            let agg_ds = if local_split_openers.len() == st_ds.split_descriptors().len() {
-                AggDataSource::from_split_openers_partial_states(
-                    local_split_openers,
-                    tantivy_aggs,
-                    partial_agg.schema(),
-                    st_ds.raw_queries().to_vec(),
-                    st_ds.pre_built_query().cloned(),
-                    st_ds.fast_field_filter_exprs().to_vec(),
-                )
-            } else {
-                AggDataSource::from_split_descriptors_partial_states(
-                    st_ds.split_descriptors(),
-                    tantivy_aggs,
-                    partial_agg.schema(),
-                    st_ds.raw_queries().to_vec(),
-                    st_ds.pre_built_query().cloned(),
-                    st_ds.fast_field_filter_exprs().to_vec(),
-                )
-            };
+            let agg_ds = AggDataSource::from_split_descriptors_partial_states_with_runtime_factory(
+                st_ds.split_descriptors(),
+                tantivy_aggs,
+                partial_agg.schema(),
+                st_ds.raw_queries().to_vec(),
+                st_ds.pre_built_query().cloned(),
+                st_ds.fast_field_filter_exprs().to_vec(),
+                st_ds.local_runtime_factory(),
+            );
             let replacement: Arc<dyn ExecutionPlan> =
                 Arc::new(DataSourceExec::new(Arc::new(agg_ds)));
             let rewritten_input =

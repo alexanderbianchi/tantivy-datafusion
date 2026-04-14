@@ -597,18 +597,6 @@ fn cast_key_column(values: &[Option<String>], data_type: &DataType) -> ArrayRef 
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cast_key_column_respects_utf8_view_schema() {
-        let values = vec![Some("api".to_string()), Some("web".to_string())];
-        let array = cast_key_column(&values, &DataType::Utf8View);
-        assert_eq!(array.data_type(), &DataType::Utf8View);
-    }
-}
-
 /// Create a typed column from f64 values, casting to the target data type.
 fn typed_f64_column(values: &[Option<f64>], data_type: &DataType) -> ArrayRef {
     match data_type {
@@ -683,5 +671,17 @@ fn extract_stats_metric_value(metric: &MetricResult, suffix: &str) -> Option<f64
             _ => None,
         },
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cast_key_column_respects_utf8_view_schema() {
+        let values = vec![Some("api".to_string()), Some("web".to_string())];
+        let array = cast_key_column(&values, &DataType::Utf8View);
+        assert_eq!(array.data_type(), &DataType::Utf8View);
     }
 }

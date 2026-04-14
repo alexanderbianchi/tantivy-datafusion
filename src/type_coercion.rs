@@ -306,29 +306,6 @@ fn promotable_scalar_type(data_type: &DataType) -> Option<DataType> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn scalar_cast_supported_accepts_numeric_to_utf8_view() {
-        assert!(scalar_cast_supported(
-            &DataType::Float64,
-            &DataType::Utf8View
-        ));
-        assert!(scalar_cast_supported(
-            &DataType::UInt64,
-            &DataType::Utf8View
-        ));
-    }
-
-    #[test]
-    fn scalar_cast_supported_accepts_utf8_dictionary_to_utf8_view() {
-        let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
-        assert!(scalar_cast_supported(&dict_type, &DataType::Utf8View));
-    }
-}
-
 fn wrap_scalar_array_in_list(array: &ArrayRef, item_type: &DataType) -> Result<ArrayRef> {
     match item_type {
         DataType::UInt64 => wrap_typed_array::<UInt64Array, UInt64Builder, u64>(
@@ -476,4 +453,27 @@ where
         builder.append(true);
     }
     Ok(Arc::new(builder.finish()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scalar_cast_supported_accepts_numeric_to_utf8_view() {
+        assert!(scalar_cast_supported(
+            &DataType::Float64,
+            &DataType::Utf8View
+        ));
+        assert!(scalar_cast_supported(
+            &DataType::UInt64,
+            &DataType::Utf8View
+        ));
+    }
+
+    #[test]
+    fn scalar_cast_supported_accepts_utf8_dictionary_to_utf8_view() {
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        assert!(scalar_cast_supported(&dict_type, &DataType::Utf8View));
+    }
 }

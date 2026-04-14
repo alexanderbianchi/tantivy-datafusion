@@ -373,7 +373,7 @@ fn decode_single_table(
         .into_iter()
         .map(|descriptor| SplitExecutionPlan {
             descriptor,
-            opener: None,
+            needs_warmup: true,
         })
         .collect();
     let partition_map = (0..proto.split_descriptors.len())

@@ -4,7 +4,7 @@
 pub mod codec;
 pub mod fast_field_reader;
 pub mod full_text_udf;
-pub mod index_opener;
+pub(crate) mod index_opener;
 pub mod schema_mapping;
 pub mod split_runtime;
 pub(crate) mod type_coercion;
@@ -21,7 +21,6 @@ pub mod unified;
 // ---------------------------------------------------------------------------
 pub use codec::TantivyCodec;
 pub use full_text_udf::{extract_full_text_call, full_text_udf};
-pub use index_opener::{DirectIndexOpener, IndexOpener, OpenerMetadata};
 pub use schema_mapping::{
     tantivy_schema_to_arrow, tantivy_schema_to_arrow_from_index,
     tantivy_schema_to_arrow_with_multi_valued,

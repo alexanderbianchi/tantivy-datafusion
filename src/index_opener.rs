@@ -1,4 +1,4 @@
-use std::any::Any;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -9,7 +9,7 @@ use tantivy::Index;
 use tokio::sync::OnceCell;
 
 use crate::schema_mapping::field_cardinality;
-use crate::split_runtime::{PreparedSplit, SplitDescriptor};
+use crate::split_runtime::{PreparedSplit, SplitDescriptor, SplitRuntimeFactory};
 
 /// Local adapter that can still derive schema metadata cheaply and prepare a
 /// reusable split runtime when the executor needs to scan a split.
@@ -21,13 +21,6 @@ use crate::split_runtime::{PreparedSplit, SplitDescriptor};
 pub trait IndexOpener: Send + Sync + fmt::Debug {
     /// Prepare a reusable split runtime.
     async fn prepare(&self) -> Result<Arc<PreparedSplit>>;
-
-    /// Open (or return cached) the tantivy `Index`.
-    ///
-    /// Kept as a convenience wrapper for older local code paths.
-    async fn open(&self) -> Result<Index> {
-        Ok(self.prepare().await?.index().clone())
-    }
 
     /// Tantivy schema — available without opening the split at planning time.
     fn schema(&self) -> tantivy::schema::Schema;
@@ -50,12 +43,31 @@ pub trait IndexOpener: Send + Sync + fmt::Debug {
     fn multi_valued_fields(&self) -> Vec<String> {
         vec![]
     }
-
-    /// Downcast to a concrete type.
-    fn as_any(&self) -> &dyn Any;
 }
 
-pub type OpenerMetadata = SplitDescriptor;
+#[derive(Debug)]
+pub struct OpenerSplitRuntimeFactory {
+    openers: HashMap<String, Arc<dyn IndexOpener>>,
+}
+
+impl OpenerSplitRuntimeFactory {
+    pub fn new(openers: HashMap<String, Arc<dyn IndexOpener>>) -> Self {
+        Self { openers }
+    }
+}
+
+#[async_trait]
+impl SplitRuntimeFactory for OpenerSplitRuntimeFactory {
+    async fn prepare_split(&self, descriptor: &SplitDescriptor) -> Result<Arc<PreparedSplit>> {
+        let opener = self.openers.get(&descriptor.split_id).ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "missing local opener for split '{}'",
+                descriptor.split_id
+            ))
+        })?;
+        opener.prepare().await
+    }
+}
 
 /// An [`IndexOpener`] that wraps an already-opened `Index`.
 ///
@@ -73,14 +85,6 @@ impl DirectIndexOpener {
             index,
             prepared: Arc::new(OnceCell::new()),
         }
-    }
-
-    /// Returns a reference to the wrapped tantivy Index.
-    ///
-    /// This is cheap (no I/O) and is used at planning time to read
-    /// per-segment statistics for partition pruning.
-    pub fn index(&self) -> &Index {
-        &self.index
     }
 
     /// Return a long-lived reader for this index snapshot.
@@ -142,8 +146,5 @@ impl IndexOpener for DirectIndexOpener {
 
     fn needs_warmup(&self) -> bool {
         false // mmap — data already accessible, no async pre-loading needed
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }

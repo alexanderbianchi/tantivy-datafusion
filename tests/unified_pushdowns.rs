@@ -136,16 +136,7 @@ fn setup_ctx(index: Index) -> SessionContext {
 }
 
 fn setup_multi_split_ctx(indices: Vec<Index>) -> SessionContext {
-    let provider = SingleTableProvider::from_splits(
-        indices
-            .into_iter()
-            .map(|index| {
-                Arc::new(tantivy_datafusion::DirectIndexOpener::new(index))
-                    as Arc<dyn tantivy_datafusion::IndexOpener>
-            })
-            .collect(),
-    )
-    .unwrap();
+    let provider = SingleTableProvider::from_local_splits(indices).unwrap();
     let config = SessionConfig::new().with_target_partitions(4);
     let state = SessionStateBuilder::new()
         .with_config(config)

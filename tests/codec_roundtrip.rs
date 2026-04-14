@@ -17,45 +17,9 @@ use tantivy::{DateTime, Index, IndexWriter, TantivyDocument};
 use tantivy_datafusion::unified::agg_data_source::{AggDataSource, AggOutputMode};
 use tantivy_datafusion::unified::single_table_provider::SingleTableDataSource;
 use tantivy_datafusion::{
-    full_text_udf, DirectIndexOpener, IndexOpener, PreparedSplit, SingleTableProvider,
-    SplitDescriptor, SplitRuntimeFactory, SplitRuntimeFactoryExt, TantivyCodec,
+    full_text_udf, PreparedSplit, SingleTableProvider, SplitDescriptor, SplitRuntimeFactory,
+    SplitRuntimeFactoryExt, TantivyCodec,
 };
-
-#[derive(Debug, Clone)]
-struct NamedDirectOpener {
-    inner: DirectIndexOpener,
-}
-
-impl NamedDirectOpener {
-    fn new(index: Index) -> Self {
-        Self {
-            inner: DirectIndexOpener::new(index),
-        }
-    }
-}
-
-#[async_trait]
-impl IndexOpener for NamedDirectOpener {
-    async fn prepare(&self) -> Result<Arc<PreparedSplit>> {
-        self.inner.prepare().await
-    }
-
-    fn schema(&self) -> tantivy::schema::Schema {
-        self.inner.schema()
-    }
-
-    fn needs_warmup(&self) -> bool {
-        self.inner.needs_warmup()
-    }
-
-    fn multi_valued_fields(&self) -> Vec<String> {
-        self.inner.multi_valued_fields()
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
 
 #[derive(Debug)]
 struct StaticSplitRuntimeFactory {
@@ -137,9 +101,9 @@ fn create_test_index() -> Index {
     index
 }
 
-/// Build a `SessionContext` with an opener factory that returns a
-/// `DirectIndexOpener` wrapping the given index.
-fn session_with_opener(index: Index) -> SessionContext {
+/// Build a `SessionContext` with a split runtime factory that returns the
+/// given index for single-split decode tests.
+fn session_with_index(index: Index) -> SessionContext {
     let mut config = SessionConfig::new();
     config.set_split_runtime_factory(Arc::new(StaticSplitRuntimeFactory {
         indices: Arc::new(HashMap::new()),
@@ -162,7 +126,7 @@ fn roundtrip_exec(exec: Arc<dyn ExecutionPlan>, index: Index) -> Arc<dyn Executi
     let mut buf = Vec::new();
     codec.try_encode(exec, &mut buf).unwrap();
 
-    let decode_session = session_with_opener(index);
+    let decode_session = session_with_index(index);
     let task_ctx = decode_session.state().task_ctx();
     codec.try_decode(&buf, &[], &task_ctx).unwrap()
 }
@@ -243,7 +207,7 @@ async fn test_single_table_roundtrip() {
     assert!(!buf.is_empty(), "encoded bytes should be non-empty");
 
     // Decode
-    let decode_session = session_with_opener(index);
+    let decode_session = session_with_index(index);
     let task_ctx = decode_session.state().task_ctx();
     let decoded = codec.try_decode(&buf, &[], &task_ctx).unwrap();
 
@@ -281,7 +245,7 @@ async fn test_single_table_with_projection_roundtrip() {
     let mut buf = Vec::new();
     codec.try_encode(exec.clone(), &mut buf).unwrap();
 
-    let decode_session = session_with_opener(index);
+    let decode_session = session_with_index(index);
     let task_ctx = decode_session.state().task_ctx();
     let decoded = codec.try_decode(&buf, &[], &task_ctx).unwrap();
 
@@ -309,7 +273,7 @@ async fn test_single_table_with_query_roundtrip() {
     let mut buf = Vec::new();
     codec.try_encode(exec.clone(), &mut buf).unwrap();
 
-    let decode_session = session_with_opener(index);
+    let decode_session = session_with_index(index);
     let task_ctx = decode_session.state().task_ctx();
     let decoded = codec.try_decode(&buf, &[], &task_ctx).unwrap();
 
@@ -346,7 +310,7 @@ async fn test_single_table_with_topk_roundtrip() {
     let mut buf = Vec::new();
     codec.try_encode(exec_with_topk.clone(), &mut buf).unwrap();
 
-    let decode_session = session_with_opener(index);
+    let decode_session = session_with_index(index);
     let task_ctx = decode_session.state().task_ctx();
     let decoded = codec.try_decode(&buf, &[], &task_ctx).unwrap();
 
@@ -378,11 +342,8 @@ async fn test_multi_split_single_table_roundtrip() {
         Field::new("score", DataType::Float64, true),
     ]));
 
-    let provider = SingleTableProvider::from_splits_with_fast_field_schema(
-        vec![
-            Arc::new(NamedDirectOpener::new(left.clone())),
-            Arc::new(NamedDirectOpener::new(right.clone())),
-        ],
+    let provider = SingleTableProvider::from_local_splits_with_fast_field_schema(
+        vec![left.clone(), right.clone()],
         canonical_schema,
     )
     .unwrap();
@@ -405,8 +366,7 @@ async fn test_multi_split_single_table_roundtrip() {
 
     let decoded_ds = single_table_ds(&decoded);
     assert_eq!(decoded_ds.split_descriptors().len(), 2);
-    assert!(decoded_ds.single_local_split_opener().is_none());
-    assert!(decoded_ds.local_split_openers().is_empty());
+    assert!(decoded_ds.local_runtime_factory().is_none());
     assert_eq!(
         decoded.properties().partitioning.partition_count(),
         exec.properties().partitioning.partition_count()
@@ -428,7 +388,7 @@ async fn test_double_roundtrip_single_table() {
     let mut buf1 = Vec::new();
     codec.try_encode(exec.clone(), &mut buf1).unwrap();
 
-    let decode_session = session_with_opener(index.clone());
+    let decode_session = session_with_index(index.clone());
     let task_ctx = decode_session.state().task_ctx();
     let decoded = codec.try_decode(&buf1, &[], &task_ctx).unwrap();
 
@@ -443,7 +403,6 @@ async fn test_double_roundtrip_single_table() {
 #[tokio::test]
 async fn test_agg_data_source_roundtrip() {
     let index = create_test_index();
-    let opener = Arc::new(DirectIndexOpener::new(index.clone()));
 
     // Build a simple terms aggregation on "body" field.
     let aggs: tantivy::aggregation::agg_req::Aggregations =
@@ -459,7 +418,7 @@ async fn test_agg_data_source_roundtrip() {
     ]));
 
     let agg_ds = AggDataSource::new(
-        opener,
+        index.clone(),
         Arc::new(aggs),
         output_schema.clone(),
         Vec::new(),
@@ -475,7 +434,7 @@ async fn test_agg_data_source_roundtrip() {
     assert!(!buf.is_empty(), "encoded bytes should be non-empty");
 
     // Decode
-    let decode_session = session_with_opener(index);
+    let decode_session = session_with_index(index);
     let task_ctx = decode_session.state().task_ctx();
     let decoded = codec.try_decode(&buf, &[], &task_ctx).unwrap();
 
@@ -494,7 +453,6 @@ async fn test_agg_data_source_roundtrip() {
 #[tokio::test]
 async fn test_agg_data_source_with_query_roundtrip() {
     let index = create_test_index();
-    let opener = Arc::new(DirectIndexOpener::new(index.clone()));
 
     // Build a terms aggregation with a FTS filter.
     let aggs: tantivy::aggregation::agg_req::Aggregations =
@@ -512,7 +470,7 @@ async fn test_agg_data_source_with_query_roundtrip() {
     let raw_queries = vec![("body".to_string(), "rust".to_string())];
 
     let agg_ds = AggDataSource::new(
-        opener,
+        index.clone(),
         Arc::new(aggs),
         output_schema.clone(),
         raw_queries,
@@ -528,7 +486,7 @@ async fn test_agg_data_source_with_query_roundtrip() {
     assert!(!buf.is_empty(), "encoded bytes should be non-empty");
 
     // Decode
-    let decode_session = session_with_opener(index);
+    let decode_session = session_with_index(index);
     let task_ctx = decode_session.state().task_ctx();
     let decoded = codec.try_decode(&buf, &[], &task_ctx).unwrap();
 
@@ -556,11 +514,8 @@ async fn test_multi_split_agg_data_source_roundtrip() {
     ]));
 
     let exec = Arc::new(DataSourceExec::new(Arc::new(
-        AggDataSource::from_split_openers(
-            vec![
-                Arc::new(NamedDirectOpener::new(left.clone())),
-                Arc::new(NamedDirectOpener::new(right.clone())),
-            ],
+        AggDataSource::from_local_splits(
+            vec![left.clone(), right.clone()],
             Arc::new(aggs),
             output_schema,
             Vec::new(),
@@ -583,7 +538,7 @@ async fn test_multi_split_agg_data_source_roundtrip() {
 
     let decoded_ds = agg_ds(&decoded);
     assert_eq!(decoded_ds.split_descriptors().len(), 2);
-    assert!(decoded_ds.single_split_opener().is_none());
+    assert!(decoded_ds.local_runtime_factory().is_none());
 }
 
 #[tokio::test]
@@ -607,11 +562,8 @@ async fn test_multi_split_partial_state_agg_data_source_roundtrip() {
     ]));
 
     let exec = Arc::new(DataSourceExec::new(Arc::new(
-        AggDataSource::from_split_openers_partial_states(
-            vec![
-                Arc::new(NamedDirectOpener::new(left.clone())),
-                Arc::new(NamedDirectOpener::new(right.clone())),
-            ],
+        AggDataSource::from_local_splits_partial_states(
+            vec![left.clone(), right.clone()],
             Arc::new(aggs),
             output_schema,
             Vec::new(),
@@ -643,11 +595,8 @@ async fn test_multi_split_partial_state_agg_data_source_with_fast_field_filters_
     let right = create_test_index();
     let filter = col("price").gt(lit(2.0));
 
-    let provider = SingleTableProvider::from_splits(vec![
-        Arc::new(NamedDirectOpener::new(left.clone())),
-        Arc::new(NamedDirectOpener::new(right.clone())),
-    ])
-    .unwrap();
+    let provider =
+        SingleTableProvider::from_local_splits(vec![left.clone(), right.clone()]).unwrap();
     let session = SessionContext::new();
     let state = session.state();
     let scan_exec = provider.scan(&state, None, &[filter], None).await.unwrap();
@@ -665,11 +614,8 @@ async fn test_multi_split_partial_state_agg_data_source_with_fast_field_filters_
         arrow::datatypes::Field::new("doc_count", arrow::datatypes::DataType::Int64, false),
     ]));
     let exec = Arc::new(DataSourceExec::new(Arc::new(
-        AggDataSource::from_split_openers_partial_states(
-            vec![
-                Arc::new(NamedDirectOpener::new(left.clone())),
-                Arc::new(NamedDirectOpener::new(right.clone())),
-            ],
+        AggDataSource::from_local_splits_partial_states(
+            vec![left.clone(), right.clone()],
             Arc::new(aggs),
             output_schema,
             scan_ds.raw_queries().to_vec(),
@@ -762,7 +708,6 @@ async fn test_codec_roundtrip_fts_plus_fast_field_filter() {
 #[tokio::test]
 async fn test_codec_roundtrip_agg_with_fast_field_filters() {
     let index = create_test_index();
-    let opener = Arc::new(DirectIndexOpener::new(index.clone()));
     let provider = SingleTableProvider::new(index.clone());
     let session = SessionContext::new();
     let state = session.state();
@@ -790,7 +735,7 @@ async fn test_codec_roundtrip_agg_with_fast_field_filters() {
         arrow::datatypes::Field::new("doc_count", arrow::datatypes::DataType::Int64, false),
     ]));
     let agg_exec = Arc::new(DataSourceExec::new(Arc::new(AggDataSource::new(
-        opener,
+        index.clone(),
         Arc::new(aggs),
         output_schema,
         scan_ds.raw_queries().to_vec(),
@@ -830,9 +775,9 @@ async fn test_codec_roundtrip_multi_valued_field_schema() {
 }
 
 #[test]
-fn test_from_opener_preserves_multi_valued_schema_for_direct_index() {
+fn test_new_preserves_multi_valued_schema_for_local_index() {
     let index = create_test_index();
-    let provider = SingleTableProvider::from_opener(Arc::new(DirectIndexOpener::new(index)));
+    let provider = SingleTableProvider::new(index);
     let schema = provider.schema();
     let field = schema.field(schema.index_of("tags").unwrap());
 
@@ -849,7 +794,6 @@ fn test_from_opener_preserves_multi_valued_schema_for_direct_index() {
 #[tokio::test]
 async fn test_double_roundtrip_agg_data_source() {
     let index = create_test_index();
-    let opener = Arc::new(DirectIndexOpener::new(index.clone()));
     let aggs: tantivy::aggregation::agg_req::Aggregations =
         serde_json::from_value(serde_json::json!({
             "terms_category": { "terms": { "field": "category" } }
@@ -860,7 +804,7 @@ async fn test_double_roundtrip_agg_data_source() {
         arrow::datatypes::Field::new("doc_count", DataType::Int64, false),
     ]));
     let exec = Arc::new(DataSourceExec::new(Arc::new(AggDataSource::new(
-        opener,
+        index.clone(),
         Arc::new(aggs),
         output_schema,
         Vec::new(),
@@ -872,7 +816,7 @@ async fn test_double_roundtrip_agg_data_source() {
     let mut buf1 = Vec::new();
     codec.try_encode(exec, &mut buf1).unwrap();
 
-    let decode_session = session_with_opener(index);
+    let decode_session = session_with_index(index);
     let task_ctx = decode_session.state().task_ctx();
     let decoded = codec.try_decode(&buf1, &[], &task_ctx).unwrap();
 

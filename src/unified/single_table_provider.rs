@@ -7,7 +7,8 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Float32Array, RecordBatch, StringBuilder, UInt32Array};
 use arrow::compute::SortOptions;
 use arrow::compute::{concat_batches, take};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::record_batch::RecordBatchOptions;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::config::ConfigOptions;
@@ -35,12 +36,11 @@ use tantivy::{DateTime, DocAddress, Document, Index};
 
 use crate::fast_field_reader::{read_segment_fast_fields_to_batch, DictCache};
 use crate::full_text_udf::extract_full_text_call;
-use crate::index_opener::{DirectIndexOpener, IndexOpener};
-use crate::schema_mapping::{
-    tantivy_schema_to_arrow_from_index, tantivy_schema_to_arrow_from_searcher,
-    tantivy_schema_to_arrow_with_multi_valued,
+use crate::index_opener::{DirectIndexOpener, IndexOpener, OpenerSplitRuntimeFactory};
+use crate::schema_mapping::tantivy_schema_to_arrow_with_multi_valued;
+use crate::split_runtime::{
+    PreparedSplit, SplitDescriptor, SplitRuntimeFactoryExt, SplitRuntimeFactoryRef,
 };
-use crate::split_runtime::{PreparedSplit, SplitDescriptor, SplitRuntimeFactoryExt};
 use crate::type_coercion::{
     apply_fast_field_projection, infer_canonical_fast_field_schema, plan_fast_field_projection,
     FastFieldProjectionPlan,
@@ -70,13 +70,13 @@ impl Drop for AbortOnDrop {
 }
 
 // ---------------------------------------------------------------------------
-// Per-partition statistics for partition pruning
+// Optional per-partition statistics for partition pruning
 // ---------------------------------------------------------------------------
 
-/// Per-segment (partition) statistics derived from tantivy fast field metadata.
+/// Per-partition statistics derived from planner-provided field metadata.
 ///
 /// Used by `partition_statistics()` to report column min/max values so that
-/// DataFusion's partition pruning can skip segments whose value ranges do not
+/// DataFusion's partition pruning can skip partitions whose value ranges do not
 /// overlap the query's WHERE clause.
 #[derive(Debug, Clone)]
 struct PartitionStat {
@@ -88,104 +88,18 @@ struct PartitionStat {
     column_stats: Vec<(String, Option<ScalarValue>, Option<ScalarValue>)>,
 }
 
-/// Eagerly compute per-segment partition statistics from a local tantivy index.
-///
-/// Reads fast field min/max from each segment's columnar data. This is cheap:
-/// it only reads column metadata, not document values.
-fn compute_partition_stats(
-    opener: &DirectIndexOpener,
-    ff_schema: &SchemaRef,
-) -> Result<Vec<Option<PartitionStat>>> {
-    let reader = opener.reader()?;
-    let searcher = reader.searcher();
-
-    let mut stats = Vec::with_capacity(searcher.segment_readers().len());
-    for seg_reader in searcher.segment_readers() {
-        let num_rows = seg_reader.max_doc() as usize;
-        // Subtract deleted docs for an accurate alive count.
-        let alive = seg_reader
-            .alive_bitset()
-            .map_or(num_rows, |b| b.num_alive_docs());
-
-        let fast_fields = seg_reader.fast_fields();
-        let mut column_stats = Vec::new();
-
-        for field in ff_schema.fields() {
-            let name = field.name();
-            if name == "_doc_id" || name == "_segment_ord" {
-                continue;
-            }
-
-            let (min_val, max_val) = match field.data_type() {
-                DataType::UInt64 => match fast_fields.u64(name) {
-                    Ok(col) if col.values.num_vals() > 0 => (
-                        Some(ScalarValue::UInt64(Some(col.min_value()))),
-                        Some(ScalarValue::UInt64(Some(col.max_value()))),
-                    ),
-                    _ => (None, None),
-                },
-                DataType::Int64 => match fast_fields.i64(name) {
-                    Ok(col) if col.values.num_vals() > 0 => (
-                        Some(ScalarValue::Int64(Some(col.min_value()))),
-                        Some(ScalarValue::Int64(Some(col.max_value()))),
-                    ),
-                    _ => (None, None),
-                },
-                DataType::Float64 => match fast_fields.f64(name) {
-                    Ok(col) if col.values.num_vals() > 0 => (
-                        Some(ScalarValue::Float64(Some(col.min_value()))),
-                        Some(ScalarValue::Float64(Some(col.max_value()))),
-                    ),
-                    _ => (None, None),
-                },
-                DataType::Timestamp(TimeUnit::Microsecond, _) => match fast_fields.date(name) {
-                    Ok(col) if col.values.num_vals() > 0 => (
-                        Some(ScalarValue::TimestampMicrosecond(
-                            Some(col.min_value().into_timestamp_micros()),
-                            None,
-                        )),
-                        Some(ScalarValue::TimestampMicrosecond(
-                            Some(col.max_value().into_timestamp_micros()),
-                            None,
-                        )),
-                    ),
-                    _ => (None, None),
-                },
-                DataType::Boolean => match fast_fields.bool(name) {
-                    Ok(col) if col.values.num_vals() > 0 => (
-                        Some(ScalarValue::Boolean(Some(col.min_value()))),
-                        Some(ScalarValue::Boolean(Some(col.max_value()))),
-                    ),
-                    _ => (None, None),
-                },
-                _ => (None, None),
-            };
-
-            column_stats.push((name.to_string(), min_val, max_val));
-        }
-
-        let has_deletes = seg_reader.alive_bitset().is_some();
-        stats.push(Some(PartitionStat {
-            num_rows: alive,
-            has_deletes,
-            column_stats,
-        }));
-    }
-    Ok(stats)
-}
-
 #[derive(Debug, Clone)]
 struct PlannedSplit {
     descriptor: SplitDescriptor,
-    opener: Option<Arc<dyn IndexOpener>>,
     fast_field_schema: SchemaRef,
     partition_stat: Option<PartitionStat>,
+    needs_warmup: bool,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct SplitExecutionPlan {
     pub(crate) descriptor: SplitDescriptor,
-    pub(crate) opener: Option<Arc<dyn IndexOpener>>,
+    pub(crate) needs_warmup: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,16 +115,7 @@ enum FilterPushdownSupport {
 }
 
 fn fast_field_schema_for_opener(opener: &Arc<dyn IndexOpener>) -> SchemaRef {
-    opener
-        .as_any()
-        .downcast_ref::<DirectIndexOpener>()
-        .map(|direct| tantivy_schema_to_arrow_from_index(direct.index()))
-        .unwrap_or_else(|| {
-            tantivy_schema_to_arrow_with_multi_valued(
-                &opener.schema(),
-                &opener.multi_valued_fields(),
-            )
-        })
+    tantivy_schema_to_arrow_with_multi_valued(&opener.schema(), &opener.multi_valued_fields())
 }
 
 fn split_descriptor_from_opener(
@@ -225,71 +130,17 @@ fn split_descriptor_from_opener(
     )
 }
 
-fn aggregate_partition_stats(stats: &[Option<PartitionStat>]) -> Option<PartitionStat> {
-    let known: Vec<&PartitionStat> = stats.iter().filter_map(|stat| stat.as_ref()).collect();
-    if known.is_empty() {
-        return None;
-    }
-
-    let num_rows = known.iter().map(|stat| stat.num_rows).sum();
-    let has_deletes = known.iter().any(|stat| stat.has_deletes);
-    let mut column_stats: Vec<(String, Option<ScalarValue>, Option<ScalarValue>)> = Vec::new();
-
-    if let Some(first) = known.first() {
-        for (name, _, _) in &first.column_stats {
-            let mut min_value: Option<ScalarValue> = None;
-            let mut max_value: Option<ScalarValue> = None;
-
-            for stat in &known {
-                if let Some((_, min_candidate, max_candidate)) = stat
-                    .column_stats
-                    .iter()
-                    .find(|(candidate, _, _)| candidate == name)
-                {
-                    if let Some(candidate) = min_candidate {
-                        min_value = match min_value {
-                            Some(current) if current <= *candidate => Some(current),
-                            _ => Some(candidate.clone()),
-                        };
-                    }
-                    if let Some(candidate) = max_candidate {
-                        max_value = match max_value {
-                            Some(current) if current >= *candidate => Some(current),
-                            _ => Some(candidate.clone()),
-                        };
-                    }
-                }
-            }
-
-            column_stats.push((name.clone(), min_value, max_value));
-        }
-    }
-
-    Some(PartitionStat {
-        num_rows,
-        has_deletes,
-        column_stats,
-    })
-}
-
 fn build_planned_split(
     opener: Arc<dyn IndexOpener>,
     fallback_id: impl Into<String>,
-) -> Result<PlannedSplit> {
+) -> PlannedSplit {
     let fast_field_schema = fast_field_schema_for_opener(&opener);
-    let partition_stats = if let Some(direct) = opener.as_any().downcast_ref::<DirectIndexOpener>()
-    {
-        compute_partition_stats(direct, &fast_field_schema)?
-    } else {
-        Vec::new()
-    };
-
-    Ok(PlannedSplit {
+    PlannedSplit {
         descriptor: split_descriptor_from_opener(&opener, fallback_id),
-        opener: Some(opener),
         fast_field_schema,
-        partition_stat: aggregate_partition_stats(&partition_stats),
-    })
+        partition_stat: None,
+        needs_warmup: opener.needs_warmup(),
+    }
 }
 
 fn build_unified_schema(fast_field_schema: &SchemaRef) -> (SchemaRef, usize, usize) {
@@ -440,7 +291,7 @@ fn translate_partition_stat(
 /// Unlike [`UnifiedTantivyTableProvider`](crate::unified_provider::UnifiedTantivyTableProvider),
 /// which composes three separate data sources joined by `HashJoinExec`, this
 /// provider handles FTS queries, fast field reading, scoring, and document
-/// retrieval in a single pass per segment.
+/// retrieval in a single pass per split partition.
 ///
 /// The schema is identical: `[_doc_id, _segment_ord, fast_field_1, ..., fast_field_n, _score, _document]`
 ///
@@ -462,43 +313,48 @@ pub struct SingleTableProvider {
     fast_field_schema: SchemaRef,
     score_column_idx: usize,
     document_column_idx: usize,
+    local_runtime_factory: Option<SplitRuntimeFactoryRef>,
 }
 
 impl SingleTableProvider {
     /// Create a provider from an already-opened tantivy index.
     #[must_use]
     pub fn new(index: Index) -> Self {
-        let ff_schema = tantivy_schema_to_arrow_from_index(&index);
-        Self::from_splits_with_fast_field_schema(
-            vec![Arc::new(DirectIndexOpener::new(index))],
-            ff_schema,
-        )
-        .expect("self-derived canonical schema should always be executable")
-    }
-
-    /// Create a provider from an [`IndexOpener`] for deferred index opening.
-    ///
-    /// When the opener is a local [`DirectIndexOpener`], this still inspects
-    /// segment cardinality so multi-valued fast fields become `List<T>`.
-    /// Generic remote openers fall back to schema-only mapping; workers rely
-    /// on serialized `multi_valued_fields` metadata to recover `List<T>`.
-    #[must_use]
-    pub fn from_opener(opener: Arc<dyn IndexOpener>) -> Self {
-        let ff_schema = fast_field_schema_for_opener(&opener);
-        Self::from_splits_with_fast_field_schema(vec![opener], ff_schema)
+        Self::from_local_splits(vec![index])
             .expect("self-derived canonical schema should always be executable")
     }
 
-    /// Create a provider spanning multiple split openers.
+    /// Create a provider spanning multiple already-opened local indexes.
     ///
     /// The canonical fast field schema is inferred by strict union on field
     /// names, with one promotion rule: if any split exposes a field as
     /// `List<T>` and another exposes the same field as scalar `T`, the
     /// canonical schema uses `List<T>`.
-    pub fn from_splits(split_openers: Vec<Arc<dyn IndexOpener>>) -> Result<Self> {
+    pub fn from_local_splits(local_indexes: Vec<Index>) -> Result<Self> {
+        let split_openers: Vec<Arc<dyn IndexOpener>> = local_indexes
+            .into_iter()
+            .map(|index| Arc::new(DirectIndexOpener::new(index)) as Arc<dyn IndexOpener>)
+            .collect();
+        Self::from_local_split_openers(split_openers)
+    }
+
+    /// Create a provider spanning multiple already-opened local indexes with
+    /// an explicit canonical fast field schema.
+    pub fn from_local_splits_with_fast_field_schema(
+        local_indexes: Vec<Index>,
+        fast_field_schema: SchemaRef,
+    ) -> Result<Self> {
+        let split_openers: Vec<Arc<dyn IndexOpener>> = local_indexes
+            .into_iter()
+            .map(|index| Arc::new(DirectIndexOpener::new(index)) as Arc<dyn IndexOpener>)
+            .collect();
+        Self::from_local_split_openers_with_fast_field_schema(split_openers, fast_field_schema)
+    }
+
+    fn from_local_split_openers(split_openers: Vec<Arc<dyn IndexOpener>>) -> Result<Self> {
         if split_openers.is_empty() {
             return Err(DataFusionError::Plan(
-                "SingleTableProvider requires at least one split opener".into(),
+                "SingleTableProvider requires at least one local split".into(),
             ));
         }
 
@@ -507,34 +363,61 @@ impl SingleTableProvider {
             .map(fast_field_schema_for_opener)
             .collect();
         let canonical_ff_schema = infer_canonical_fast_field_schema(&split_schemas)?;
-        Self::from_splits_with_fast_field_schema(split_openers, canonical_ff_schema)
+        Self::from_local_split_openers_with_fast_field_schema(split_openers, canonical_ff_schema)
     }
 
-    /// Create a provider spanning multiple split openers with an explicit
-    /// canonical fast field schema.
-    pub fn from_splits_with_fast_field_schema(
+    fn from_local_split_openers_with_fast_field_schema(
         split_openers: Vec<Arc<dyn IndexOpener>>,
         fast_field_schema: SchemaRef,
     ) -> Result<Self> {
         if split_openers.is_empty() {
             return Err(DataFusionError::Plan(
-                "SingleTableProvider requires at least one split opener".into(),
+                "SingleTableProvider requires at least one local split".into(),
             ));
         }
 
         let fast_field_schema = normalize_canonical_fast_field_schema(&fast_field_schema);
+        let opener_map: std::collections::HashMap<String, Arc<dyn IndexOpener>> = split_openers
+            .iter()
+            .enumerate()
+            .map(|(idx, opener)| (format!("local-split-{idx}"), Arc::clone(opener)))
+            .collect();
 
         let splits: Vec<PlannedSplit> = split_openers
             .into_iter()
             .enumerate()
             .map(|(idx, opener)| build_planned_split(opener, format!("local-split-{idx}")))
-            .collect::<Result<_>>()?;
+            .collect();
 
         for split in &splits {
             plan_fast_field_projection(&split.fast_field_schema, &fast_field_schema)?;
         }
 
-        Ok(Self::from_planned_splits(splits, fast_field_schema))
+        Ok(Self::from_planned_splits(
+            splits,
+            fast_field_schema,
+            Some(Arc::new(OpenerSplitRuntimeFactory::new(opener_map))),
+        ))
+    }
+
+    pub fn from_split_descriptors(split_descriptors: Vec<SplitDescriptor>) -> Result<Self> {
+        if split_descriptors.is_empty() {
+            return Err(DataFusionError::Plan(
+                "SingleTableProvider requires at least one split descriptor".into(),
+            ));
+        }
+
+        let split_schemas: Vec<SchemaRef> = split_descriptors
+            .iter()
+            .map(|descriptor| {
+                tantivy_schema_to_arrow_with_multi_valued(
+                    &descriptor.tantivy_schema,
+                    &descriptor.multi_valued_fields,
+                )
+            })
+            .collect();
+        let canonical_ff_schema = infer_canonical_fast_field_schema(&split_schemas)?;
+        Self::from_split_descriptors_with_fast_field_schema(split_descriptors, canonical_ff_schema)
     }
 
     pub fn from_split_descriptors_with_fast_field_schema(
@@ -556,15 +439,19 @@ impl SingleTableProvider {
                     &descriptor.multi_valued_fields,
                 ),
                 descriptor,
-                opener: None,
                 partition_stat: None,
+                needs_warmup: true,
             })
             .collect();
 
-        Ok(Self::from_planned_splits(splits, fast_field_schema))
+        Ok(Self::from_planned_splits(splits, fast_field_schema, None))
     }
 
-    fn from_planned_splits(splits: Vec<PlannedSplit>, fast_field_schema: SchemaRef) -> Self {
+    fn from_planned_splits(
+        splits: Vec<PlannedSplit>,
+        fast_field_schema: SchemaRef,
+        local_runtime_factory: Option<SplitRuntimeFactoryRef>,
+    ) -> Self {
         let (unified_schema, score_column_idx, document_column_idx) =
             build_unified_schema(&fast_field_schema);
 
@@ -574,6 +461,7 @@ impl SingleTableProvider {
             fast_field_schema,
             score_column_idx,
             document_column_idx,
+            local_runtime_factory,
         }
     }
 }
@@ -726,7 +614,7 @@ impl TableProvider for SingleTableProvider {
             .map(|split| {
                 Ok(SplitExecutionPlan {
                     descriptor: split.descriptor.clone(),
-                    opener: split.opener.as_ref().map(Arc::clone),
+                    needs_warmup: split.needs_warmup,
                 })
             })
             .collect::<Result<_>>()?;
@@ -764,6 +652,7 @@ impl TableProvider for SingleTableProvider {
             row_limit: limit,
             partition_map,
             partition_stats,
+            local_runtime_factory: self.local_runtime_factory.clone(),
             warmup_done: self
                 .splits
                 .iter()
@@ -793,7 +682,6 @@ pub(crate) struct ScanSchema {
     pub(crate) needs_document: bool,
 }
 
-#[derive(Debug)]
 pub struct SingleTableDataSource {
     splits: Vec<SplitExecutionPlan>,
     schema: ScanSchema,
@@ -811,10 +699,23 @@ pub struct SingleTableDataSource {
     /// Indexed by partition number. `None` means stats are unavailable for
     /// that partition (e.g. remote opener without metadata).
     partition_stats: Vec<Option<PartitionStat>>,
+    local_runtime_factory: Option<SplitRuntimeFactoryRef>,
     /// Ensures warmup runs at most once per split.
     warmup_done: Vec<Arc<tokio::sync::OnceCell<()>>>,
     /// Shared metrics set for all partitions.
     metrics: ExecutionPlanMetricsSet,
+}
+
+impl fmt::Debug for SingleTableDataSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SingleTableDataSource")
+            .field("splits", &self.splits.len())
+            .field("schema", &self.schema.projected)
+            .field("topk", &self.topk)
+            .field("row_limit", &self.row_limit)
+            .field("partitions", &self.partition_map.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SingleTableDataSource {
@@ -851,6 +752,7 @@ impl SingleTableDataSource {
             row_limit,
             partition_stats: vec![None; partition_map.len()],
             partition_map,
+            local_runtime_factory: None,
             warmup_done,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -867,6 +769,7 @@ impl SingleTableDataSource {
             row_limit: self.row_limit,
             partition_map: self.partition_map.clone(),
             partition_stats: self.partition_stats.clone(),
+            local_runtime_factory: self.local_runtime_factory.clone(),
             warmup_done: self.warmup_done.clone(),
             metrics: self.metrics.clone(),
         };
@@ -882,20 +785,8 @@ impl SingleTableDataSource {
             .collect()
     }
 
-    /// Access any local split openers embedded in this datasource.
-    pub fn local_split_openers(&self) -> Vec<Arc<dyn IndexOpener>> {
-        self.splits
-            .iter()
-            .filter_map(|split| split.opener.as_ref().map(Arc::clone))
-            .collect()
-    }
-
-    /// Access the sole local opener when the data source spans a single local split.
-    pub fn single_local_split_opener(&self) -> Option<&Arc<dyn IndexOpener>> {
-        match self.splits.as_slice() {
-            [split] => split.opener.as_ref(),
-            _ => None,
-        }
+    pub fn local_runtime_factory(&self) -> Option<SplitRuntimeFactoryRef> {
+        self.local_runtime_factory.clone()
     }
 
     /// Access the raw full-text queries.
@@ -1066,15 +957,13 @@ impl SingleTableDataSource {
 
 async fn prepare_split(
     split: &SplitExecutionPlan,
+    local_runtime_factory: Option<&SplitRuntimeFactoryRef>,
     context: &datafusion::execution::TaskContext,
 ) -> Result<Arc<PreparedSplit>> {
-    if let Some(opener) = &split.opener {
-        return opener.prepare().await;
-    }
-
     let factory = context
         .session_config()
         .get_split_runtime_factory()
+        .or_else(|| local_runtime_factory.cloned())
         .ok_or_else(|| {
             DataFusionError::Internal(
                 "no SplitRuntimeFactory registered on session config; \
@@ -1086,10 +975,7 @@ async fn prepare_split(
 }
 
 fn split_needs_warmup(split: &SplitExecutionPlan) -> bool {
-    split
-        .opener
-        .as_ref()
-        .is_none_or(|opener| opener.needs_warmup())
+    split.needs_warmup
 }
 
 impl DataSource for SingleTableDataSource {
@@ -1125,6 +1011,7 @@ impl DataSource for SingleTableDataSource {
         } else {
             None
         };
+        let local_runtime_factory = self.local_runtime_factory.clone();
         let fast_field_filter_exprs = self.fast_field_filter_exprs.clone();
         let warmup_done = Arc::clone(
             self.warmup_done
@@ -1140,25 +1027,20 @@ impl DataSource for SingleTableDataSource {
 
         let cancelled_task = Arc::clone(&cancelled);
         let handle = tokio::spawn(async move {
-            let prepared = match prepare_split(&split, context.as_ref()).await {
-                Ok(prepared) => prepared,
-                Err(err) => {
-                    let _ = tx.send(Err(err)).await;
-                    return;
-                }
-            };
+            let prepared =
+                match prepare_split(&split, local_runtime_factory.as_ref(), context.as_ref()).await
+                {
+                    Ok(prepared) => prepared,
+                    Err(err) => {
+                        let _ = tx.send(Err(err)).await;
+                        return;
+                    }
+                };
 
-            let source_ff_schema = if split.opener.is_some() {
-                tantivy_schema_to_arrow_from_searcher(
-                    &prepared.index().schema(),
-                    prepared.searcher(),
-                )
-            } else {
-                tantivy_schema_to_arrow_with_multi_valued(
-                    &split.descriptor.tantivy_schema,
-                    &split.descriptor.multi_valued_fields,
-                )
-            };
+            let source_ff_schema = tantivy_schema_to_arrow_with_multi_valued(
+                &split.descriptor.tantivy_schema,
+                &split.descriptor.multi_valued_fields,
+            );
             let fast_field_projection =
                 match plan_fast_field_projection(&source_ff_schema, &ff_projected_schema) {
                     Ok(plan) => plan,
@@ -1640,8 +1522,14 @@ impl<'a> ChunkBuilder<'a> {
         }
 
         let intermediate_schema = Arc::new(Schema::new(output_fields));
-        RecordBatch::try_new(intermediate_schema, output_columns)
-            .map_err(|e| DataFusionError::Internal(format!("build output batch: {e}")))
+        if output_columns.is_empty() {
+            let options = RecordBatchOptions::new().with_row_count(Some(chunk_rows));
+            RecordBatch::try_new_with_options(intermediate_schema, output_columns, &options)
+                .map_err(|e| DataFusionError::Internal(format!("build output batch: {e}")))
+        } else {
+            RecordBatch::try_new(intermediate_schema, output_columns)
+                .map_err(|e| DataFusionError::Internal(format!("build output batch: {e}")))
+        }
     }
 }
 

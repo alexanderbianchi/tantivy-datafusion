@@ -27,8 +27,10 @@ use tantivy::aggregation::agg_req::Aggregations;
 use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
 use tokio::sync::OnceCell;
 
-use crate::index_opener::IndexOpener;
-use crate::split_runtime::{PreparedSplit, SplitDescriptor, SplitRuntimeFactoryExt};
+use crate::index_opener::{IndexOpener, OpenerSplitRuntimeFactory};
+use crate::split_runtime::{
+    PreparedSplit, SplitDescriptor, SplitRuntimeFactoryExt, SplitRuntimeFactoryRef,
+};
 use crate::unified::single_table_provider::build_split_fast_field_query;
 use crate::util::build_combined_query;
 
@@ -57,10 +59,9 @@ impl Drop for AbortOnDrop {
 #[derive(Debug, Clone)]
 struct AggSplitPlan {
     descriptor: SplitDescriptor,
-    opener: Option<Arc<dyn IndexOpener>>,
+    needs_warmup: bool,
 }
 
-#[derive(Debug)]
 pub struct AggDataSource {
     splits: Vec<AggSplitPlan>,
     /// Tantivy aggregation specification (terms + metric sub-aggs).
@@ -77,10 +78,21 @@ pub struct AggDataSource {
     /// Whether this source emits final aggregate rows or partial aggregate
     /// state rows for a downstream `AggregateExec(Final*)`.
     output_mode: AggOutputMode,
+    local_runtime_factory: Option<SplitRuntimeFactoryRef>,
     /// Ensures warmup runs at most once per split.
     warmup_done: Vec<Arc<OnceCell<()>>>,
     /// Shared metrics set for all partitions.
     metrics: ExecutionPlanMetricsSet,
+}
+
+impl fmt::Debug for AggDataSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AggDataSource")
+            .field("splits", &self.splits.len())
+            .field("output_mode", &self.output_mode)
+            .field("schema", &self.output_schema)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +110,15 @@ struct AggExecutionContext {
     cancelled: Arc<AtomicBool>,
 }
 
+struct AggSourceConfig {
+    aggregations: Arc<Aggregations>,
+    output_schema: SchemaRef,
+    raw_queries: Vec<(String, String)>,
+    pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
+    fast_field_filter_exprs: Vec<Expr>,
+    output_mode: AggOutputMode,
+}
+
 fn local_split_descriptor(
     opener: &Arc<dyn IndexOpener>,
     split_id: impl Into<String>,
@@ -110,28 +131,26 @@ fn local_split_descriptor(
     )
 }
 
-fn build_local_split_plans(split_openers: Vec<Arc<dyn IndexOpener>>) -> Vec<AggSplitPlan> {
+fn build_local_split_plans(split_openers: &[Arc<dyn IndexOpener>]) -> Vec<AggSplitPlan> {
     split_openers
-        .into_iter()
+        .iter()
         .enumerate()
         .map(|(idx, opener)| AggSplitPlan {
-            descriptor: local_split_descriptor(&opener, format!("local-split-{idx}")),
-            opener: Some(opener),
+            descriptor: local_split_descriptor(opener, format!("local-split-{idx}")),
+            needs_warmup: opener.needs_warmup(),
         })
         .collect()
 }
 
 async fn prepare_split(
     split: &AggSplitPlan,
+    local_runtime_factory: Option<&SplitRuntimeFactoryRef>,
     context: &datafusion::execution::TaskContext,
 ) -> Result<Arc<PreparedSplit>> {
-    if let Some(opener) = &split.opener {
-        return opener.prepare().await;
-    }
-
     let factory = context
         .session_config()
         .get_split_runtime_factory()
+        .or_else(|| local_runtime_factory.cloned())
         .ok_or_else(|| {
             DataFusionError::Internal(
                 "no SplitRuntimeFactory registered on session config; \
@@ -143,23 +162,20 @@ async fn prepare_split(
 }
 
 fn split_needs_warmup(split: &AggSplitPlan) -> bool {
-    split
-        .opener
-        .as_ref()
-        .is_none_or(|opener| opener.needs_warmup())
+    split.needs_warmup
 }
 
 impl AggDataSource {
     pub fn new(
-        opener: Arc<dyn IndexOpener>,
+        index: tantivy::Index,
         aggregations: Arc<Aggregations>,
         output_schema: SchemaRef,
         raw_queries: Vec<(String, String)>,
         pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
         fast_field_filter_exprs: Vec<Expr>,
     ) -> Self {
-        Self::from_split_openers(
-            vec![opener],
+        Self::from_local_splits(
+            vec![index],
             aggregations,
             output_schema,
             raw_queries,
@@ -168,7 +184,55 @@ impl AggDataSource {
         )
     }
 
-    pub fn from_split_openers(
+    pub fn from_local_splits(
+        local_indexes: Vec<tantivy::Index>,
+        aggregations: Arc<Aggregations>,
+        output_schema: SchemaRef,
+        raw_queries: Vec<(String, String)>,
+        pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
+        fast_field_filter_exprs: Vec<Expr>,
+    ) -> Self {
+        let split_openers: Vec<Arc<dyn IndexOpener>> = local_indexes
+            .into_iter()
+            .map(|index| {
+                Arc::new(crate::index_opener::DirectIndexOpener::new(index)) as Arc<dyn IndexOpener>
+            })
+            .collect();
+        Self::from_local_split_openers(
+            split_openers,
+            aggregations,
+            output_schema,
+            raw_queries,
+            pre_built_query,
+            fast_field_filter_exprs,
+        )
+    }
+
+    pub fn from_local_splits_partial_states(
+        local_indexes: Vec<tantivy::Index>,
+        aggregations: Arc<Aggregations>,
+        output_schema: SchemaRef,
+        raw_queries: Vec<(String, String)>,
+        pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
+        fast_field_filter_exprs: Vec<Expr>,
+    ) -> Self {
+        let split_openers: Vec<Arc<dyn IndexOpener>> = local_indexes
+            .into_iter()
+            .map(|index| {
+                Arc::new(crate::index_opener::DirectIndexOpener::new(index)) as Arc<dyn IndexOpener>
+            })
+            .collect();
+        Self::from_local_split_openers_partial_states(
+            split_openers,
+            aggregations,
+            output_schema,
+            raw_queries,
+            pre_built_query,
+            fast_field_filter_exprs,
+        )
+    }
+
+    fn from_local_split_openers(
         split_openers: Vec<Arc<dyn IndexOpener>>,
         aggregations: Arc<Aggregations>,
         output_schema: SchemaRef,
@@ -176,14 +240,22 @@ impl AggDataSource {
         pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
         fast_field_filter_exprs: Vec<Expr>,
     ) -> Self {
-        Self::from_split_plans(
-            build_local_split_plans(split_openers),
+        let opener_map: std::collections::HashMap<String, Arc<dyn IndexOpener>> = split_openers
+            .iter()
+            .enumerate()
+            .map(|(idx, opener)| (format!("local-split-{idx}"), Arc::clone(opener)))
+            .collect();
+        Self::from_split_descriptors_with_runtime_factory(
+            build_local_split_plans(&split_openers)
+                .into_iter()
+                .map(|split| split.descriptor)
+                .collect(),
             aggregations,
             output_schema,
             raw_queries,
             pre_built_query,
             fast_field_filter_exprs,
-            AggOutputMode::FinalMerged,
+            Some(Arc::new(OpenerSplitRuntimeFactory::new(opener_map))),
         )
     }
 
@@ -195,25 +267,48 @@ impl AggDataSource {
         pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
         fast_field_filter_exprs: Vec<Expr>,
     ) -> Self {
-        let splits = split_descriptors
-            .into_iter()
-            .map(|descriptor| AggSplitPlan {
-                descriptor,
-                opener: None,
-            })
-            .collect();
-        Self::from_split_plans(
-            splits,
+        Self::from_split_descriptors_with_runtime_factory(
+            split_descriptors,
             aggregations,
             output_schema,
             raw_queries,
             pre_built_query,
             fast_field_filter_exprs,
-            AggOutputMode::FinalMerged,
+            None,
         )
     }
 
-    pub fn from_split_openers_partial_states(
+    pub(crate) fn from_split_descriptors_with_runtime_factory(
+        split_descriptors: Vec<SplitDescriptor>,
+        aggregations: Arc<Aggregations>,
+        output_schema: SchemaRef,
+        raw_queries: Vec<(String, String)>,
+        pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
+        fast_field_filter_exprs: Vec<Expr>,
+        local_runtime_factory: Option<SplitRuntimeFactoryRef>,
+    ) -> Self {
+        let splits = split_descriptors
+            .into_iter()
+            .map(|descriptor| AggSplitPlan {
+                descriptor,
+                needs_warmup: true,
+            })
+            .collect();
+        Self::from_split_plans(
+            splits,
+            AggSourceConfig {
+                aggregations,
+                output_schema,
+                raw_queries,
+                pre_built_query,
+                fast_field_filter_exprs,
+                output_mode: AggOutputMode::FinalMerged,
+            },
+            local_runtime_factory,
+        )
+    }
+
+    fn from_local_split_openers_partial_states(
         split_openers: Vec<Arc<dyn IndexOpener>>,
         aggregations: Arc<Aggregations>,
         output_schema: SchemaRef,
@@ -221,14 +316,22 @@ impl AggDataSource {
         pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
         fast_field_filter_exprs: Vec<Expr>,
     ) -> Self {
-        Self::from_split_plans(
-            build_local_split_plans(split_openers),
+        let opener_map: std::collections::HashMap<String, Arc<dyn IndexOpener>> = split_openers
+            .iter()
+            .enumerate()
+            .map(|(idx, opener)| (format!("local-split-{idx}"), Arc::clone(opener)))
+            .collect();
+        Self::from_split_descriptors_partial_states_with_runtime_factory(
+            build_local_split_plans(&split_openers)
+                .into_iter()
+                .map(|split| split.descriptor)
+                .collect(),
             aggregations,
             output_schema,
             raw_queries,
             pre_built_query,
             fast_field_filter_exprs,
-            AggOutputMode::PartialStates,
+            Some(Arc::new(OpenerSplitRuntimeFactory::new(opener_map))),
         )
     }
 
@@ -240,67 +343,64 @@ impl AggDataSource {
         pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
         fast_field_filter_exprs: Vec<Expr>,
     ) -> Self {
-        let splits = split_descriptors
-            .into_iter()
-            .map(|descriptor| AggSplitPlan {
-                descriptor,
-                opener: None,
-            })
-            .collect();
-        Self::from_split_plans(
-            splits,
+        Self::from_split_descriptors_partial_states_with_runtime_factory(
+            split_descriptors,
             aggregations,
             output_schema,
             raw_queries,
             pre_built_query,
             fast_field_filter_exprs,
-            AggOutputMode::PartialStates,
+            None,
         )
     }
 
-    fn from_split_plans(
-        splits: Vec<AggSplitPlan>,
+    pub(crate) fn from_split_descriptors_partial_states_with_runtime_factory(
+        split_descriptors: Vec<SplitDescriptor>,
         aggregations: Arc<Aggregations>,
         output_schema: SchemaRef,
         raw_queries: Vec<(String, String)>,
         pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
         fast_field_filter_exprs: Vec<Expr>,
-        output_mode: AggOutputMode,
+        local_runtime_factory: Option<SplitRuntimeFactoryRef>,
+    ) -> Self {
+        let splits = split_descriptors
+            .into_iter()
+            .map(|descriptor| AggSplitPlan {
+                descriptor,
+                needs_warmup: true,
+            })
+            .collect();
+        Self::from_split_plans(
+            splits,
+            AggSourceConfig {
+                aggregations,
+                output_schema,
+                raw_queries,
+                pre_built_query,
+                fast_field_filter_exprs,
+                output_mode: AggOutputMode::PartialStates,
+            },
+            local_runtime_factory,
+        )
+    }
+
+    fn from_split_plans(
+        splits: Vec<AggSplitPlan>,
+        config: AggSourceConfig,
+        local_runtime_factory: Option<SplitRuntimeFactoryRef>,
     ) -> Self {
         let warmup_done = splits.iter().map(|_| Arc::new(OnceCell::new())).collect();
         Self {
             splits,
-            aggregations,
-            output_schema,
-            raw_queries,
-            pre_built_query,
-            fast_field_filter_exprs,
-            output_mode,
+            aggregations: config.aggregations,
+            output_schema: config.output_schema,
+            raw_queries: config.raw_queries,
+            pre_built_query: config.pre_built_query,
+            fast_field_filter_exprs: config.fast_field_filter_exprs,
+            output_mode: config.output_mode,
+            local_runtime_factory,
             warmup_done,
             metrics: ExecutionPlanMetricsSet::new(),
-        }
-    }
-
-    /// Access the sole index opener when this aggregation is local and single-split.
-    pub fn opener(&self) -> &Arc<dyn IndexOpener> {
-        self.single_split_opener().expect(
-            "AggDataSource spans multiple or remote splits; use split_descriptors() instead",
-        )
-    }
-
-    /// Access all local split openers embedded in this datasource.
-    pub fn split_openers(&self) -> Vec<Arc<dyn IndexOpener>> {
-        self.splits
-            .iter()
-            .filter_map(|split| split.opener.as_ref().map(Arc::clone))
-            .collect()
-    }
-
-    /// Access the sole local opener when this aggregation spans a single local split.
-    pub fn single_split_opener(&self) -> Option<&Arc<dyn IndexOpener>> {
-        match self.splits.as_slice() {
-            [split] => split.opener.as_ref(),
-            _ => None,
         }
     }
 
@@ -309,6 +409,10 @@ impl AggDataSource {
             .iter()
             .map(|split| split.descriptor.clone())
             .collect()
+    }
+
+    pub fn local_runtime_factory(&self) -> Option<SplitRuntimeFactoryRef> {
+        self.local_runtime_factory.clone()
     }
 
     /// Access the tantivy aggregation specification.
@@ -369,6 +473,7 @@ impl DataSource for AggDataSource {
         let splits = self.splits.clone();
         let warmup_done = self.warmup_done.clone();
         let output_mode = self.output_mode;
+        let local_runtime_factory = self.local_runtime_factory.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(1);
 
@@ -389,8 +494,15 @@ impl DataSource for AggDataSource {
         let handle = tokio::spawn(async move {
             let result = match output_mode {
                 AggOutputMode::FinalMerged => {
-                    execute_final_agg_batch(splits, warmup_done, schema.clone(), exec_ctx, context)
-                        .await
+                    execute_final_agg_batch(
+                        splits,
+                        warmup_done,
+                        schema.clone(),
+                        exec_ctx,
+                        local_runtime_factory.clone(),
+                        context,
+                    )
+                    .await
                 }
                 AggOutputMode::PartialStates => {
                     let split = splits.get(partition).cloned().ok_or_else(|| {
@@ -406,6 +518,7 @@ impl DataSource for AggDataSource {
                                 warmup_done,
                                 schema.clone(),
                                 exec_ctx,
+                                local_runtime_factory.clone(),
                                 context,
                             )
                             .await
@@ -527,6 +640,7 @@ async fn execute_final_agg_batch(
     warmup_done: Vec<Arc<OnceCell<()>>>,
     schema: SchemaRef,
     exec_ctx: AggExecutionContext,
+    local_runtime_factory: Option<SplitRuntimeFactoryRef>,
     context: Arc<datafusion::execution::TaskContext>,
 ) -> Result<Option<RecordBatch>> {
     ensure_not_cancelled(exec_ctx.cancelled.as_ref())?;
@@ -539,8 +653,15 @@ async fn execute_final_agg_batch(
         let warmup_done = warmup_done.into_iter().next().ok_or_else(|| {
             DataFusionError::Internal("AggDataSource missing warmup state".into())
         })?;
-        let batch =
-            execute_single_split_agg_batch(split, warmup_done, schema, exec_ctx, context).await?;
+        let batch = execute_single_split_agg_batch(
+            split,
+            warmup_done,
+            schema,
+            exec_ctx,
+            local_runtime_factory,
+            context,
+        )
+        .await?;
         return Ok(Some(batch));
     }
 
@@ -548,8 +669,14 @@ async fn execute_final_agg_batch(
     for (split, warmup_done) in splits.into_iter().zip(warmup_done) {
         ensure_not_cancelled(exec_ctx.cancelled.as_ref())?;
         partials.push(
-            execute_split_intermediate_agg(split, warmup_done, exec_ctx.clone(), context.as_ref())
-                .await?,
+            execute_split_intermediate_agg(
+                split,
+                warmup_done,
+                exec_ctx.clone(),
+                local_runtime_factory.as_ref(),
+                context.as_ref(),
+            )
+            .await?,
         );
     }
 
@@ -570,12 +697,19 @@ async fn execute_partial_state_agg_batch(
     warmup_done: Arc<OnceCell<()>>,
     schema: SchemaRef,
     exec_ctx: AggExecutionContext,
+    local_runtime_factory: Option<SplitRuntimeFactoryRef>,
     context: Arc<datafusion::execution::TaskContext>,
 ) -> Result<Option<RecordBatch>> {
     ensure_not_cancelled(exec_ctx.cancelled.as_ref())?;
-    let batch =
-        execute_single_split_partial_state_batch(split, warmup_done, schema, exec_ctx, context)
-            .await?;
+    let batch = execute_single_split_partial_state_batch(
+        split,
+        warmup_done,
+        schema,
+        exec_ctx,
+        local_runtime_factory,
+        context,
+    )
+    .await?;
     Ok(Some(batch))
 }
 
@@ -636,10 +770,11 @@ async fn execute_split_intermediate_agg(
     split: AggSplitPlan,
     warmup_done: Arc<OnceCell<()>>,
     exec_ctx: AggExecutionContext,
+    local_runtime_factory: Option<&SplitRuntimeFactoryRef>,
     context: &datafusion::execution::TaskContext,
 ) -> Result<IntermediateAggregationResults> {
     ensure_not_cancelled(exec_ctx.cancelled.as_ref())?;
-    let prepared = prepare_split(&split, context).await?;
+    let prepared = prepare_split(&split, local_runtime_factory, context).await?;
     warmup_for_agg(
         &split,
         prepared.as_ref(),
@@ -687,10 +822,11 @@ async fn execute_single_split_agg_batch(
     warmup_done: Arc<OnceCell<()>>,
     schema: SchemaRef,
     exec_ctx: AggExecutionContext,
+    local_runtime_factory: Option<SplitRuntimeFactoryRef>,
     context: Arc<datafusion::execution::TaskContext>,
 ) -> Result<RecordBatch> {
     ensure_not_cancelled(exec_ctx.cancelled.as_ref())?;
-    let prepared = prepare_split(&split, context.as_ref()).await?;
+    let prepared = prepare_split(&split, local_runtime_factory.as_ref(), context.as_ref()).await?;
     warmup_for_agg(
         &split,
         prepared.as_ref(),
@@ -739,10 +875,11 @@ async fn execute_single_split_partial_state_batch(
     warmup_done: Arc<OnceCell<()>>,
     schema: SchemaRef,
     exec_ctx: AggExecutionContext,
+    local_runtime_factory: Option<SplitRuntimeFactoryRef>,
     context: Arc<datafusion::execution::TaskContext>,
 ) -> Result<RecordBatch> {
     ensure_not_cancelled(exec_ctx.cancelled.as_ref())?;
-    let prepared = prepare_split(&split, context.as_ref()).await?;
+    let prepared = prepare_split(&split, local_runtime_factory.as_ref(), context.as_ref()).await?;
     warmup_for_agg(
         &split,
         prepared.as_ref(),
