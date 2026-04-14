@@ -986,6 +986,7 @@ impl DataSource for SingleTableDataSource {
     ) -> Result<SendableRecordBatchStream> {
         let metrics_guard = MetricsGuard(BaselineMetrics::new(&self.metrics, partition));
         let batch_size = context.session_config().batch_size();
+        let sync_pool = crate::sync_exec::get_or_default_pool(context.as_ref());
         let partition_spec = *self.partition_map.get(partition).ok_or_else(|| {
             DataFusionError::Internal(format!("invalid partition index {partition}"))
         })?;
@@ -1111,38 +1112,41 @@ impl DataSource for SingleTableDataSource {
             let output_schema_for_docs = projected_schema.clone();
             let cancelled_blocking = Arc::clone(&cancelled_task);
 
-            let blocking_handle = tokio::task::spawn_blocking(move || {
-                let split_fast_field_query = match pre_built_query {
-                    Some(query) => Some(query),
-                    None => build_split_fast_field_query(
-                        &fast_field_filter_exprs,
-                        &prepared.index().schema(),
-                    ),
-                };
-                let query = build_combined_query(
-                    prepared.index(),
-                    split_fast_field_query.as_ref(),
-                    &raw_queries,
-                )?;
-                let cfg = ScanConfig {
-                    prepared,
-                    batch_size,
-                    source_ff_schema,
-                    fast_field_projection,
-                    unified_schema,
-                    projection,
-                    score_column_idx,
-                    document_column_idx,
-                    needs_score,
-                    needs_document,
-                    topk,
-                    row_limit,
-                    query,
-                    cancelled: cancelled_blocking,
-                };
-                generate_single_table_batch_streaming(&cfg, |batch| {
-                    raw_tx.blocking_send(Ok(batch)).is_ok()
-                })
+            let blocking_handle = tokio::spawn(async move {
+                sync_pool.run_boxed(Box::new(move || {
+                    let split_fast_field_query = match pre_built_query {
+                        Some(query) => Some(query),
+                        None => build_split_fast_field_query(
+                            &fast_field_filter_exprs,
+                            &prepared.index().schema(),
+                        ),
+                    };
+                    let query = build_combined_query(
+                        prepared.index(),
+                        split_fast_field_query.as_ref(),
+                        &raw_queries,
+                    )?;
+                    let cfg = ScanConfig {
+                        prepared,
+                        batch_size,
+                        source_ff_schema,
+                        fast_field_projection,
+                        unified_schema,
+                        projection,
+                        score_column_idx,
+                        document_column_idx,
+                        needs_score,
+                        needs_document,
+                        topk,
+                        row_limit,
+                        query,
+                        cancelled: cancelled_blocking,
+                    };
+                    generate_single_table_batch_streaming(&cfg, |batch| {
+                        raw_tx.blocking_send(Ok(batch)).is_ok()
+                    })?;
+                    Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
+                })).await
             });
 
             // Forward batches, adding _document column async when needed.
@@ -1165,19 +1169,19 @@ impl DataSource for SingleTableDataSource {
                 }
             }
 
-            // Propagate errors from the blocking task.
+            // Propagate errors from the pool task.
             match blocking_handle.await {
+                Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
                     let _ = tx.send(Err(e)).await;
                 }
                 Err(e) => {
                     let _ = tx
                         .send(Err(DataFusionError::Internal(format!(
-                            "spawn_blocking: {e}"
+                            "sync pool task join: {e}"
                         ))))
                         .await;
                 }
-                Ok(Ok(())) => {}
             }
         });
         let guard = AbortOnDrop { handle, cancelled };
@@ -1439,7 +1443,7 @@ impl<'a> ChunkBuilder<'a> {
     ///
     /// Produces fast fields and scores only — `_document` is excluded here and
     /// added asynchronously by `fill_document_column_async` after this batch
-    /// exits `spawn_blocking`. The returned schema is `intermediate_schema`
+    /// exits `the sync execution pool`. The returned schema is `intermediate_schema`
     /// (projected schema minus `_document`).
     fn build(&self, chunk_ids: &[u32], chunk_scores: Option<&[f32]>) -> Result<RecordBatch> {
         let source_ff_batch = read_segment_fast_fields_to_batch(
@@ -1502,7 +1506,7 @@ impl<'a> ChunkBuilder<'a> {
 
         for &unified_idx in &self.projected_indices {
             if unified_idx == self.document_column_idx {
-                // Skip _document — it's added async after spawn_blocking.
+                // Skip _document — it's added async after the sync execution pool.
                 continue;
             } else if unified_idx == self.score_column_idx {
                 output_columns.push(score_array.clone().unwrap_or_else(|| {
@@ -1539,7 +1543,7 @@ impl<'a> ChunkBuilder<'a> {
 /// stops early.
 ///
 /// Configuration for a single-segment batch generation pass.
-/// Constructed in `open()` and moved into `spawn_blocking`.
+/// Constructed in `open()` and moved into `the sync execution pool`.
 struct ScanConfig {
     prepared: Arc<PreparedSplit>,
     batch_size: usize,

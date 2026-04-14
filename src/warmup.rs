@@ -17,7 +17,7 @@ use tantivy::{Index, IndexReader, ReloadPolicy, Searcher};
 
 async fn open_reader_for_warmup(index: &Index) -> Result<IndexReader> {
     let index = index.clone();
-    tokio::task::spawn_blocking(move || {
+    crate::sync_exec::run_sync(&crate::sync_exec::SpawnBlockingPool, move || {
         index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -25,7 +25,6 @@ async fn open_reader_for_warmup(index: &Index) -> Result<IndexReader> {
             .map_err(|e| DataFusionError::Internal(format!("open reader for warmup: {e}")))
     })
     .await
-    .map_err(|e| DataFusionError::Internal(format!("warmup reader spawn: {e}")))?
 }
 
 /// Collect fast-field names referenced by pushed-down filter expressions.

@@ -453,6 +453,7 @@ impl DataSource for AggDataSource {
         context: Arc<datafusion::execution::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let metrics_guard = MetricsGuard(BaselineMetrics::new(&self.metrics, partition));
+        let sync_pool = crate::sync_exec::get_or_default_pool(context.as_ref());
         let schema = self.output_schema.clone();
         match self.output_mode {
             AggOutputMode::FinalMerged if partition != 0 => {
@@ -501,6 +502,7 @@ impl DataSource for AggDataSource {
                         exec_ctx,
                         local_runtime_factory.clone(),
                         context,
+                        sync_pool,
                     )
                     .await
                 }
@@ -520,6 +522,7 @@ impl DataSource for AggDataSource {
                                 exec_ctx,
                                 local_runtime_factory.clone(),
                                 context,
+                                sync_pool,
                             )
                             .await
                         }
@@ -642,6 +645,7 @@ async fn execute_final_agg_batch(
     exec_ctx: AggExecutionContext,
     local_runtime_factory: Option<SplitRuntimeFactoryRef>,
     context: Arc<datafusion::execution::TaskContext>,
+    sync_pool: crate::sync_exec::SyncExecutionPoolRef,
 ) -> Result<Option<RecordBatch>> {
     ensure_not_cancelled(exec_ctx.cancelled.as_ref())?;
 
@@ -660,6 +664,7 @@ async fn execute_final_agg_batch(
             exec_ctx,
             local_runtime_factory,
             context,
+            Arc::clone(&sync_pool),
         )
         .await?;
         return Ok(Some(batch));
@@ -675,6 +680,7 @@ async fn execute_final_agg_batch(
                 exec_ctx.clone(),
                 local_runtime_factory.as_ref(),
                 context.as_ref(),
+                &*sync_pool,
             )
             .await?,
         );
@@ -682,12 +688,11 @@ async fn execute_final_agg_batch(
 
     ensure_not_cancelled(exec_ctx.cancelled.as_ref())?;
     let aggs = Arc::clone(&exec_ctx.aggs);
-    let batch = tokio::task::spawn_blocking(move || {
+    let batch = crate::sync_exec::run_sync(&*sync_pool, move || {
         let results = crate::unified::agg_exec::merge_intermediate_agg_results(partials, &aggs)?;
         crate::unified::agg_exec::agg_results_to_output_batch(&results, &aggs, &schema)
     })
-    .await
-    .map_err(|e| DataFusionError::Internal(format!("spawn_blocking join error: {e}")))??;
+    .await?;
     ensure_not_cancelled(exec_ctx.cancelled.as_ref())?;
     Ok(Some(batch))
 }
@@ -699,6 +704,7 @@ async fn execute_partial_state_agg_batch(
     exec_ctx: AggExecutionContext,
     local_runtime_factory: Option<SplitRuntimeFactoryRef>,
     context: Arc<datafusion::execution::TaskContext>,
+    sync_pool: crate::sync_exec::SyncExecutionPoolRef,
 ) -> Result<Option<RecordBatch>> {
     ensure_not_cancelled(exec_ctx.cancelled.as_ref())?;
     let batch = execute_single_split_partial_state_batch(
@@ -708,6 +714,7 @@ async fn execute_partial_state_agg_batch(
         exec_ctx,
         local_runtime_factory,
         context,
+        sync_pool,
     )
     .await?;
     Ok(Some(batch))
@@ -772,6 +779,7 @@ async fn execute_split_intermediate_agg(
     exec_ctx: AggExecutionContext,
     local_runtime_factory: Option<&SplitRuntimeFactoryRef>,
     context: &datafusion::execution::TaskContext,
+    sync_pool: &dyn crate::sync_exec::SyncExecutionPool,
 ) -> Result<IntermediateAggregationResults> {
     ensure_not_cancelled(exec_ctx.cancelled.as_ref())?;
     let prepared = prepare_split(&split, local_runtime_factory, context).await?;
@@ -794,7 +802,7 @@ async fn execute_split_intermediate_agg(
         cancelled: _,
     } = exec_ctx;
 
-    tokio::task::spawn_blocking(move || {
+    crate::sync_exec::run_sync(sync_pool, move || {
         let split_fast_field_query = match pre_built_query {
             Some(query) => Some(query),
             None => {
@@ -814,7 +822,6 @@ async fn execute_split_intermediate_agg(
         )
     })
     .await
-    .map_err(|e| DataFusionError::Internal(format!("spawn_blocking join error: {e}")))?
 }
 
 async fn execute_single_split_agg_batch(
@@ -824,6 +831,7 @@ async fn execute_single_split_agg_batch(
     exec_ctx: AggExecutionContext,
     local_runtime_factory: Option<SplitRuntimeFactoryRef>,
     context: Arc<datafusion::execution::TaskContext>,
+    sync_pool: crate::sync_exec::SyncExecutionPoolRef,
 ) -> Result<RecordBatch> {
     ensure_not_cancelled(exec_ctx.cancelled.as_ref())?;
     let prepared = prepare_split(&split, local_runtime_factory.as_ref(), context.as_ref()).await?;
@@ -846,7 +854,7 @@ async fn execute_single_split_agg_batch(
         cancelled: _,
     } = exec_ctx;
 
-    tokio::task::spawn_blocking(move || {
+    crate::sync_exec::run_sync(&*sync_pool, move || {
         let split_fast_field_query = match pre_built_query {
             Some(query) => Some(query),
             None => {
@@ -867,7 +875,6 @@ async fn execute_single_split_agg_batch(
         )
     })
     .await
-    .map_err(|e| DataFusionError::Internal(format!("spawn_blocking join error: {e}")))?
 }
 
 async fn execute_single_split_partial_state_batch(
@@ -877,6 +884,7 @@ async fn execute_single_split_partial_state_batch(
     exec_ctx: AggExecutionContext,
     local_runtime_factory: Option<SplitRuntimeFactoryRef>,
     context: Arc<datafusion::execution::TaskContext>,
+    sync_pool: crate::sync_exec::SyncExecutionPoolRef,
 ) -> Result<RecordBatch> {
     ensure_not_cancelled(exec_ctx.cancelled.as_ref())?;
     let prepared = prepare_split(&split, local_runtime_factory.as_ref(), context.as_ref()).await?;
@@ -899,7 +907,7 @@ async fn execute_single_split_partial_state_batch(
         cancelled: _,
     } = exec_ctx;
 
-    tokio::task::spawn_blocking(move || {
+    crate::sync_exec::run_sync(&*sync_pool, move || {
         let split_fast_field_query = match pre_built_query {
             Some(query) => Some(query),
             None => {
@@ -920,7 +928,6 @@ async fn execute_single_split_partial_state_batch(
         crate::unified::agg_exec::agg_results_to_partial_state_batch(&results, &aggs, &schema)
     })
     .await
-    .map_err(|e| DataFusionError::Internal(format!("spawn_blocking join error: {e}")))?
 }
 
 /// Extract all field names referenced by an `Aggregations` tree.
