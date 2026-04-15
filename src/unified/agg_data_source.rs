@@ -28,6 +28,7 @@ use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResult
 use tokio::sync::OnceCell;
 
 use crate::index_opener::{IndexOpener, OpenerSplitRuntimeFactory};
+use crate::nested_agg::spec::NestedApproxAggSpec;
 use crate::split_runtime::{
     PreparedSplit, SplitDescriptor, SplitRuntimeFactoryExt, SplitRuntimeFactoryRef,
 };
@@ -75,9 +76,11 @@ pub struct AggDataSource {
     /// Source logical `Expr`s that produced `pre_built_query`. Stored for
     /// codec serialization so workers can re-derive the tantivy query.
     fast_field_filter_exprs: Vec<Expr>,
-    /// Whether this source emits final aggregate rows or partial aggregate
-    /// state rows for a downstream `AggregateExec(Final*)`.
+    /// Whether this source emits final aggregate rows, partial aggregate
+    /// state rows, or node-table partial rows for nested aggregations.
     output_mode: AggOutputMode,
+    /// Nested aggregation spec — present only for `NodeTablePartial` mode.
+    nested_spec: Option<Arc<NestedApproxAggSpec>>,
     local_runtime_factory: Option<SplitRuntimeFactoryRef>,
     /// Ensures warmup runs at most once per split.
     warmup_done: Vec<Arc<OnceCell<()>>>,
@@ -99,6 +102,9 @@ impl fmt::Debug for AggDataSource {
 pub enum AggOutputMode {
     FinalMerged,
     PartialStates,
+    /// Emit node-table partial rows for nested approximate aggregations.
+    /// Requires `nested_spec` to be set on the data source.
+    NodeTablePartial,
 }
 
 #[derive(Clone)]
@@ -117,6 +123,7 @@ struct AggSourceConfig {
     pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
     fast_field_filter_exprs: Vec<Expr>,
     output_mode: AggOutputMode,
+    nested_spec: Option<Arc<NestedApproxAggSpec>>,
 }
 
 fn local_split_descriptor(
@@ -303,6 +310,7 @@ impl AggDataSource {
                 pre_built_query,
                 fast_field_filter_exprs,
                 output_mode: AggOutputMode::FinalMerged,
+                nested_spec: None,
             },
             local_runtime_factory,
         )
@@ -379,8 +387,79 @@ impl AggDataSource {
                 pre_built_query,
                 fast_field_filter_exprs,
                 output_mode: AggOutputMode::PartialStates,
+                nested_spec: None,
             },
             local_runtime_factory,
+        )
+    }
+
+    /// Create an `AggDataSource` that emits node-table partial rows for
+    /// nested approximate aggregations.
+    pub fn from_split_descriptors_node_table_partial_with_runtime_factory(
+        split_descriptors: Vec<SplitDescriptor>,
+        aggregations: Arc<Aggregations>,
+        output_schema: SchemaRef,
+        raw_queries: Vec<(String, String)>,
+        pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
+        fast_field_filter_exprs: Vec<Expr>,
+        nested_spec: Arc<NestedApproxAggSpec>,
+        local_runtime_factory: Option<SplitRuntimeFactoryRef>,
+    ) -> Self {
+        let splits = split_descriptors
+            .into_iter()
+            .map(|descriptor| AggSplitPlan {
+                descriptor,
+                needs_warmup: true,
+            })
+            .collect();
+        Self::from_split_plans(
+            splits,
+            AggSourceConfig {
+                aggregations,
+                output_schema,
+                raw_queries,
+                pre_built_query,
+                fast_field_filter_exprs,
+                output_mode: AggOutputMode::NodeTablePartial,
+                nested_spec: Some(nested_spec),
+            },
+            local_runtime_factory,
+        )
+    }
+
+    /// Create a node-table partial source from local indexes.
+    pub fn from_local_splits_node_table_partial(
+        local_indexes: Vec<tantivy::Index>,
+        aggregations: Arc<Aggregations>,
+        output_schema: SchemaRef,
+        raw_queries: Vec<(String, String)>,
+        pre_built_query: Option<Arc<dyn tantivy::query::Query>>,
+        fast_field_filter_exprs: Vec<Expr>,
+        nested_spec: Arc<NestedApproxAggSpec>,
+    ) -> Self {
+        let split_openers: Vec<Arc<dyn IndexOpener>> = local_indexes
+            .into_iter()
+            .map(|index| {
+                Arc::new(crate::index_opener::DirectIndexOpener::new(index)) as Arc<dyn IndexOpener>
+            })
+            .collect();
+        let opener_map: std::collections::HashMap<String, Arc<dyn IndexOpener>> = split_openers
+            .iter()
+            .enumerate()
+            .map(|(idx, opener)| (format!("local-split-{idx}"), Arc::clone(opener)))
+            .collect();
+        Self::from_split_descriptors_node_table_partial_with_runtime_factory(
+            build_local_split_plans(&split_openers)
+                .into_iter()
+                .map(|split| split.descriptor)
+                .collect(),
+            aggregations,
+            output_schema,
+            raw_queries,
+            pre_built_query,
+            fast_field_filter_exprs,
+            nested_spec,
+            Some(Arc::new(OpenerSplitRuntimeFactory::new(opener_map))),
         )
     }
 
@@ -398,6 +477,7 @@ impl AggDataSource {
             pre_built_query: config.pre_built_query,
             fast_field_filter_exprs: config.fast_field_filter_exprs,
             output_mode: config.output_mode,
+            nested_spec: config.nested_spec,
             local_runtime_factory,
             warmup_done,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -444,6 +524,11 @@ impl AggDataSource {
     pub fn output_mode(&self) -> AggOutputMode {
         self.output_mode
     }
+
+    /// Access the nested aggregation spec (present only for `NodeTablePartial`).
+    pub fn nested_spec(&self) -> Option<&Arc<NestedApproxAggSpec>> {
+        self.nested_spec.as_ref()
+    }
 }
 
 impl DataSource for AggDataSource {
@@ -462,7 +547,9 @@ impl DataSource for AggDataSource {
                     stream::empty(),
                 )));
             }
-            AggOutputMode::PartialStates if partition >= self.splits.len() => {
+            AggOutputMode::PartialStates | AggOutputMode::NodeTablePartial
+                if partition >= self.splits.len() =>
+            {
                 return Ok(Box::pin(RecordBatchStreamAdapter::new(
                     schema,
                     stream::empty(),
@@ -474,6 +561,7 @@ impl DataSource for AggDataSource {
         let splits = self.splits.clone();
         let warmup_done = self.warmup_done.clone();
         let output_mode = self.output_mode;
+        let nested_spec = self.nested_spec.clone();
         let local_runtime_factory = self.local_runtime_factory.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(1);
@@ -525,6 +613,40 @@ impl DataSource for AggDataSource {
                                 sync_pool,
                             )
                             .await
+                        }
+                        Err(err) => Err(err),
+                    }
+                }
+                AggOutputMode::NodeTablePartial => {
+                    let split = splits.get(partition).cloned().ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "invalid agg split partition {partition}"
+                        ))
+                    });
+                    match split {
+                        Ok(split) => {
+                            let warmup_done = Arc::clone(&warmup_done[partition]);
+                            let nested_spec = nested_spec.as_ref().cloned().ok_or_else(|| {
+                                DataFusionError::Internal(
+                                    "NodeTablePartial requires nested_spec".into(),
+                                )
+                            });
+                            match nested_spec {
+                                Ok(spec) => {
+                                    execute_node_table_partial_batch(
+                                        split,
+                                        warmup_done,
+                                        schema.clone(),
+                                        exec_ctx,
+                                        spec,
+                                        local_runtime_factory.clone(),
+                                        context,
+                                        sync_pool,
+                                    )
+                                    .await
+                                }
+                                Err(err) => Err(err),
+                            }
                         }
                         Err(err) => Err(err),
                     }
@@ -583,7 +705,9 @@ impl DataSource for AggDataSource {
     fn output_partitioning(&self) -> Partitioning {
         let partitions = match self.output_mode {
             AggOutputMode::FinalMerged => 1,
-            AggOutputMode::PartialStates => self.splits.len().max(1),
+            AggOutputMode::PartialStates | AggOutputMode::NodeTablePartial => {
+                self.splits.len().max(1)
+            }
         };
         Partitioning::UnknownPartitioning(partitions)
     }
@@ -926,6 +1050,65 @@ async fn execute_single_split_partial_state_batch(
             Some(prepared.reader()),
         )?;
         crate::unified::agg_exec::agg_results_to_partial_state_batch(&results, &aggs, &schema)
+    })
+    .await
+}
+
+async fn execute_node_table_partial_batch(
+    split: AggSplitPlan,
+    warmup_done: Arc<OnceCell<()>>,
+    schema: SchemaRef,
+    exec_ctx: AggExecutionContext,
+    nested_spec: Arc<NestedApproxAggSpec>,
+    local_runtime_factory: Option<SplitRuntimeFactoryRef>,
+    context: Arc<datafusion::execution::TaskContext>,
+    sync_pool: crate::sync_exec::SyncExecutionPoolRef,
+) -> Result<Option<RecordBatch>> {
+    ensure_not_cancelled(exec_ctx.cancelled.as_ref())?;
+    let prepared = prepare_split(&split, local_runtime_factory.as_ref(), context.as_ref()).await?;
+    warmup_for_agg(
+        &split,
+        prepared.as_ref(),
+        &exec_ctx.raw_queries,
+        &exec_ctx.fast_field_filter_exprs,
+        &exec_ctx.aggs,
+        warmup_done.as_ref(),
+        exec_ctx.cancelled.as_ref(),
+    )
+    .await?;
+    ensure_not_cancelled(exec_ctx.cancelled.as_ref())?;
+    let AggExecutionContext {
+        aggs,
+        raw_queries,
+        pre_built_query,
+        fast_field_filter_exprs,
+        cancelled: _,
+    } = exec_ctx;
+
+    crate::sync_exec::run_sync(&*sync_pool, move || {
+        let split_fast_field_query = match pre_built_query {
+            Some(query) => Some(query),
+            None => {
+                build_split_fast_field_query(&fast_field_filter_exprs, &prepared.index().schema())
+            }
+        };
+        let query = build_combined_query(
+            prepared.index(),
+            split_fast_field_query.as_ref(),
+            &raw_queries,
+        )?;
+        let intermediate = crate::unified::agg_exec::execute_tantivy_intermediate_agg_with_reader(
+            prepared.index(),
+            &aggs,
+            query.as_ref(),
+            Some(prepared.reader()),
+        )?;
+        let batch = crate::nested_agg::node_table::intermediate_results_to_node_table_batch(
+            &intermediate,
+            &nested_spec,
+            &schema,
+        )?;
+        Ok(Some(batch))
     })
     .await
 }
