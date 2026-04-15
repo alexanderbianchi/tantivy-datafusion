@@ -824,3 +824,225 @@ async fn test_double_roundtrip_agg_data_source() {
     codec.try_encode(decoded, &mut buf2).unwrap();
     assert_eq!(buf1, buf2, "double roundtrip must produce identical bytes");
 }
+
+// ── Nested agg codec roundtrip ──────────────────────────────────
+
+#[tokio::test]
+async fn test_node_table_partial_agg_data_source_roundtrip() {
+    use tantivy_datafusion::nested_agg::node_table::node_table_partial_schema;
+    use tantivy_datafusion::nested_agg::spec::{
+        BucketKind, BucketLevelSpec, MetricSpec, NestedApproxAggSpec,
+    };
+
+    let index = create_test_index();
+
+    let spec = Arc::new(
+        NestedApproxAggSpec::try_new(
+            vec![BucketLevelSpec {
+                kind: BucketKind::Terms,
+                field: "category".into(),
+                final_size: 10,
+                fanout: 40,
+            }],
+            vec![MetricSpec::Count],
+        )
+        .unwrap(),
+    );
+    let tantivy_aggs = Arc::new(spec.to_tantivy_aggregations());
+    let output_schema = node_table_partial_schema(&spec);
+
+    let exec = Arc::new(DataSourceExec::new(Arc::new(
+        AggDataSource::from_local_splits_node_table_partial(
+            vec![index.clone()],
+            tantivy_aggs,
+            output_schema.clone(),
+            Vec::new(),
+            None,
+            Vec::new(),
+            Arc::clone(&spec),
+        ),
+    )));
+
+    let codec = TantivyCodec;
+    let mut buf = Vec::new();
+    codec.try_encode(exec.clone(), &mut buf).unwrap();
+
+    let decode_session = session_with_index(index);
+    let task_ctx = decode_session.state().task_ctx();
+    let decoded = codec.try_decode(&buf, &[], &task_ctx).unwrap();
+
+    let decoded_ds = agg_ds(&decoded);
+    assert_eq!(
+        decoded_ds.output_mode(),
+        AggOutputMode::NodeTablePartial,
+        "output mode must survive roundtrip"
+    );
+    assert!(
+        decoded_ds.nested_spec().is_some(),
+        "nested_spec must survive roundtrip"
+    );
+    let rt_spec = decoded_ds.nested_spec().unwrap();
+    assert_eq!(rt_spec.levels.len(), 1);
+    assert_eq!(rt_spec.levels[0].fanout, 40);
+    assert_eq!(rt_spec.metrics.len(), 1);
+    assert_eq!(
+        decoded_ds.output_schema().as_ref(),
+        output_schema.as_ref(),
+        "output schema must survive roundtrip"
+    );
+}
+
+#[tokio::test]
+async fn test_nested_approx_agg_exec_roundtrip() {
+    use tantivy_datafusion::nested_agg::exec::NestedApproxAggExec;
+    use tantivy_datafusion::nested_agg::node_table::node_table_partial_schema;
+    use tantivy_datafusion::nested_agg::spec::{
+        BucketKind, BucketLevelSpec, MetricSpec, NestedApproxAggSpec,
+    };
+
+    let index = create_test_index();
+
+    let spec = Arc::new(
+        NestedApproxAggSpec::try_new(
+            vec![
+                BucketLevelSpec {
+                    kind: BucketKind::Terms,
+                    field: "category".into(),
+                    final_size: 5,
+                    fanout: 20,
+                },
+                BucketLevelSpec {
+                    kind: BucketKind::Terms,
+                    field: "tags".into(),
+                    final_size: 3,
+                    fanout: 10,
+                },
+            ],
+            vec![
+                MetricSpec::Count,
+                MetricSpec::Avg { field: "price".into() },
+            ],
+        )
+        .unwrap(),
+    );
+
+    let tantivy_aggs = Arc::new(spec.to_tantivy_aggregations());
+    let partial_schema = node_table_partial_schema(&spec);
+
+    let leaf_ds = AggDataSource::from_local_splits_node_table_partial(
+        vec![index.clone()],
+        tantivy_aggs,
+        partial_schema,
+        Vec::new(),
+        None,
+        Vec::new(),
+        Arc::clone(&spec),
+    );
+    let leaf: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(leaf_ds)));
+
+    let coalesced: Arc<dyn ExecutionPlan> = Arc::new(
+        datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec::new(
+            Arc::clone(&leaf),
+        ),
+    );
+    let final_merge =
+        Arc::new(NestedApproxAggExec::new_final_merge(coalesced, Arc::clone(&spec)));
+
+    let codec = TantivyCodec;
+    let mut buf = Vec::new();
+    codec
+        .try_encode(final_merge.clone() as Arc<dyn ExecutionPlan>, &mut buf)
+        .unwrap();
+
+    let decode_session = session_with_index(index);
+    let task_ctx = decode_session.state().task_ctx();
+    let decoded = codec
+        .try_decode(&buf, &[Arc::clone(&leaf)], &task_ctx)
+        .unwrap();
+
+    let decoded_nested = decoded
+        .as_any()
+        .downcast_ref::<NestedApproxAggExec>()
+        .expect("decoded plan should be NestedApproxAggExec");
+
+    assert_eq!(decoded_nested.spec().levels.len(), 2);
+    assert_eq!(decoded_nested.spec().levels[0].fanout, 20);
+    assert_eq!(decoded_nested.spec().levels[1].final_size, 3);
+    assert_eq!(decoded_nested.spec().metrics.len(), 2);
+    assert_eq!(
+        decoded_nested.schema(),
+        final_merge.schema(),
+        "output schema must survive roundtrip"
+    );
+}
+
+#[tokio::test]
+async fn test_nested_approx_partial_exec_roundtrip() {
+    use tantivy_datafusion::nested_agg::exec::{NestedApproxAggExec, NestedApproxAggMode};
+    use tantivy_datafusion::nested_agg::spec::{
+        BucketKind, BucketLevelSpec, MetricSpec, NestedApproxAggSpec,
+    };
+
+    let index = create_test_index();
+    let provider = Arc::new(SingleTableProvider::new(index.clone()));
+    let ctx = SessionContext::new();
+    ctx.register_table("t", provider).unwrap();
+
+    let projected = ctx
+        .sql(
+            "SELECT \
+               category AS __na_key_0, \
+               CAST(price AS DOUBLE) AS __na_metric_1, \
+               _segment_ord \
+             FROM t",
+        )
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+
+    let spec = Arc::new(
+        NestedApproxAggSpec::try_new(
+            vec![BucketLevelSpec {
+                kind: BucketKind::Terms,
+                field: "category".into(),
+                final_size: 10,
+                fanout: 40,
+            }],
+            vec![
+                MetricSpec::Count,
+                MetricSpec::Avg {
+                    field: "price".into(),
+                },
+            ],
+        )
+        .unwrap(),
+    );
+
+    let partial = Arc::new(NestedApproxAggExec::new_partial_split_local(
+        Arc::clone(&projected),
+        Arc::clone(&spec),
+    ));
+
+    let codec = TantivyCodec;
+    let mut buf = Vec::new();
+    codec
+        .try_encode(partial.clone() as Arc<dyn ExecutionPlan>, &mut buf)
+        .unwrap();
+
+    let task_ctx = session_with_index(index).state().task_ctx();
+    let decoded = codec
+        .try_decode(&buf, &[projected], &task_ctx)
+        .unwrap();
+
+    let decoded_nested = decoded
+        .as_any()
+        .downcast_ref::<NestedApproxAggExec>()
+        .expect("decoded plan should be NestedApproxAggExec");
+
+    assert_eq!(decoded_nested.mode(), NestedApproxAggMode::PartialSplitLocal);
+    assert_eq!(decoded_nested.spec().levels.len(), 1);
+    assert_eq!(decoded_nested.spec().metrics.len(), 2);
+    assert_eq!(decoded_nested.schema(), partial.schema());
+}

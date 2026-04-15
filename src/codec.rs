@@ -15,6 +15,8 @@ use datafusion_datasource::source::DataSourceExec;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use prost::Message;
 
+use crate::nested_agg::exec::{NestedApproxAggExec, NestedApproxAggMode};
+use crate::nested_agg::spec::NestedApproxAggSpec;
 use crate::split_runtime::SplitDescriptor;
 use crate::unified::agg_data_source::{AggDataSource, AggOutputMode};
 use crate::unified::single_table_provider::{
@@ -67,12 +69,20 @@ struct TantivyPlanProto {
     row_limit: u32,
     #[prost(bool, tag = "14")]
     has_row_limit: bool,
+    /// JSON-serialized `NestedApproxAggSpec` for node-table partial mode.
+    #[prost(string, tag = "15")]
+    nested_spec_json: String,
+    /// Mode for `NestedApproxAggExec`: 0 = FinalMerge, 1 = PartialSplitLocal.
+    #[prost(uint32, tag = "16")]
+    nested_agg_mode: u32,
 }
 
 const SINGLE_TABLE: u32 = 3;
 const AGG_DATA_SOURCE: u32 = 4;
+const NESTED_APPROX_AGG_EXEC: u32 = 5;
 const AGG_OUTPUT_FINAL_MERGED: u32 = 0;
 const AGG_OUTPUT_PARTIAL_STATES: u32 = 1;
+const AGG_OUTPUT_NODE_TABLE_PARTIAL: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct TantivyCodec;
@@ -218,6 +228,11 @@ fn build_single_table_scan_schema(
 
 impl PhysicalExtensionCodec for TantivyCodec {
     fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> Result<()> {
+        // Handle NestedApproxAggExec first (it's not a DataSourceExec).
+        if let Some(nested) = node.as_any().downcast_ref::<NestedApproxAggExec>() {
+            return encode_nested_approx_agg(nested, buf);
+        }
+
         let ds_exec = node
             .as_any()
             .downcast_ref::<DataSourceExec>()
@@ -266,6 +281,8 @@ impl PhysicalExtensionCodec for TantivyCodec {
                 agg_output_mode: AGG_OUTPUT_FINAL_MERGED,
                 row_limit,
                 has_row_limit,
+                nested_spec_json: String::new(),
+                nested_agg_mode: 0,
             }
             .encode(buf)
             .map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
@@ -287,6 +304,12 @@ impl PhysicalExtensionCodec for TantivyCodec {
             let agg_output_mode = match agg_ds.output_mode() {
                 AggOutputMode::FinalMerged => AGG_OUTPUT_FINAL_MERGED,
                 AggOutputMode::PartialStates => AGG_OUTPUT_PARTIAL_STATES,
+                AggOutputMode::NodeTablePartial => AGG_OUTPUT_NODE_TABLE_PARTIAL,
+            };
+            let nested_spec_json = match agg_ds.nested_spec() {
+                Some(spec) => serde_json::to_string(spec.as_ref())
+                    .map_err(|e| DataFusionError::Internal(format!("serialize nested spec: {e}")))?,
+                None => String::new(),
             };
 
             return TantivyPlanProto {
@@ -304,6 +327,8 @@ impl PhysicalExtensionCodec for TantivyCodec {
                 agg_output_mode,
                 row_limit: 0,
                 has_row_limit: false,
+                nested_spec_json,
+                nested_agg_mode: 0,
             }
             .encode(buf)
             .map_err(|e| DataFusionError::Internal(format!("encode: {e}")));
@@ -338,6 +363,7 @@ impl PhysicalExtensionCodec for TantivyCodec {
         match proto.provider_type {
             SINGLE_TABLE => decode_single_table(&proto, projection),
             AGG_DATA_SOURCE => decode_agg(&proto),
+            NESTED_APPROX_AGG_EXEC => decode_nested_approx_agg(&proto, _inputs),
             other => Err(DataFusionError::Internal(format!(
                 "unknown tantivy provider type: {other}"
             ))),
@@ -443,6 +469,22 @@ fn decode_agg(proto: &TantivyPlanProto) -> Result<Arc<dyn ExecutionPlan>> {
             pre_built_query,
             fast_field_filter_exprs,
         ),
+        AGG_OUTPUT_NODE_TABLE_PARTIAL => {
+            let nested_spec: NestedApproxAggSpec =
+                serde_json::from_str(&proto.nested_spec_json).map_err(|e| {
+                    DataFusionError::Internal(format!("parse nested spec: {e}"))
+                })?;
+            AggDataSource::from_split_descriptors_node_table_partial_with_runtime_factory(
+                split_descriptors,
+                aggregations,
+                output_schema,
+                raw_queries,
+                pre_built_query,
+                fast_field_filter_exprs,
+                Arc::new(nested_spec),
+                None,
+            )
+        }
         _ => AggDataSource::from_split_descriptors(
             split_descriptors,
             aggregations,
@@ -453,4 +495,73 @@ fn decode_agg(proto: &TantivyPlanProto) -> Result<Arc<dyn ExecutionPlan>> {
         ),
     };
     Ok(Arc::new(DataSourceExec::new(Arc::new(ds))))
+}
+
+// ---------------------------------------------------------------------------
+// NestedApproxAggExec codec
+// ---------------------------------------------------------------------------
+
+const NESTED_AGG_MODE_FINAL_MERGE: u32 = 0;
+const NESTED_AGG_MODE_PARTIAL_SPLIT_LOCAL: u32 = 1;
+
+fn encode_nested_approx_agg(nested: &NestedApproxAggExec, buf: &mut Vec<u8>) -> Result<()> {
+    let nested_spec_json = serde_json::to_string(nested.spec().as_ref())
+        .map_err(|e| DataFusionError::Internal(format!("serialize nested spec: {e}")))?;
+    let output_schema_bytes = encode_schema_bytes(nested.schema().as_ref())?;
+    let nested_agg_mode = match nested.mode() {
+        NestedApproxAggMode::FinalMerge => NESTED_AGG_MODE_FINAL_MERGE,
+        NestedApproxAggMode::PartialSplitLocal => NESTED_AGG_MODE_PARTIAL_SPLIT_LOCAL,
+    };
+
+    TantivyPlanProto {
+        provider_type: NESTED_APPROX_AGG_EXEC,
+        projection: Vec::new(),
+        has_projection: false,
+        raw_queries_json: String::new(),
+        topk: 0,
+        has_topk: false,
+        fast_field_filters_json: String::new(),
+        split_descriptors: Vec::new(),
+        canonical_ff_schema_bytes: Vec::new(),
+        aggregations_json: String::new(),
+        output_schema_bytes,
+        agg_output_mode: 0,
+        row_limit: 0,
+        has_row_limit: false,
+        nested_spec_json,
+        nested_agg_mode,
+    }
+    .encode(buf)
+    .map_err(|e| DataFusionError::Internal(format!("encode nested agg: {e}")))
+}
+
+fn decode_nested_approx_agg(
+    proto: &TantivyPlanProto,
+    inputs: &[Arc<dyn ExecutionPlan>],
+) -> Result<Arc<dyn ExecutionPlan>> {
+    if inputs.len() != 1 {
+        return Err(DataFusionError::Internal(
+            "NestedApproxAggExec requires exactly one input".into(),
+        ));
+    }
+
+    let nested_spec: NestedApproxAggSpec =
+        serde_json::from_str(&proto.nested_spec_json)
+            .map_err(|e| DataFusionError::Internal(format!("parse nested spec: {e}")))?;
+
+    let mode = match proto.nested_agg_mode {
+        NESTED_AGG_MODE_FINAL_MERGE => NestedApproxAggMode::FinalMerge,
+        NESTED_AGG_MODE_PARTIAL_SPLIT_LOCAL => NestedApproxAggMode::PartialSplitLocal,
+        other => {
+            return Err(DataFusionError::Internal(format!(
+                "unknown nested agg mode {other}"
+            )))
+        }
+    };
+
+    Ok(Arc::new(NestedApproxAggExec::from_codec(
+        mode,
+        Arc::new(nested_spec),
+        Arc::clone(&inputs[0]),
+    )))
 }
